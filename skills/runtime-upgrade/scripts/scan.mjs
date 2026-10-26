@@ -45,14 +45,17 @@ for (const f of files) {
   const lines = raw.split('\n');
   for (const r of rules) {
     // fresh regex per file: a /g rule would carry lastIndex between files
+    // a rule may need to see inside strings (Go import paths, PHP interpolation)
+    const haystack = (r.scope === 'any' || r.scope === 'strings') ? raw : text;
     const re = new RegExp(r.re.source, r.re.flags.includes('g') ? r.re.flags : r.re.flags + 'g');
     let m;
-    while ((m = re.exec(text)) !== null && findings.length < MAX) {
-      const line = text.slice(0, m.index).split('\n').length;
+    while ((m = re.exec(haystack)) !== null && findings.length < MAX) {
+      const line = haystack.slice(0, m.index).split('\n').length;
       findings.push({
         file: rel(DIR, f), line,
         severity: r.severity, introducedIn: r.introducedIn,
         preExisting: !!r.preExisting,
+        autofixable: !!r.autofix,
         inheritedFrom: r.inheritedFrom || null,
         what: r.what, fix: r.fix,
         evidence: (lines[line - 1] || '').trim().slice(0, 140),
@@ -79,6 +82,8 @@ emit({
   truncated: findings.length >= MAX,
   bySeverity,
   causedByThisUpgrade: findings.filter(f => !f.preExisting).length,
+  autofixable: findings.filter(f => f.autofixable && !f.preExisting).length,
+  needsAHuman: findings.filter(f => !f.autofixable && !f.preExisting).length,
   preExistingFindings: findings.filter(f => f.preExisting).length,
   severityMeaning: {
     removed: 'will throw or fail to build on the target — must be fixed',

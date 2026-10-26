@@ -172,7 +172,9 @@ for (const t of targets) {
            : (blockers.length || editionJump || crossed >= 3) ? 'proceed-with-conditions'
            : 'proceed',
     estimatePoints: points,
-    steps: steps({ lang: t.lang, dir: t.dir, absDir: dir, current, target, pins, ci, cfg, blockers, behaviour, a, r }),
+    autofixable: sc.autofixable ?? 0,
+    steps: steps({ lang: t.lang, dir: t.dir, absDir: dir, current, target, pins, ci, cfg,
+                   blockers, behaviour, a, r, autofixable: sc.autofixable ?? 0 }),
     rollback: rollback({ lang: t.lang, dir: t.dir, current, target }),
     testStrategy: testStrategy({ lang: t.lang, current, target, behaviour }),
     cyclesCrossed: crossed, editionJump,
@@ -228,7 +230,7 @@ function estimate({ pins, ci, cfg, blockers, scan, deps, fwEol, crossed, edition
   return Math.min(55, p);
 }
 
-function steps({ lang, dir, absDir, current, target, pins, ci, cfg, blockers, behaviour, a, r }) {
+function steps({ lang, dir, absDir, current, target, pins, ci, cfg, blockers, behaviour, a, r, autofixable }) {
   const SK = HERE;
   const D = absDir;
   const out = [];
@@ -259,6 +261,18 @@ function steps({ lang, dir, absDir, current, target, pins, ci, cfg, blockers, be
       `node ${SK}/remediate.mjs ${lang} ${D} ${target} --deps none --apply`,
     ],
     exit: `every declared location reads ${target}; the build succeeds; no version drift`,
+  });
+  if (autofixable) out.push({
+    n: out.length + 1, phase: 'source-fix',
+    title: `Apply ${autofixable} mechanical source fix(es)`,
+    why: 'These rewrites are correct for every match, so a machine can make them. '
+       + 'Everything else in the scan needs a human and is listed separately.',
+    actions: [
+      `node ${SK}/fix.mjs ${lang} ${D} ${current} ${target} --list    # what is automatic vs what is not`,
+      `node ${SK}/fix.mjs ${lang} ${D} ${current} ${target}           # dry run: see the diffs`,
+      `node ${SK}/fix.mjs ${lang} ${D} ${current} ${target} --apply   # guard preflight must pass`,
+    ],
+    exit: 'the mechanical fixes are in their own commit, separate from the runtime pin',
   });
   out.push({
     n: out.length + 1, phase: 'dependencies',

@@ -113,6 +113,19 @@ node skills/runtime-upgrade/scripts/frameworks.mjs <dir>
 ```
 The runtime is often the smaller half. endoflife.date tracks 41 frameworks; anything it doesn't (NestJS, FastAPI, Flask, Quarkus, Ember, Tailwind) is reported as `untracked` rather than guessed at.
 
+## It writes the code fixes too
+
+```bash
+node skills/runtime-upgrade/scripts/fix.mjs elixir ./repo 1.12 1.20 --list
+node skills/runtime-upgrade/scripts/fix.mjs elixir ./repo 1.12 1.20 --apply
+```
+
+`remediate.mjs` moves version pins; **`fix.mjs` rewrites the source** — only where the rewrite is correct for every match. 11 hand-written autofixes across 9 languages: `Logger.warn`->`Logger.warning`, `File.exists?`->`File.exist?`, `window.`->`globalThis.`, `'sym`->`Symbol("sym")`, `golang.org/x/exp/slices`->`slices`, and more.
+
+**Autofix is opt-in per rule, never inferred.** `new Buffer(x)` could be `Buffer.from` or `Buffer.alloc` depending on the argument's *type*; `createCipher`->`createCipheriv` needs an IV that isn't in the source. Those are listed as **needs-a-human, with the reason**. A `behaviour`-class rule never gets an autofix — it needs a test, not an edit.
+
+`--list` is your decision point. `--only a,b` applies a subset. Dry run by default; `--apply` goes through the same guard as everything else.
+
 ## Pull requests — your tool, your call
 
 ```bash
@@ -217,7 +230,7 @@ now a named regression test.
 node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
-147 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
+155 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
 
 CI runs the suite on **ubuntu + macOS × Node 18/20/22/24**, plus an offline job, plus a weekly cron to catch upstream feed changes.
 

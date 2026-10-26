@@ -7,7 +7,35 @@
 //             behaviour= still runs, DIFFERENT RESULT — the dangerous class
 import { compare } from './semver.mjs';
 
-const R = (introducedIn, re, severity, what, fix) => ({ introducedIn, re, severity, what, fix });
+const R = (introducedIn, re, severity, what, fix, autofix = null, scope = 'code') =>
+  ({ introducedIn, re, severity, what, fix, autofix, scope });
+
+/**
+ * `scope` says WHERE a rule is allowed to match.
+ *   'code'    default — comments and string literals are blanked first
+ *   'strings' the construct only exists INSIDE a string (PHP "${x}" interpolation)
+ *   'any'     the construct is a string by nature (a Go import path), so
+ *             blanking strings would delete the very thing being matched
+ * Without this, Go's x/exp rule and PHP's interpolation rule silently never
+ * fired: both live inside quotes.
+ */
+
+/**
+ * `autofix` is a per-rule, hand-written rewrite. It is NOT derived from the
+ * `fix` text, because detecting with a regex does not imply being able to
+ * rewrite with one:
+ *
+ *   new Buffer(x)            -> Buffer.from(x) OR Buffer.alloc(x) depending on
+ *                               the argument's TYPE — not decidable statically
+ *   crypto.createCipher(a,b) -> createCipheriv(a,b,iv) — needs an IV that does
+ *                               not exist in the source
+ *   Deno.run({cmd:[a,b]})    -> new Deno.Command(a,{args:[b]}) — reshapes the
+ *                               argument object
+ *   enumValues<T>()          -> enumEntries<T>() — returns List, not Array
+ *
+ * Only a rewrite that is correct for EVERY match gets an autofix. A
+ * behaviour-class rule never gets one: it needs a test, not an edit.
+ */
 
 export const RULES = {
   node: [
@@ -22,7 +50,8 @@ export const RULES = {
       'createCipher/createDecipher were removed', 'use createCipheriv/createDecipheriv'),
     R('26.0.0', /\brequire\(['"]_stream_(wrap|readable|writable|duplex|transform|passthrough)['"]\)/, 'removed',
       'the legacy _stream_* internals were removed in Node 26', "import from 'stream' instead"),
-    R('26.0.0', /\.writeHeader\s*\(/,                     'removed',  'http.Server.prototype.writeHeader() was removed', 'use writeHead()'),
+    R('26.0.0', /\.writeHeader\s*\(/,                     'removed',  'http.Server.prototype.writeHeader() was removed', 'use writeHead()',
+      m => m.replace('.writeHeader', '.writeHead')),
     R('26.0.0', /--experimental-transform-types/,         'removed',  '--experimental-transform-types was removed', 'use --experimental-strip-types or precompile'),
   ],
   php: [
@@ -34,14 +63,17 @@ export const RULES = {
     R('8.1.0', /\bstrftime\s*\(|\bgmstrftime\s*\(/,       'runtime',  'strftime()/gmstrftime() are deprecated', 'use IntlDateFormatter or date()'),
     R('8.1.0', /\bFILTER_SANITIZE_STRING\b/,              'runtime',  'FILTER_SANITIZE_STRING is deprecated', 'use htmlspecialchars()'),
     R('8.2.0', /\butf8_encode\s*\(|\butf8_decode\s*\(/,   'runtime',  'utf8_encode()/utf8_decode() are deprecated', 'use mb_convert_encoding()'),
-    R('8.2.0', /\$\{\s*\$?\w+\s*\}/,                      'runtime',  '${} string interpolation is deprecated', 'use {$var}'),
+    // interpolation only exists inside a double-quoted string
+    R('8.2.0', /\$\{\s*(\$?\w+)\s*\}/,                     'runtime',  '${} string interpolation is deprecated', 'use {$var}',
+      m => { const n = m.match(/\$\{\s*\$?(\w+)\s*\}/)[1]; return '{$' + n + '}'; }, 'strings'),
     R('8.3.0', /\bReflectionClass::getStaticProperties\b/, 'runtime', 'nullable return deprecated', 'check the PHP 8.3 UPGRADING notes'),
     R('8.4.0', /\bmysqli_execute\s*\(|\bsession_set_save_handler\s*\(\s*\w+\s*,/, 'runtime',
       'several signatures were deprecated in 8.4', 'see UPGRADING for the exact call'),
   ],
   python: [
     R('3.9.0',  /\bfrom\s+collections\s+import\s+(?:Mapping|Sequence|Iterable|MutableMapping)/, 'removed',
-      'collections ABCs moved to collections.abc', 'import from collections.abc'),
+      'collections ABCs moved to collections.abc', 'import from collections.abc',
+      m => m.replace('from collections import', 'from collections.abc import')),
     R('3.10.0', /\basyncio\.get_event_loop\s*\(\s*\)/,    'runtime',  'get_event_loop() outside a running loop is deprecated', 'use asyncio.run() or get_running_loop()'),
     R('3.12.0', /\bimp\.|\bimport\s+imp\b/,               'removed',  'the imp module was removed', 'use importlib'),
     R('3.12.0', /\bdistutils\b/,                          'removed',  'distutils was removed', 'use setuptools or packaging'),
@@ -53,14 +85,17 @@ export const RULES = {
   ],
   ruby: [
     R('3.0.0', /\bTaint\b|\.taint\b|\.untaint\b/,         'removed',  'the taint mechanism was removed', 'delete the calls'),
-    R('3.1.0', /\bFile\.exists\?\s*\(/,                   'runtime',  'File.exists? is deprecated', 'use File.exist?'),
+    R('3.1.0', /\bFile\.exists\?\s*\(/,                   'runtime',  'File.exists? is deprecated', 'use File.exist?',
+      m => m.replace('File.exists?', 'File.exist?')),
     R('3.4.0', /\bObject#=~|\bNilClass#=~/,               'removed',  'Object#=~ was removed', 'use explicit matching'),
   ],
   go: [
     R('1.16.0', /\bio\/ioutil\b/,                         'runtime',  'io/ioutil is deprecated', 'use io and os'),
     R('1.20.0', /\bmath\/rand"\s*\)?[\s\S]{0,40}rand\.Seed\s*\(/, 'runtime', 'rand.Seed is deprecated', 'the global source is auto-seeded; use rand.New for determinism'),
-    R('1.21.0', /\bgolang\.org\/x\/exp\/slices\b|\bgolang\.org\/x\/exp\/maps\b/, 'runtime',
-      'x/exp/slices and x/exp/maps graduated to the stdlib', 'import "slices" / "maps"'),
+    // a Go import path IS a string literal, so this rule must see strings
+    R('1.21.0', /\bgolang\.org\/x\/exp\/(slices|maps)\b/, 'runtime',
+      'x/exp/slices and x/exp/maps graduated to the stdlib', 'import "slices" / "maps"',
+      m => m.replace(/golang\.org\/x\/exp\//, ''), 'any'),
   ],
   java: [
     R('17', /\bsun\.misc\.Unsafe\b/,                      'runtime',  'sun.misc.Unsafe is being removed incrementally', 'use VarHandle / MemorySegment'),
@@ -82,14 +117,20 @@ export const RULES = {
     R('1.82.0', /\bextern\s+crate\s+/,                    'runtime',  'extern crate is unnecessary since the 2018 edition', 'delete it; use path-based imports'),
   ],
   elixir: [
-    R('1.13.0', /\bMix\.Config\b/,                        'removed',  'Mix.Config was replaced by Config', 'use Config (available since 1.9)'),
-    R('1.14.0', /\buse\s+Bitwise\b/,                      'runtime',  'use Bitwise is deprecated', 'import Bitwise'),
-    R('1.15.0', /\bLogger\.warn\s*\(/,                    'runtime',  'Logger.warn/2 is deprecated — Erlang :logger uses "warning"', 'use Logger.warning/2'),
+    R('1.13.0', /\bMix\.Config\b/,                        'removed',  'Mix.Config was replaced by Config', 'use Config (available since 1.9)',
+      () => 'Config'),
+    R('1.14.0', /\buse\s+Bitwise\b/,                      'runtime',  'use Bitwise is deprecated', 'import Bitwise',
+      () => 'import Bitwise'),
+    R('1.15.0', /\bLogger\.warn\s*\(/,                    'runtime',  'Logger.warn/2 is deprecated — Erlang :logger uses "warning"', 'use Logger.warning/2',
+      m => m.replace('Logger.warn', 'Logger.warning')),
     R('1.17.0', /(?<![\w?!])'[^'\n]{1,80}'(?![\w])/,      'runtime',  "single-quoted charlists are deprecated", 'use ~c"..."'),
   ],
   erlang: [
     R('18', /\berlang:now\s*\(\s*\)|(?<!\w)now\s*\(\s*\)/, 'runtime', 'erlang:now/0 is deprecated', 'use erlang:system_time/1 or erlang:monotonic_time/0'),
-    R('20', /\brandom:(?:seed|uniform)\s*\(/,             'removed',  'the random module was removed in OTP 20', 'use the rand module'),
+    R('20', /\brandom:uniform\s*\(/,                      'removed',  'the random module was removed in OTP 20', 'use rand:uniform/0,1',
+      m => m.replace('random:uniform', 'rand:uniform')),
+    R('20', /\brandom:seed\s*\(/,                         'removed',  'random:seed was removed in OTP 20',
+      'use rand:seed/1,2 — the argument shape differs, so this is not a rename'),
     R('23', /\bhttp_uri:(?:parse|encode|decode)\s*\(/,    'runtime',  'http_uri is deprecated', 'use uri_string'),
     R('24', /\bcrypto:(?:block_encrypt|block_decrypt|stream_init|next_iv)\s*\(/, 'removed',
       'the old crypto block/stream API was removed in OTP 24', 'use crypto:crypto_one_time/4,5 or crypto_init/4'),
@@ -102,7 +143,8 @@ export const RULES = {
   ],
   scala: [
     // Scala 3 is an EDITION boundary; these are the dropped constructs
-    R('3.0.0', /(?<![\w"'])'[A-Za-z_]\w*(?![\w'"])/,      'removed',  "symbol literals ('foo) were dropped in Scala 3", 'use Symbol("foo")'),
+    R('3.0.0', /(?<![\w"'])'[A-Za-z_]\w*(?![\w'"])/,      'removed',  "symbol literals ('foo) were dropped in Scala 3", 'use Symbol("foo")',
+      m => 'Symbol("' + m.slice(1) + '")'),
     R('3.0.0', /\bdef\s+\w+\s*\([^)]*\)\s*\{/,            'removed',  'procedure syntax (def f() { }) was dropped in Scala 3', 'write def f(): Unit = { }'),
     R('3.0.0', /\bdo\s*\{[\s\S]{0,400}?\}\s*while\s*\(/,  'removed',  'do...while was dropped in Scala 3', 'use while ({ ...; cond }) ()'),
     R('3.0.0', /<\/?[a-zA-Z][^>]*>\s*(?:\{|$)/m,          'runtime',  'XML literals are being dropped', 'use XML string interpolation'),
@@ -116,7 +158,8 @@ export const RULES = {
   ],
   deno: [
     R('2.0', /\bDeno\.run\s*\(/,                          'removed',  'Deno.run was removed in Deno 2', 'use new Deno.Command()'),
-    R('2.0', /(?<![\w.])window\./,                        'removed',  'the window global was removed in Deno 2', 'use globalThis'),
+    R('2.0', /(?<![\w.])window\./,                        'removed',  'the window global was removed in Deno 2', 'use globalThis',
+      () => 'globalThis.'),
     R('2.0', /\bDeno\.(?:readAll|writeAll|iter|copy)\s*\(/, 'removed','these Deno I/O helpers moved to the Standard Library in Deno 2', 'import them from jsr:@std/io'),
     R('2.0', /\bDeno\.(?:Buffer|Reader|Writer|Seeker)\b/, 'removed',  'the Deno.Buffer/Reader/Writer/Seeker interfaces were removed in Deno 2', 'use Web Streams or @std/io'),
     R('2.0', /\bDeno\.(?:resources|metrics|close)\s*\(/,  'removed',  'resource-id APIs were removed in Deno 2', 'use the resource\'s own .close(); metrics has no replacement'),

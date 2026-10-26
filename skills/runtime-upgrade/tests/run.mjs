@@ -833,6 +833,107 @@ t('rules: each new language catalogue actually matches its own syntax', () => {
   }
 });
 
+// ───────────── source autofix ─────────────
+console.log('\nsource autofix');
+function fix(...a) { return runJson(process.execPath, [S('fix.mjs'), ...a]); }
+function srcRepo(files, fn) {
+  const r = mkdtempSync(join(tmpdir(), 'ru-fix-'));
+  try {
+    run('git', ['init', '-q'], { cwd: r });
+    run('git', ['config', 'user.email', 't@t'], { cwd: r });
+    run('git', ['config', 'user.name', 'T'], { cwd: r });
+    for (const [f, body] of Object.entries(files)) {
+      const full = join(r, f);
+      const i = full.lastIndexOf('/');
+      // a file with no directory part gave slice(0, -1) — a truncated path
+      if (i > 0) mkdirSync(full.slice(0, i), { recursive: true });
+      writeFileSync(full, body);
+    }
+    run('git', ['add', '-A'], { cwd: r }); run('git', ['commit', '-qm', 'init'], { cwd: r });
+    return fn(r);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+}
+
+t('fix: only rules with a hand-written autofix are applied', () => {
+  const auto = Object.values(RULES).flat().filter(r => r.autofix);
+  ok(auto.length >= 10, `expected a real autofix set, got ${auto.length}`);
+  // a behaviour change needs a test, not an edit — never an autofix
+  eq(Object.values(RULES).flat().filter(r => r.severity === 'behaviour' && r.autofix).length, 0,
+     'no behaviour-class rule may carry an autofix');
+});
+t('fix: --list separates automatic from needs-a-human, with reasons', () => srcRepo(
+  { 'package.json': '{"name":"x","engines":{"node":">=20"}}', 'a.js': 'const x = 1;\n' }, r => {
+    const v = fix('node', r, '20.11.1', '26.12.1', '--list');
+    ok(v.data.automatic.length >= 1, 'some rules are automatic');
+    ok(v.data.needsAHuman.length >= 1, 'some need a human');
+    for (const x of v.data.needsAHuman) ok(x.why && x.why.length > 30, `${x.id} must say why`);
+    ok(/Nothing is written without --apply/.test(v.data.choiceIsYours), 'the choice is the user\'s');
+  }));
+t('fix: dry run writes nothing', () => srcRepo(
+  { 'mix.exs': 'def project, do: [elixir: "~> 1.12"]\n', 'a.ex': 'Logger.warn("x")\n' }, r => {
+    const before = readFileSync(join(r, 'a.ex'), 'utf8');
+    const v = fix('elixir', r, '1.12', '1.20');
+    eq(v.data.mode, 'dry-run');
+    ok(v.data.editCount > 0, 'it found something');
+    eq(readFileSync(join(r, 'a.ex'), 'utf8'), before, 'but changed nothing');
+  }));
+t('fix: NEVER edits inside a comment', () => srcRepo(
+  { 'mix.exs': 'def project, do: [elixir: "~> 1.12"]\n',
+    'a.ex': '# Logger.warn in a comment\nLogger.warn("real")\n' }, r => {
+    const v = fix('elixir', r, '1.12', '1.20');
+    eq(v.data.editCount, 1, 'exactly one edit — the real call, not the comment');
+    eq(v.data.changes[0].edits[0].line, 2, 'on line 2');
+  }));
+t('fix: a rule scoped to strings still fires (php interpolation)', () => srcRepo(
+  { 'composer.json': '{"name":"a/b","require":{"php":"^8.0"}}',
+    'a.php': '<?php\n$s = "hello ${name}";\n' }, r => {
+    // interpolation only exists INSIDE a string; blanking strings killed it
+    const v = fix('php', r, '8.0', '8.4');
+    eq(v.data.editCount, 1, 'the interpolation is found');
+    eq(v.data.changes[0].edits[0].after, '{$name}');
+  }));
+t('fix: a rule scoped to any still fires (go import path)', () => srcRepo(
+  { 'go.mod': 'module x\n\ngo 1.20\n',
+    'a.go': 'package main\nimport "golang.org/x/exp/slices"\n' }, r => {
+    // a Go import path IS a string literal
+    const v = fix('go', r, '1.20', '1.27');
+    eq(v.data.editCount, 1, 'the import path is found');
+    eq(v.data.changes[0].edits[0].after, 'slices');
+  }));
+t('fix: --only applies a subset', () => srcRepo(
+  { 'mix.exs': 'def project, do: [elixir: "~> 1.12"]\n',
+    'a.ex': 'use Bitwise\nLogger.warn("x")\n' }, r => {
+    const all = fix('elixir', r, '1.12', '1.20');
+    ok(all.data.editCount >= 2, 'both found by default');
+    const one = fix('elixir', r, '1.12', '1.20', '--only', all.data.rulesSelected[0]);
+    ok(one.data.editCount < all.data.editCount, 'a subset applies fewer');
+  }));
+t('fix: --apply refuses where guard would refuse', () => srcRepo(
+  { 'mix.exs': 'def project, do: [elixir: "~> 1.12"]\n', 'a.ex': 'Logger.warn("x")\n' }, r => {
+    const before = readFileSync(join(r, 'a.ex'), 'utf8');
+    const v = fix('elixir', r, '1.12', '1.20', '--apply');     // still on the default branch
+    eq(v.data.refused, true, 'must refuse');
+    eq(readFileSync(join(r, 'a.ex'), 'utf8'), before, 'and write nothing');
+  }));
+t('fix: --apply writes on a guarded branch', () => srcRepo(
+  { 'mix.exs': 'def project, do: [elixir: "~> 1.12"]\n',
+    'a.ex': '# Logger.warn stays\nLogger.warn("x")\nMix.Config.config(:a)\n' }, r => {
+    runJson(process.execPath, [S('guard.mjs'), 'branch', r, 'elixir', '1.20.4']);
+    const v = fix('elixir', r, '1.12', '1.20', '--apply');
+    eq(v.data.mode, 'apply');
+    const out = readFileSync(join(r, 'a.ex'), 'utf8');
+    ok(/# Logger\.warn stays/.test(out), 'the comment is untouched');
+    ok(/Logger\.warning\("x"\)/.test(out), 'the call is rewritten');
+    ok(/^Config\.config/m.test(out), 'Mix.Config is rewritten');
+  }));
+t('fix: overlapping matches never corrupt a line', () => srcRepo(
+  { 'mix.exs': 'def project, do: [elixir: "~> 1.12"]\n',
+    'a.ex': 'Logger.warn(Logger.warn("nested"))\n' }, r => {
+    const v = fix('elixir', r, '1.12', '1.20');
+    const after = v.data.changes[0].diff.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++'))[0];
+    ok(!/warninging|warningwarn/.test(after), `mangled output: ${after}`);
+  }));
+
 // ───────────── pull requests ─────────────
 console.log('\npull requests — user picks the tool');
 function pr(...a) { return runJson(process.execPath, [S('pr.mjs'), ...a]); }

@@ -193,6 +193,33 @@ Rules that hold for both:
 - Regenerate the lockfile with the **new** runtime's package manager.
 - Under `MODE=plan`, emit diffs only.
 
+## Phase 4a — WRITE THE SOURCE FIXES
+
+```bash
+node $SK/scripts/fix.mjs <lang> <dir> <from> <to> --list     # automatic vs needs-a-human
+node $SK/scripts/fix.mjs <lang> <dir> <from> <to>            # dry run, prints diffs
+node $SK/scripts/fix.mjs <lang> <dir> <from> <to> --apply    # guard preflight must pass
+node $SK/scripts/fix.mjs <lang> <dir> <from> <to> --only a,b # the user's subset
+```
+
+`remediate.mjs` moves version pins; **`fix.mjs` rewrites the code itself** — but only where the rewrite is correct for *every* match.
+
+**Autofix is opt-in per rule, hand-written, never inferred from the fix text.** Detecting with a regex does not imply being able to rewrite with one:
+
+| | |
+|---|---|
+| `Logger.warn(` -> `Logger.warning(` | OK — a pure rename |
+| `new Buffer(x)` | NOT safe — `Buffer.from` or `Buffer.alloc` depends on the argument's **type** |
+| `crypto.createCipher(a,b)` | NOT safe — `createCipheriv` needs an IV that isn't in the source |
+| `Deno.run({cmd:[a,b]})` | NOT safe — `new Deno.Command(a,{args:[b]})` reshapes the object |
+| `enumValues<T>()` | NOT safe — `enumEntries` returns a List, not an Array |
+
+**A `behaviour`-class rule never gets an autofix** — the code still runs, it just answers differently. That needs a test, not an edit. A test asserts this invariant.
+
+**`--list` is the user's decision point.** It prints what is automatic, what needs a human, and *why* each one does. `--only` applies a subset.
+
+Rules carry a `scope`: `code` (default — comments and strings blanked first), `strings` (PHP interpolation), or `any` (a Go import path **is** a string literal). Without it, those two rules silently never fired.
+
 ## Phase 4b — OPEN A PULL REQUEST (the user picks the tool)
 
 ```bash
