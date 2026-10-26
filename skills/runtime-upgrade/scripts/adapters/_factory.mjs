@@ -5,6 +5,7 @@
 // A spec declares WHERE the version lives and WHAT the ABI story is. Everything
 // else — EOL lookup, OSV dependency advisories, drift, image parsing — is shared.
 import { join, existsSync, readText, readdirSync, rel } from '../lib/io.mjs';
+import { classifyDeclared } from '../lib/semver.mjs';
 
 export function makeAdapter(spec) {
   const {
@@ -12,6 +13,7 @@ export function makeAdapter(spec) {
     ciKeyWords, sources, lockfiles = [], abiNote = null,
     versionShape = 'major.minor', gateNote, countDeps,
     driftExclude = [],
+    postProcess = null,
   } = spec;
 
   const imageRe = new RegExp(`\\b(${imageNames.join('|')})[:@]([^\\s"']+)`, 'gi');
@@ -34,6 +36,9 @@ export function makeAdapter(spec) {
       if (!text) { declared[key] = ''; continue; }
       declared[key] = src.re ? ((text.match(src.re) || [])[1] || '').trim() : text.trim().split('\n')[0];
     }
+    // sbt writes `scalaVersion := Scala213` — an identifier, not a literal.
+    // postProcess resolves those against the manifest text before classification.
+    if (postProcess) postProcess(declared, f => readText(join(dir, f)) || '');
     declared.toolVersions = (readText(join(dir, '.tool-versions')) || '')
       .match(new RegExp(`^(?:${ciKeyWords.join('|')})\\s+(\\S+)`, 'mi'))?.[1] || '';
     declared.dockerfile = dockerImages.filter(s => new RegExp(`^(${imageNames.join('|')})[:@]`, 'i').test(s)).join(' | ');
@@ -42,9 +47,11 @@ export function makeAdapter(spec) {
     // Keys listed in driftExclude describe a DIFFERENT axis (Kotlin's JVM
     // toolchain, Scala's cross-build matrix). Counting them as disagreement
     // reports drift where none exists.
-    const majors = [...new Set(Object.entries(declared)
-      .filter(([k]) => !driftExclude.includes(k))
-      .map(([, v]) => extract(v)).filter(Boolean))];
+    const considered = Object.fromEntries(Object.entries(declared).filter(([k]) => !driftExclude.includes(k)));
+    const { pins, floors } = classifyDeclared(considered);
+    const pinMajors = [...new Set(Object.values(pins).map(extract).filter(Boolean))];
+    const floorMajors = [...new Set(Object.values(floors).map(extract).filter(Boolean))];
+    const majors = [...new Set([...pinMajors, ...floorMajors])];
     const otherAxis = Object.fromEntries(driftExclude
       .filter(k => declared[k]).map(k => [k, declared[k]]));
     let lockfile = '';
@@ -54,7 +61,9 @@ export function makeAdapter(spec) {
     return {
       lang: id, name: dir.split('/').pop(), dir: rel(root, dir), manifest: rel(root, join(dir, primary)),
       declared, lockfile,
-      declaredMajors: majors.join(','), drift: majors.length > 1,
+      declaredMajors: majors.join(','),
+      pinnedMajors: pinMajors.join(','), floorMajors: floorMajors.join(','),
+      drift: pinMajors.length > 1,
       ...(Object.keys(otherAxis).length ? { otherAxis } : {}),
       deps: countDeps ? countDeps(manifestText) : 0, devDeps: 0,
       abiNote,

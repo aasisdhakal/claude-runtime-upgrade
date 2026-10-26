@@ -40,7 +40,10 @@ export function scan({ dir, root, dockerImages, ciText }) {
     lang: id, name: (projFile || dir.split('/').pop()).replace(/\.(csproj|fsproj|vbproj)$/, ''),
     dir: rel(root, dir), manifest: rel(root, join(dir, projFile || 'global.json')),
     declared, lockfile: existsSync(join(dir, 'packages.lock.json')) ? 'packages.lock.json' : '',
-    declaredMajors: majors.join(','), drift: majors.length > 1,
+    declaredMajors: majors.join(','),
+    // <TargetFrameworks>net10.0;net9.0;net8.0</TargetFrameworks> is deliberate
+    // multi-targeting — the whole point of the file, never disagreement
+    drift: tfms.length > 1 ? false : majors.length > 1,
     deps: (proj.match(/<PackageReference\s/g) || []).length, devDeps: 0,
     multiTargeted: tfms.length > 1,
     abiNote: 'TFM (net8.0) is the compatibility axis; global.json rollForward decides which SDK a build accepts.',

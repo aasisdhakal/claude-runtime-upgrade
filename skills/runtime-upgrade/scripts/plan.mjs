@@ -25,6 +25,17 @@ const POLICY = flag('policy') === 'report' ? 'report' : 'gate';
 const FORMAT = flag('format') === 'md' ? 'md' : 'json';
 const ONLY = flag('only') ? flag('only').split(',').map(s => s.trim()) : null;
 
+// .NET numbers the SDK (10.0.100) and the runtime (10.0.13) differently, so
+// comparing a global.json SDK build against a runtime release reads as a
+// downgrade. The TFM is the compatibility axis — use it.
+const DEPLOY_PINS = ['targetFramework', 'dockerfile', 'nvmrc', 'nodeVersion', 'phpVersionFile',
+                     'pythonVersion', 'rubyVersion', 'perlVersion', 'denoVersionFile',
+                     'bunVersionFile', 'toolVersions', 'lockPlatform', 'sdkmanrc', 'javaVersionFile'];
+const FLOORS = ['engines', 'requirePhp', 'requiresPython', 'poetryPython', 'pythonRequires',
+                'gemfileRuby', 'gemspecRuby', 'rustVersion', 'minimumOtp', 'makefileOtp',
+                'goDirective', 'mavenRelease', 'javaVersionProp', 'kotlinPlugin', 'versionCatalog',
+                'scalaVersion', 'mixElixir', 'cpanfilePerl', 'globalJsonSdk', 'denoJson'];
+
 // ───────────── discover ─────────────
 const det = runJson(process.execPath, [S('detect.mjs'), DIR]);
 if (!det.data) die('detect.mjs produced no output: ' + (det.stderr || '').slice(0, 300));
@@ -95,7 +106,11 @@ for (const t of targets) {
     ((r?.gateCapable && gateValue > 0) || advBlocking > 0 || blockers.some(b => b.severity === 'blocker'));
 
   // ── estimate ──
-  const points = estimate({ pins, ci, cfg, blockers, scan: sc, deps: (t.deps || 0) + (t.devDeps || 0), fwEol });
+  // counted from the published cycle list, not inferred from the numbers
+  const crossed = r?.distance?.cyclesCrossed ?? 0;
+  const editionJump = !!r?.distance?.editionJump;
+  const points = estimate({ pins, ci, cfg, blockers, scan: sc,
+    deps: (t.deps || 0) + (t.devDeps || 0), fwEol, crossed, edition: editionJump });
 
   plans.push({
     dir: t.dir, lang: t.lang, name: t.name,
@@ -123,12 +138,22 @@ for (const t of targets) {
              config: cfg.map(e => `${e.file} (${e.rule})`),
              ciMatrix: matrix },
     blockers,
-    verdict: gateFails ? 'blocked' : blockers.length ? 'proceed-with-conditions' : 'proceed',
+    verdict: gateFails ? 'blocked'
+           : (blockers.length || editionJump || crossed >= 3) ? 'proceed-with-conditions'
+           : 'proceed',
     estimatePoints: points,
     steps: steps({ lang: t.lang, dir: t.dir, absDir: dir, current, target, pins, ci, cfg, blockers, behaviour, a, r }),
     rollback: rollback({ lang: t.lang, dir: t.dir, current, target }),
     testStrategy: testStrategy({ lang: t.lang, current, target, behaviour }),
-    risk: risk({ t, blockers, behaviour, a, advBlocking }),
+    cyclesCrossed: crossed, editionJump,
+    stepwise: editionJump
+      ? `${current} → ${target} crosses a language EDITION boundary. This is a port: expect source changes `
+        + `throughout, and plan it as its own project rather than a version bump.`
+      : crossed >= 3
+      ? `Do NOT go ${current} → ${target} in one change. Move one release cycle at a time, testing and committing between each.`
+      : null,
+    risk: risk({ t, blockers, behaviour, a, advBlocking, crossed, edition: editionJump,
+                 lang: t.lang, from: current, to: target }),
   });
 }
 
@@ -137,16 +162,30 @@ function dedupeByFileRule(list) {
   return list.filter(f => { const k = f.file + '::' + f.what; if (seen.has(k)) return false; seen.add(k); return true; });
 }
 
+/**
+ * What "current" means depends on what the repo is.
+ *   An APPLICATION pins a deployment version (.nvmrc, Dockerfile, .tool-versions)
+ *     — that is what runs, and what you are moving.
+ *   A LIBRARY declares only a floor (`^8.1`, `>=3.10`) and tests a matrix above
+ *     it. Its constraint is the FLOOR; the newest version CI happens to test is
+ *     not what you are upgrading from.
+ * Taking the CI version made php-carbon look like 8.5 -> 8.5.12: a no-op.
+ */
 function pickCurrent(t) {
-  // the pin that actually runs beats the range that is merely declared
   const d = t.declared || {};
-  for (const k of ['dockerfile', 'ci', 'nvmrc', 'phpVersionFile', 'pythonVersion', 'rubyVersion',
-                   'toolVersions', 'lockPlatform', 'goDirective', 'requirePhp', 'engines', 'requiresPython'])
-    if (d[k]) { const m = String(d[k]).match(/(\d+(?:\.\d+){0,2})/); if (m) return m[1]; }
-  return String(t.declaredMajors || '').split(',')[0];
+  const num = v => {
+    const t = String(v).replace(/^net(?:coreapp)?/, '').split(';')[0];   // net10.0 -> 10.0
+    return (t.match(/(\d+(?:\.\d+){0,2})/) || [])[1];
+  };
+  for (const k of DEPLOY_PINS) if (d[k]) { const m = num(d[k]); if (m) return m; }
+  for (const k of FLOORS)      if (d[k]) { const m = num(d[k]); if (m) return m; }
+  // last resort: the LOWEST declared major, never the highest
+  const all = String(t.declaredMajors || '').split(',').filter(Boolean)
+    .sort((a, b) => parseFloat(a) - parseFloat(b));
+  return all[0] || '';
 }
 
-function estimate({ pins, ci, cfg, blockers, scan, deps, fwEol }) {
+function estimate({ pins, ci, cfg, blockers, scan, deps, fwEol, crossed, edition }) {
   let p = 1;                                                 // the pin edit itself
   p += Math.min(3, Math.ceil((ci.length + cfg.length) / 2)); // config surface
   p += blockers.filter(b => b.severity === 'blocker').length * 3;
@@ -154,7 +193,9 @@ function estimate({ pins, ci, cfg, blockers, scan, deps, fwEol }) {
   p += Math.min(5, Math.floor((scan.findings || 0) / 10));
   p += deps > 80 ? 5 : deps > 40 ? 3 : deps > 15 ? 2 : 1;    // dependency surface
   p += fwEol.length * 5;                                     // a dead framework is its own project
-  return Math.min(34, p);
+  // distance is the strongest predictor of effort and nothing above measured it
+  p += edition ? 21 : crossed >= 6 ? 8 : crossed >= 3 ? 5 : crossed >= 2 ? 3 : crossed === 1 ? 1 : 0;
+  return Math.min(55, p);
 }
 
 function steps({ lang, dir, absDir, current, target, pins, ci, cfg, blockers, behaviour, a, r }) {
@@ -254,7 +295,7 @@ function testStrategy({ lang, current, target, behaviour }) {
   };
 }
 
-function risk({ t, blockers, behaviour, a, advBlocking }) {
+function risk({ t, blockers, behaviour, a, advBlocking, crossed, edition, lang, from, to }) {
   const signals = [];
   if (t.containerOnly) signals.push('runtime pinned only in a Dockerfile — nothing in the manifest enforces it');
   if (t.drift) signals.push(`version drift across ${t.declaredMajors} — a defect that predates this upgrade`);
@@ -262,8 +303,13 @@ function risk({ t, blockers, behaviour, a, advBlocking }) {
   if (advBlocking > 0) signals.push(`${advBlocking} critical/high dependency advisories open`);
   if ((a.nativeBlockers || []).length) signals.push(`${a.nativeBlockers.length} ABI-pinned native addon(s)`);
   if ((t.deps || 0) + (t.devDeps || 0) > 80) signals.push('large dependency surface — expect unrelated breakage from the lockfile refresh');
-  const level = blockers.some(b => b.severity === 'blocker') ? 'high'
-              : signals.length >= 3 ? 'high' : signals.length ? 'medium' : 'low';
+  if (edition) signals.push(
+    `${from} → ${to} crosses a language EDITION boundary — plan it as a port, not a version bump`);
+  else if (crossed >= 6) signals.push(`${crossed} release cycles in one jump — move one cycle at a time`);
+  else if (crossed >= 3) signals.push(`${crossed} release cycles crossed`);
+  const level = (edition || blockers.some(b => b.severity === 'blocker') || crossed >= 6) ? 'high'
+              : (crossed >= 3 || signals.length >= 3) ? 'medium'
+              : signals.length ? 'medium' : 'low';
   return { level, signals: signals.length ? signals : ['no elevated risk signals detected'] };
 }
 
@@ -321,6 +367,7 @@ function markdown(o) {
     L.push(`**Verdict:** ${p.verdict} · **Risk:** ${p.risk.level} · **Estimate:** ${p.estimatePoints} points`, '');
     if (p.eol.isEol) L.push(`> **EOL since ${p.eol.date}.** Target supported to ${p.eol.targetEol}.`, '');
     if (p.drift) L.push(`> **Version drift:** ${p.drift.majors} — a defect that predates this upgrade.`, '');
+    if (p.stepwise) L.push(`> ⚠ **${p.stepwise}**`, '');
     if (p.cve.gateCapable) L.push(`**Runtime CVEs:** ${p.cve.currentBlocking} → ${p.cve.targetBlocking} (${p.cve.removed} removed)`, '');
     else L.push(`**Runtime CVEs:** not gateable — ${(p.cve.note || '').slice(0, 160)}`, '');
     if (p.dependencyAdvisories.critical != null)

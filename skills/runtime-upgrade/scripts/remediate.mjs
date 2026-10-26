@@ -13,7 +13,7 @@
 import { resolve, join, existsSync, readText, emit, die } from './lib/io.mjs';
 import { have, run, runJson } from './lib/sh.mjs';
 import { byId } from './adapters/index.mjs';
-import { planPinEdits, unified } from './lib/edits.mjs';
+import { planPinEdits, planAddPin, unified } from './lib/edits.mjs';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -102,6 +102,21 @@ const DEP_RECIPES = {
 
 // ---------------- step 1: runtime pins ----------------
 const { edits, unsupported } = planPinEdits(A.id, DIR, target);
+// A project that declares the runtime nowhere in its manifest has nothing to
+// rewrite — and is precisely the project that needs a pin. Add one.
+let addedPin = null;
+let alreadyCurrent = false;
+if (!edits.length && !argv.includes('--no-add-pin')) {
+  addedPin = planAddPin(A.id, DIR, target);
+  if (addedPin) edits.push(addedPin);
+  else {
+    // no rewrite AND no pin to add: either the project is already on the target,
+    // or an edit was deliberately declined (a Scala cross-build val, say).
+    // Saying "0 pins" for both is how a refusal reads as a no-op.
+    const probe = planPinEdits(A.id, DIR, target + '.0-probe');
+    alreadyCurrent = probe.edits.length === 0;
+  }
+}
 const pinDiffs = edits.map(e => ({ file: e.file, rule: e.rule, diff: unified(e.file, e.before, e.after) }));
 
 // ---------------- step 2: dependency packages ----------------
@@ -147,10 +162,18 @@ if (APPLY) {
     const r = run(c, a, { cwd: DIR, timeout: 900000 });
     applied.deps = { command: deps.command, ok: r.ok, exit: r.status, output: (r.stdout || r.stderr).slice(0, 6000) };
   }
-  if (LOCK && recipe?.lockfile && have(recipe.tool)) {
+  // regenerating a lockfile is right; CREATING one the project never had is not
+  const LOCK_FILES = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb',
+                      'composer.lock', 'go.sum', 'Cargo.lock', 'Gemfile.lock', 'poetry.lock',
+                      'uv.lock', 'pdm.lock', 'Pipfile.lock', 'mix.lock', 'rebar.lock',
+                      'packages.lock.json', 'deno.lock', 'cpanfile.snapshot'];
+  const hadLock = LOCK_FILES.some(f => existsSync(join(DIR, f)));
+  if (LOCK && hadLock && recipe?.lockfile && have(recipe.tool)) {
     const r = run(recipe.tool, recipe.lockfile, { cwd: DIR, timeout: 900000 });
     applied.lockfile = { command: [recipe.tool, ...recipe.lockfile].join(' '), ok: r.ok,
                          output: (r.stdout || r.stderr).slice(0, 3000) };
+  } else if (LOCK && !hadLock) {
+    applied.lockfile = { skipped: 'the project has no lockfile — creating one is not this tool\'s call' };
   }
 }
 
@@ -158,7 +181,12 @@ emit({
   lang: A.id, dir: DIR, target,
   mode: APPLY ? 'apply' : 'dry-run',
   unsupportedLanguage: unsupported || undefined,
-  runtimePins: { count: edits.length, files: edits.map(e => `${e.file} (${e.rule})`), diffs: pinDiffs },
+  runtimePins: { count: edits.length, files: edits.map(e => `${e.file} (${e.rule})`), diffs: pinDiffs,
+                 addedPin: addedPin ? { file: addedPin.file, created: addedPin.created,
+                   why: 'the project declared no runtime in its manifest — nothing enforced the version' } : null,
+                 status: edits.length ? 'rewritten'
+                       : alreadyCurrent ? 'already-on-target'
+                       : 'declined — an edit was possible but unsafe (see the language playbook)' },
   dependencies: deps,
   applied: APPLY ? applied : undefined,
   nextSteps: APPLY

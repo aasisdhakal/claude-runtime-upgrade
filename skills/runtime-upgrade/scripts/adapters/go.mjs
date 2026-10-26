@@ -1,4 +1,5 @@
 import { join, existsSync, readText, rel } from '../lib/io.mjs';
+import { classifyDeclared } from '../lib/semver.mjs';
 import { osvAdvisories } from '../lib/osv.mjs';
 
 export const id = 'go';
@@ -37,15 +38,19 @@ export function scan({ dir, root, dockerImages, ciText }) {
     ci:            ciText,
   };
   const module = (gomod.match(/^module\s+(\S+)/m) || [])[1] || dir.split('/').pop();
-  const majors = [...new Set(Object.values(declared)
-    .map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const { pins, floors } = classifyDeclared(declared);
+  const pinMajors = [...new Set(Object.values(pins).map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const floorMajors = [...new Set(Object.values(floors).map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const majors = [...new Set([...pinMajors, ...floorMajors])];
   const deps = (gomod.match(/^\s*require\s*\(/m)
     ? (gomod.split(/^\s*require\s*\(/m)[1] || '').split(/^\s*\)/m)[0].split('\n').filter(l => l.trim() && !l.trim().startsWith('//')).length
     : (gomod.match(/^require\s+\S+/gm) || []).length);
   return {
     lang: id, name: module.split('/').pop(), dir: rel(root, dir), manifest: rel(root, join(dir, 'go.mod')),
     declared, lockfile: existsSync(join(dir, 'go.sum')) ? 'go.sum' : '',
-    declaredMajors: majors.join(','), drift: majors.length > 1,
+    declaredMajors: majors.join(','),
+    pinnedMajors: pinMajors.join(','), floorMajors: floorMajors.join(','),
+    drift: pinMajors.length > 1,
     deps, devDeps: 0,
     // Go links statically; CGO_ENABLED is the only native axis that matters.
     cgo: /\bC\b/.test(gomod) || existsSync(join(dir, 'cgo.go')),

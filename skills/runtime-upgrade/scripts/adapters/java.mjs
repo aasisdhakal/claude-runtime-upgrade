@@ -1,4 +1,5 @@
 import { join, existsSync, readText, readdirSync, rel } from '../lib/io.mjs';
+import { classifyDeclared } from '../lib/semver.mjs';
 
 export const id = 'java';
 export const label = 'Java';
@@ -38,7 +39,10 @@ export function scan({ dir, root, dockerImages, ciText }) {
   };
   // Java majors are bare integers (17, 21, 25) — "1.8" style means 8.
   const norm = v => { const s = String(v); const m = s.match(/^1\.(\d+)/) || s.match(/(\d+)/); return m ? m[1] : ''; };
-  const majors = [...new Set(Object.values(declared).map(norm).filter(Boolean))];
+  const { pins, floors } = classifyDeclared(declared);
+  const pinMajors = [...new Set(Object.values(pins).map(norm).filter(Boolean))];
+  const floorMajors = [...new Set(Object.values(floors).map(norm).filter(Boolean))];
+  const majors = [...new Set([...pinMajors, ...floorMajors])];
   const build = existsSync(join(dir, 'pom.xml')) ? 'maven' : 'gradle';
   const name = (pom.match(/<artifactId>\s*([^<\s]+)/) || [])[1] || dir.split('/').pop();
   return {
@@ -46,7 +50,9 @@ export function scan({ dir, root, dockerImages, ciText }) {
     manifest: rel(root, join(dir, build === 'maven' ? 'pom.xml' : 'build.gradle')),
     declared, build,
     lockfile: existsSync(join(dir, 'gradle.lockfile')) ? 'gradle.lockfile' : '',
-    declaredMajors: majors.join(','), drift: majors.length > 1,
+    declaredMajors: majors.join(','),
+    pinnedMajors: pinMajors.join(','), floorMajors: floorMajors.join(','),
+    drift: pinMajors.length > 1,
     deps: build === 'maven' ? (pom.match(/<dependency>/g) || []).length
                             : (gradle.match(/^\s*(implementation|api|compileOnly|runtimeOnly)\s/gm) || []).length,
     devDeps: (pom.match(/<scope>\s*test\s*<\/scope>/g) || []).length,

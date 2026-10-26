@@ -22,11 +22,15 @@ export const deno = makeAdapter({
 
 export const bun = makeAdapter({
   id: 'bun', label: 'Bun',
-  manifests: ['bunfig.toml'],
+  // package.json is also a Bun manifest; a repo with no bun lockfile and no
+  // bun version is pruned as a non-target, so this does not shadow Node.
+  manifests: ['bunfig.toml', 'package.json'],
   eolProduct: 'bun', osvEcosystem: 'npm',
   imageNames: ['oven/bun', 'bun'], ciKeyWords: ['bun'],
   lockfiles: ['bun.lock', 'bun.lockb'],
-  sources: { bunVersionFile: { file: '.bun-version' } },
+  sources: { bunVersionFile: { file: '.bun-version' },
+             enginesBun:     { file: 'package.json', re: /"engines"\s*:\s*\{[^}]*?"bun"\s*:\s*"([^"]+)"/s },
+             packageManager: { file: 'package.json', re: /"packageManager"\s*:\s*"bun@([^"]+)"/ } },
   versionShape: 'major',
   abiNote: 'single static binary; native addons use N-API, which is ABI-stable.',
   gateNote: no('Bun'),
@@ -48,11 +52,13 @@ export const elixir = makeAdapter({
 
 export const erlang = makeAdapter({
   id: 'erlang', label: 'Erlang/OTP',
-  manifests: ['rebar.config'],
+  manifests: ['rebar.config', 'erlang.mk'],
   eolProduct: 'erlang', osvEcosystem: 'Hex',
   imageNames: ['erlang'], ciKeyWords: ['otp', 'erlang'],
   lockfiles: ['rebar.lock'],
   sources: { minimumOtp: { file: 'rebar.config', re: /minimum_otp_vsn\s*,\s*"([^"]+)"/ },
+             // erlang.mk projects pin OTP in the Makefile: `AUTO_CI_OTP ?= OTP-LATEST-27+`
+             makefileOtp: { file: 'Makefile', re: /AUTO_CI_OTP\s*\?*=\s*OTP-(?:LATEST-)?(\d+)/ },
              toolVersionsOtp: { file: '.tool-versions', re: /^erlang\s+(\S+)/m } },
   versionShape: 'major',
   abiNote: 'NIFs and ports are compiled against the OTP release; a new OTP MAJOR needs a rebuild.',
@@ -68,6 +74,8 @@ export const kotlin = makeAdapter({
   lockfiles: ['gradle.lockfile'],
   sources: { kotlinPlugin:  { file: 'build.gradle.kts', re: /kotlin\(["']jvm["']\)\s*version\s*["']([^"']+)/ },
              gradleProps:   { file: 'gradle.properties', re: /kotlin\.version\s*=\s*(\S+)/ },
+             // modern Gradle keeps versions in a TOML catalog, not the build script
+             versionCatalog:{ file: 'gradle/libs.versions.toml', re: /^\s*kotlin\s*=\s*["']([^"']+)/m },
              jvmToolchain:  { file: 'build.gradle.kts', re: /jvmToolchain\((\d+)\)/ } },
   driftExclude: ['jvmToolchain'],   // the JVM target is a separate axis from the Kotlin version
   abiNote: 'Kotlin targets a JVM bytecode level; the Kotlin compiler version and the JVM target move independently.',
@@ -81,10 +89,26 @@ export const scala = makeAdapter({
   eolProduct: 'scala', osvEcosystem: 'Maven',
   imageNames: ['sbtscala/scala-sbt', 'hseeberger/scala-sbt'], ciKeyWords: ['scala'],
   lockfiles: [],
-  sources: { scalaVersion:      { file: 'build.sbt', re: /scalaVersion\s*:=\s*"([^"]+)"/ },
+  sources: { scalaVersion:      { file: 'build.sbt', re: /scalaVersion\s*:=\s*"?([\w.]+)"?/ },
              crossScalaVersions:{ file: 'build.sbt', re: /crossScalaVersions\s*:=\s*Seq\(([^)]+)\)/ },
              scalaVersionFile:  { file: '.scala-version' } },
   driftExclude: ['crossScalaVersions'],   // a cross-build matrix is deliberate breadth
+  postProcess: (declared, read) => {
+    // `ThisBuild / scalaVersion := Scala213` names a val defined above it
+    const sbt = read('build.sbt');
+    for (const key of ['scalaVersion', 'crossScalaVersions']) {
+      const v = declared[key];
+      if (!v || /^\d+(\.\d+)/.test(v)) continue;   // already a literal version
+      const ident = (v.match(/[A-Za-z_]\w*/) || [])[0];
+      if (!ident) continue;
+      const def = sbt.match(new RegExp(`val\\s+${ident}\\s*=\\s*["']([^"']+)["']`));
+      if (def) declared[key] = def[1];
+    }
+    if (!declared.scalaVersion) {
+      const direct = sbt.match(/scalaVersion\s*:=\s*["']([^"']+)["']/);
+      if (direct) declared.scalaVersion = direct[1];
+    }
+  },
   abiNote: 'Scala 2 binaries are NOT compatible across minors (2.12 vs 2.13); Scala 3 keeps TASTy compatibility forward only.',
   gateNote: no('Scala'),
   countDeps: t => (t.match(/libraryDependencies\s*\+?\+?=/g) || []).length,

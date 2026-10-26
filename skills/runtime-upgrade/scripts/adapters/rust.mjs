@@ -1,4 +1,5 @@
 import { join, existsSync, readText, rel } from '../lib/io.mjs';
+import { classifyDeclared } from '../lib/semver.mjs';
 
 export const id = 'rust';
 export const label = 'Rust';
@@ -25,14 +26,18 @@ export function scan({ dir, root, dockerImages, ciText }) {
     dockerfile:   dockerImages.filter(s => /^rust/i.test(s)).join(' | '),
     ci:           ciText,
   };
-  const majors = [...new Set(Object.entries(declared)
-    .filter(([k]) => k !== 'edition')
-    .map(([, v]) => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const considered = Object.fromEntries(Object.entries(declared).filter(([k]) => k !== 'edition'));
+  const { pins, floors } = classifyDeclared(considered);
+  const pinMajors = [...new Set(Object.values(pins).map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const floorMajors = [...new Set(Object.values(floors).map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const majors = [...new Set([...pinMajors, ...floorMajors])];
   const name = (cargo.match(/^\s*name\s*=\s*["']([^"']+)/m) || [])[1] || dir.split('/').pop();
   return {
     lang: id, name, dir: rel(root, dir), manifest: rel(root, join(dir, 'Cargo.toml')),
     declared, lockfile: existsSync(join(dir, 'Cargo.lock')) ? 'Cargo.lock' : '',
-    declaredMajors: majors.join(','), drift: majors.length > 1,
+    declaredMajors: majors.join(','),
+    pinnedMajors: pinMajors.join(','), floorMajors: floorMajors.join(','),
+    drift: pinMajors.length > 1,
     deps: (cargo.split(/^\[dependencies\]/m)[1] || '').split(/^\[/m)[0].split('\n').filter(l => /^\s*[\w-]+\s*=/.test(l)).length,
     devDeps: 0,
     // No stable ABI, but crates compile from source every time — nothing to prebuild.

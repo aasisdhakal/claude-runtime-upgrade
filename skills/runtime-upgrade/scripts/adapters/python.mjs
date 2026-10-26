@@ -1,4 +1,5 @@
 import { join, existsSync, readText, readJson, rel } from '../lib/io.mjs';
+import { classifyDeclared } from '../lib/semver.mjs';
 
 export const id = 'python';
 export const label = 'Python';
@@ -32,9 +33,11 @@ export function scan({ dir, root, dockerImages, ciText }) {
     dockerfile:     dockerImages.filter(s => /^(python|pypy)[:@]/i.test(s)).join(' | '),
     ci:             ciText,
   };
-  const majors = [...new Set(Object.entries(declared)
-    .filter(([k]) => k !== 'toxEnvs')
-    .map(([, v]) => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const considered = Object.fromEntries(Object.entries(declared).filter(([k]) => k !== 'toxEnvs'));
+  const { pins, floors } = classifyDeclared(considered);
+  const pinMajors = [...new Set(Object.values(pins).map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const floorMajors = [...new Set(Object.values(floors).map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const majors = [...new Set([...pinMajors, ...floorMajors])];
   let lockfile = '';
   for (const l of ['poetry.lock', 'Pipfile.lock', 'uv.lock', 'pdm.lock', 'requirements.lock']) {
     if (existsSync(join(dir, l))) { lockfile = l; break; }
@@ -45,7 +48,9 @@ export function scan({ dir, root, dockerImages, ciText }) {
     lang: id, name, dir: rel(root, dir),
     manifest: rel(root, join(dir, existsSync(join(dir, 'pyproject.toml')) ? 'pyproject.toml' : 'requirements.txt')),
     declared, lockfile,
-    declaredMajors: majors.join(','), drift: majors.length > 1,
+    declaredMajors: majors.join(','),
+    pinnedMajors: pinMajors.join(','), floorMajors: floorMajors.join(','),
+    drift: pinMajors.length > 1,
     deps: reqs ? reqs.split('\n').filter(l => l.trim() && !l.trim().startsWith('#')).length
                : (pyproject.match(/^\s*[\w.-]+\s*=\s*["\^~><=]/gm) || []).length,
     devDeps: 0,

@@ -1,5 +1,5 @@
 import { join, existsSync, readJson, readText, rel } from '../lib/io.mjs';
-import { rangeMajorMinor } from '../lib/semver.mjs';
+import { rangeMajorMinor, classifyDeclared } from '../lib/semver.mjs';
 
 export const id = 'php';
 export const label = 'PHP';
@@ -35,7 +35,10 @@ export function scan({ dir, root, dockerImages, ciText }) {
     dockerfile:     dockerImages.filter(s => /^php/i.test(s)).join(' | '),
     ci:             ciText,
   };
-  const majors = [...new Set(Object.values(declared).map(rangeMajorMinor).filter(Boolean))];
+  const { pins, floors } = classifyDeclared(declared);
+  const pinMajors = [...new Set(Object.values(pins).map(rangeMajorMinor).filter(Boolean))];
+  const floorMajors = [...new Set(Object.values(floors).map(rangeMajorMinor).filter(Boolean))];
+  const majors = [...new Set([...pinMajors, ...floorMajors])];
   return {
     lang: id,
     name: cj.name || dir.split('/').pop(),
@@ -44,7 +47,8 @@ export function scan({ dir, root, dockerImages, ciText }) {
     declared,
     lockfile: existsSync(join(dir, 'composer.lock')) ? 'composer.lock' : '',
     declaredMajors: majors.join(','),
-    drift: majors.length > 1,
+    pinnedMajors: pinMajors.join(','), floorMajors: floorMajors.join(','),
+    drift: pinMajors.length > 1,
     deps: Object.keys(cj.require || {}).length,
     devDeps: Object.keys(cj['require-dev'] || {}).length,
     // config.platform.php makes Composer resolve AS IF on that version regardless

@@ -56,6 +56,9 @@ if (!target) {
   const best = pool.sort((a, b) => compare(String(a.cycle), String(b.cycle))).pop();
   target = best?.latest || '';
 }
+// amazon-corretto publishes latest as "27.0.1.0.10"; nobody targets that string.
+// For integer-major runtimes the usable target is the major itself.
+if (intMajor && /^\d+(\.\d+){3,}/.test(String(target))) target = String(target).split('.')[0];
 const tgtMajor = majorOf(target);
 const cur = find(curMajor), tgt = find(tgtMajor);
 
@@ -113,6 +116,27 @@ function summarise(hits, version) {
   };
 }
 
+/**
+ * Release cycles between current and target, counted from the actual
+ * endoflife.date cycle list. Heuristics got this badly wrong: Ruby 2.7 -> 4.0
+ * is six published cycles, not "two majors"; Deno 2.0 -> 2.9 is nine.
+ */
+const cycleOrder = cycles.map(c => String(c.cycle)).sort((a, b) => compare(a, b));
+const idx = v => {
+  const m = majorOf(v);
+  let i = cycleOrder.indexOf(m);
+  if (i >= 0) return i;
+  // not a published cycle (a pin below the oldest tracked one) — clamp
+  for (let k = 0; k < cycleOrder.length; k++) if (compare(cycleOrder[k], m) >= 0) return k;
+  return cycleOrder.length - 1;
+};
+const ci = idx(curMajor), ti = idx(tgtMajor);
+const cyclesCrossed = Math.max(0, ti - ci);
+// an EDITION boundary is a port, not an upgrade — these are the real ones
+const EDITIONS = { python: [['2', '3']], scala: [['2', '3']], perl: [['5', '6']] };
+const editionJump = (EDITIONS[A.id] || []).some(([f, t]) =>
+  String(curMajor).startsWith(f) && String(tgtMajor).startsWith(t));
+
 const curEol = typeof cur.eol === 'string' ? cur.eol : (cur.eol === false ? null : '');
 const curSup = typeof cur.support === 'string' ? cur.support : (cur.support === false ? null : '');
 
@@ -142,6 +166,13 @@ emit({
     cve: targetCve,
     autoSelected: !targetArg,
   },
+  distance: { cyclesCrossed, editionJump,
+              from: curMajor, to: tgtMajor,
+              publishedCycles: cycleOrder.length,
+              note: editionJump
+                ? 'this crosses a language EDITION boundary — plan it as a port, not a version bump'
+                : cyclesCrossed >= 4 ? 'several release cycles in one jump — move one cycle at a time'
+                : null },
   cveDelta: {
     blockingRemoved: (currentCve.blocking || 0) - (targetCve.blocking || 0),
     totalRemoved: (currentCve.total || 0) - (targetCve.total || 0),

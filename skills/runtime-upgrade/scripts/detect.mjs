@@ -109,12 +109,23 @@ function manifestDeps(dir, lang) {
 }
 
 // ---------- locate manifests + dockerfiles ----------
-const manifestPaths = walk(ROOT, { match: matchesManifest });
+const NOISE = /(^|\/)(examples?|samples?|fixtures?|testdata|test-?data|benchmarks?|docs?|website|demo)(\/|$)/i;
+const manifestPaths = walk(ROOT, { match: matchesManifest })
+  // example and fixture trees are not deployables; they drown the real targets
+  .filter(p => !NOISE.test(rel(ROOT, p)));
 const dockerPaths = walk(ROOT, { match: n => n === 'Dockerfile' || n.startsWith('Dockerfile.') });
 
 // ---------- classify repo shape ----------
 const rootPkg = readJson(join(ROOT, 'package.json'));
 const rootComposer = readJson(join(ROOT, 'composer.json'));
+// shape was Node/PHP-only: a repo with go.mod or pyproject.toml at its root
+// was classified "no-manifest", which is the one shape that means "stop".
+const rootManifests = [];
+for (const a of adapters) for (const m of a.manifests)
+  if (existsSync(join(ROOT, m)) && !rootManifests.includes(m)) rootManifests.push(m);
+const rootLangs = [...new Set(adapters
+  .filter(a => a.manifests.some(m => existsSync(join(ROOT, m))))
+  .map(a => a.id))];
 const isWorkspace =
   !!(rootPkg && (rootPkg.workspaces || rootPkg.private && manifestPaths.length > 2)) ||
   existsSync(join(ROOT, 'pnpm-workspace.yaml')) ||
@@ -129,13 +140,7 @@ try {
   }
 } catch {}
 
-let shape;
-if (gitChildren >= 2) shape = 'polyrepo';
-else if (isWorkspace) shape = 'monorepo';
-else if (rootPkg && rootComposer) shape = 'mixed-single';
-else if (rootPkg || rootComposer) shape = 'single';
-else if (dockerPaths.length) shape = 'container-only';
-else shape = 'no-manifest';
+let shape;   // provisional — finalised below, once targets are known
 
 // ---------- scan each manifest with its adapter ----------
 const targets = [];
@@ -191,6 +196,21 @@ const meaningful = targets.filter(t => t.error || t.containerOnly || t.declaredM
                                    || t.deps > 0 || t.devDeps > 0 || t.lockfile);
 targets.length = 0; targets.push(...meaningful);
 
+// Shape is decided from RESOLVED targets, not from which adapters merely claim
+// a filename. Bun claims package.json and Kotlin claims build.gradle.kts, so
+// classifying on claims alone reported every Node repo as "mixed-single".
+// a container-only target has no manifest, so it must not make the repo look
+// like a manifest-pinned single-language project
+const rootTargetLangs = [...new Set(targets
+  .filter(t => t.dir === '.' && t.declaredMajors && !t.containerOnly).map(t => t.lang))];
+if (gitChildren >= 2) shape = 'polyrepo';
+else if (isWorkspace) shape = 'monorepo';
+else if (rootTargetLangs.length > 1) shape = 'mixed-single';
+else if (rootTargetLangs.length === 1) shape = 'single';
+else if (targets.some(t => !t.containerOnly)) shape = 'multi-package';
+else if (targets.length || dockerPaths.length) shape = 'container-only';
+else shape = 'no-manifest';
+
 const driftCount = targets.filter(t => t.drift).length;
 const undeclared = targets.filter(t => !t.declaredMajors).length;
 
@@ -207,6 +227,7 @@ emit({
     monorepo: 'upgrade the ROOT runtime pin once; each workspace gets its own compat pass. Do not file one ticket per package',
     polyrepo: 'each repo is its own unit of work with its own branch and rollback',
     'mixed-single': 'two runtimes in one repo — run both adapters, upgrade them in SEPARATE commits',
+    'multi-package': 'no manifest at the root, but packages below it. Treat each as its own target; the root pins nothing',
     'container-only': 'runtime pinned only in a Dockerfile. Add a manifest pin as part of the work, or nothing enforces the version',
     'no-manifest': 'nothing to upgrade until someone declares a runtime — report and stop',
   }[shape],

@@ -1,4 +1,5 @@
 import { join, existsSync, readText, readdirSync, rel } from '../lib/io.mjs';
+import { classifyDeclared } from '../lib/semver.mjs';
 
 export const id = 'ruby';
 export const label = 'Ruby';
@@ -28,12 +29,16 @@ export function scan({ dir, root, dockerImages, ciText }) {
     dockerfile:    dockerImages.filter(s => /^(ruby|jruby)[:@]/i.test(s)).join(' | '),
     ci:            ciText,
   };
-  const majors = [...new Set(Object.values(declared)
-    .map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const { pins, floors } = classifyDeclared(declared);
+  const pinMajors = [...new Set(Object.values(pins).map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const floorMajors = [...new Set(Object.values(floors).map(v => (String(v).match(/(\d+\.\d+)/) || [])[1]).filter(Boolean))];
+  const majors = [...new Set([...pinMajors, ...floorMajors])];
   return {
     lang: id, name: dir.split('/').pop(), dir: rel(root, dir), manifest: rel(root, join(dir, 'Gemfile')),
     declared, lockfile: existsSync(join(dir, 'Gemfile.lock')) ? 'Gemfile.lock' : '',
-    declaredMajors: majors.join(','), drift: majors.length > 1,
+    declaredMajors: majors.join(','),
+    pinnedMajors: pinMajors.join(','), floorMajors: floorMajors.join(','),
+    drift: pinMajors.length > 1,
     deps: (gemfile.match(/^\s*gem\s+["']/gm) || []).length, devDeps: 0,
     // C extensions relink against the interpreter ABI; a new MINOR needs a rebuild.
     abiNote: 'native gems (C extensions) must be rebuilt for a new Ruby MINOR; check Gemfile.lock PLATFORMS',

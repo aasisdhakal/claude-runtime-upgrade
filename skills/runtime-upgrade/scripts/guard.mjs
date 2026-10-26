@@ -85,15 +85,63 @@ function checks(dir) {
   return out;
 }
 
-/** manifest changed without its lockfile, or vice versa */
-function pairViolations(files) {
+/**
+ * Lines in a manifest diff that mean DEPENDENCIES moved, and therefore that the
+ * lockfile must move with them. A runtime pin (`engines.node`, the `go`
+ * directive, `rust-version`) changes no resolution, so demanding a lockfile
+ * update for it refuses correct commits — which is exactly what it did against
+ * chalk, ripgrep, click, Carbon and gorilla/mux.
+ */
+const RUNTIME_PIN_KEYS = /"(?:engines|devEngines|volta|packageManager)"|requires-python|python_requires|rust-version|required_ruby_version|^\s*[-+]\s*go\s+[\d.]|"php"\s*:|elixir:\s*"|minimum_otp_vsn|AUTO_CI_OTP|<maven\.compiler|jvmToolchain|TargetFramework|scalaVersion|MIN_PERL_VERSION|use\s+5\./;
+const DEP_SECTION = /"(?:dependencies|devDependencies|peerDependencies|optionalDependencies|require|require-dev)"|^\s*[-+]\s*(?:require|gem|implementation|api)\s|^\s*[-+]\s*[\w.-]+\s*=\s*["'][\^~>=<\d]/;
+
+const DEP_KEYS = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies',
+                  'require', 'require-dev'];
+
+/**
+ * Did the DEPENDENCIES move, or only the runtime pin?
+ *
+ * Line heuristics cannot answer this: minified JSON puts `engines` and
+ * `dependencies` on the same line, so any rule that classifies a whole line
+ * either refuses correct commits or lets real dependency drift through.
+ * For JSON manifests, compare the parsed dependency maps instead.
+ */
+function manifestChangedDeps(dir, file) {
+  const show = ref => git(dir, 'show', `${ref}:${file}`).stdout;
+  const staged = git(dir, 'show', `:${file}`).stdout;
+
+  if (/\.json$/.test(file)) {
+    try {
+      const before = JSON.parse(show('HEAD') || '{}');
+      const after = JSON.parse(staged || '{}');
+      for (const k of DEP_KEYS) {
+        // `require` in composer.json carries the php platform constraint, which
+        // is a runtime pin, not a dependency
+        const strip = o => { const c = { ...(o?.[k] || {}) }; delete c.php; delete c.node; return c; };
+        if (JSON.stringify(strip(before)) !== JSON.stringify(strip(after))) return true;
+      }
+      return false;
+    } catch { /* fall through to the line heuristic */ }
+  }
+
+  const d = git(dir, 'diff', '--cached', '-U0', '--', file).stdout;
+  const changed = d.split('\n').filter(l => /^[-+]/.test(l) && !/^(\+\+\+|---)/.test(l));
+  if (!changed.length) return false;
+  const depLines = changed.filter(l => DEP_SECTION.test(l) && !RUNTIME_PIN_KEYS.test(l));
+  return depLines.length > 0;
+}
+
+/** manifest and lockfile must move together — but only when deps actually moved */
+function pairViolations(dir, files) {
   const base = f => f.split('/').pop();
   const names = new Set(files.map(base));
   const bad = [];
   for (const [manifest, locks] of PAIRS) {
     const hasM = names.has(manifest);
     const hasL = locks.some(l => names.has(l));
-    if (hasM && !hasL) bad.push(`${manifest} changed without its lockfile (${locks[0]})`);
+    const lockExists = locks.some(l => existsSync(join(dir, l)));
+    if (hasM && !hasL && lockExists && manifestChangedDeps(dir, manifest))
+      bad.push(`${manifest} dependencies changed without its lockfile (${locks.find(l => existsSync(join(dir, l)))})`);
     if (hasL && !hasM) bad.push(`a lockfile changed without ${manifest}`);
   }
   return bad;
@@ -163,7 +211,7 @@ if (cmd === 'commit') {
   const files = stagedFiles(DIR);
   if (!files.length) die('nothing to commit');
 
-  const violations = [...pairViolations(files)];
+  const violations = [...pairViolations(DIR, files)];
   const secrets = secretScan(DIR, files);
   if (secrets.length) violations.push(...secrets);
 

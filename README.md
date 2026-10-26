@@ -180,13 +180,31 @@ Workflow({ name: 'runtime-upgrade', args: {
 ```
 Six phases, `3n + 2` agents, pipelined per target with an adversarial **Challenge** stage that tries to *refute* each blocker before it reaches the report.
 
+## Validated against real repositories
+
+Every language is exercised end to end — detect → plan → write → commit — against a real
+open-source project, not a fixture:
+
+| | | | |
+|---|---|---|---|
+| chalk · slugify (Node) | Carbon (PHP) | gorilla/mux (Go) | click (Python) |
+| sinatra (Ruby) | ripgrep (Rust) | gson (Java) | serilog (.NET) |
+| oak (Deno) | elysia (Bun) | plug (Elixir) | cowboy (Erlang) |
+| okio (Kotlin) | cats (Scala) | mojo (Perl) | |
+
+**16/16 produce a correct, committed runtime-pin change.** That sweep found bugs no fixture
+had: Scala cross-build vals being destroyed, caret constraints over-narrowed to a patch,
+Perl's zero-padded version form, `go.mod` directives taking a patch, erlang.mk Makefiles,
+Gradle version catalogs, and a lockfile-pairing rule that refused correct commits. Each is
+now a named regression test.
+
 ## Tests
 
 ```bash
 node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
-101 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
+121 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
 
 CI runs the suite on **ubuntu + macOS × Node 18/20/22/24**, plus an offline job, plus a weekly cron to catch upstream feed changes.
 

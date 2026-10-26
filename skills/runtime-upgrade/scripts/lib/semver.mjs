@@ -95,3 +95,25 @@ export function rangeMajorMinor(s) {
   const m = String(s ?? '').match(/(\d+)\.(\d+)/);
   return m ? `${m[1]}.${m[2]}` : rangeMajor(s);
 }
+
+/**
+ * A FLOOR declares a minimum ("^8.1", ">=20", "1.2 || 1.3"); a PIN declares what
+ * actually runs (".nvmrc 20.11.1", "FROM node:24-alpine").
+ *
+ * Conflating them reports drift on every healthy library: `require php ^8.1`
+ * with CI testing 8.5 is correct behaviour, not disagreement. Drift is two
+ * PINS disagreeing. A floor ABOVE the pins is a different defect entirely.
+ */
+export function isFloor(v) {
+  const s = String(v ?? '').trim();
+  if (!s) return false;
+  return /[\^~]|>=|<=|>|<|\|\||\s-\s|\*|[xX](?![\w])/.test(s);
+}
+export function classifyDeclared(declared = {}) {
+  const pins = {}, floors = {};
+  for (const [k, v] of Object.entries(declared)) {
+    if (!v) continue;
+    (isFloor(v) ? floors : pins)[k] = v;
+  }
+  return { pins, floors };
+}

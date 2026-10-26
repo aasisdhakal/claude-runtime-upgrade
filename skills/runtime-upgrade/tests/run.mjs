@@ -7,7 +7,8 @@ import { fetchJson } from '../scripts/lib/io.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
 import { adapters, byId, adaptersForManifest } from '../scripts/adapters/index.mjs';
 import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
-import { PIN_RULES, planPinEdits, unified, planCiEdits, planConfigEdits, ciMatrixAdvice } from '../scripts/lib/edits.mjs';
+import { PIN_RULES, planPinEdits, unified, planCiEdits, planConfigEdits, ciMatrixAdvice,
+         planAddPin, ADD_PIN_RULES } from '../scripts/lib/edits.mjs';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -190,6 +191,30 @@ t('php carries a gate explanation', () => ok((byId.php.gateNote || '').length > 
 t('every adapter declares required fields', () => {
   for (const a of adapters) for (const k of ['id','label','manifests','eolProduct','osvEcosystem','gateCapable','cveSource','imageRe','scan'])
     ok(a[k] !== undefined, `${a.id} missing ${k}`);
+});
+
+t('factory: every spec key is actually destructured', () => {
+  // Twice now a new spec key was added to _generated.mjs but not to the
+  // destructure in makeAdapter, producing a ReferenceError at scan time that
+  // detect.mjs swallowed into a generic "error" target.
+  const factory = readFileSync(join(HERE, '..', 'scripts', 'adapters', '_factory.mjs'), 'utf8');
+  const gen = readFileSync(join(HERE, '..', 'scripts', 'adapters', '_generated.mjs'), 'utf8');
+  const destructured = new Set(
+    (factory.match(/const \{\n([\s\S]*?)\n  \} = spec;/)?.[1] || '')
+      .split(/[,\n]/).map(x => x.trim().split(/[:=\s]/)[0]).filter(Boolean));
+  const used = new Set([...gen.matchAll(/^\s{2}([a-zA-Z]\w*):/gm)].map(m => m[1]));
+  const missing = [...used].filter(k => !destructured.has(k));
+  ok(missing.length === 0, `spec keys used but not destructured: ${missing.join(', ')}`);
+});
+t('factory: every generated adapter actually scans without throwing', () => {
+  // the ReferenceError above only surfaced on real repos, never in unit tests
+  const r = build('single-go');
+  try {
+    for (const a of adapters) {
+      if (!a.scan) continue;
+      a.scan({ dir: r, root: r, dockerImages: [], ciText: '' });   // must not throw
+    }
+  } finally { destroy(r); }
 });
 
 // ───────────────────────── discovery: every repo shape ─────────────────────────
@@ -476,15 +501,58 @@ t('guard: creates a runtime/* branch and then permits writes', () => gitRepo(r =
   const p = guard('preflight', r);
   eq(p.data.verdict, 'safe-to-write', 'clean runtime branch is writable');
 }));
-t('guard: refuses a manifest change without its lockfile', () => gitRepo(r => {
+t('guard: a runtime-pin-only change needs no lockfile update', () => gitRepo(r => {
+  // Bumping engines.node changes no resolution. Demanding a lockfile update for
+  // it refused correct commits against chalk, ripgrep, click, Carbon and mux.
   guard('branch', r, 'node', '24.22.1');
   writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=24.22.1 <25"}}');
-  const v = guard('commit', r, '-m', 'bump');
+  const v = guard('commit', r, '-m', 'pin runtime');
+  eq(v.data.verdict, 'committed', 'a pin-only change must be allowed');
+}));
+t('guard: refuses a DEPENDENCY change without its lockfile', () => gitRepo(r => {
+  guard('branch', r, 'node', '24.22.1');
+  writeFileSync(join(r, 'package.json'),
+    '{"name":"x","engines":{"node":">=20"},"dependencies":{"ms":"^2.1.3"}}');
+  const v = guard('commit', r, '-m', 'bump dep');
   eq(v.data.verdict, 'refused');
-  ok(v.data.blocked.some(b => /without its lockfile/.test(b)), 'names the pairing rule');
+  ok(v.data.blocked.some(b => /dependencies changed without its lockfile/.test(b)), 'names the rule');
   const staged = run('git', ['diff', '--cached', '--name-only'], { cwd: r }).stdout.trim();
   eq(staged, '', 'index must be reset after a refusal');
 }));
+t('guard: tells a pin from a dep even in MINIFIED json', () => {
+  // minified manifests put engines and dependencies on ONE line, so any
+  // line-based rule gets this wrong in one direction or the other
+  const r = mkdtempSync(join(tmpdir(), 'ru-min-'));
+  try {
+    run('git', ['init', '-q'], { cwd: r });
+    run('git', ['config', 'user.email', 't@t'], { cwd: r });
+    run('git', ['config', 'user.name', 'T'], { cwd: r });
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=20"},"dependencies":{"ms":"2.1.2"}}');
+    writeFileSync(join(r, 'package-lock.json'), '{"lockfileVersion":3}');
+    run('git', ['add', '-A'], { cwd: r }); run('git', ['commit', '-qm', 'init'], { cwd: r });
+    guard('branch', r, 'node', '24.22.1');
+    // same line, only the pin moves
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=24.22.1 <25"},"dependencies":{"ms":"2.1.2"}}');
+    eq(guard('commit', r, '-m', 'pin').data.verdict, 'committed', 'pin-only on one line');
+    // same line, only the dependency moves
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=24.22.1 <25"},"dependencies":{"ms":"^9.9.9"}}');
+    eq(guard('commit', r, '-m', 'dep').data.verdict, 'refused', 'dep change on one line');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('guard: composer php constraint is a pin, not a dependency', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-composer-'));
+  try {
+    run('git', ['init', '-q'], { cwd: r });
+    run('git', ['config', 'user.email', 't@t'], { cwd: r });
+    run('git', ['config', 'user.name', 'T'], { cwd: r });
+    writeFileSync(join(r, 'composer.json'), '{"name":"a/b","require":{"php":"^8.1","monolog/monolog":"^3.0"}}');
+    writeFileSync(join(r, 'composer.lock'), '{"packages":[]}');
+    run('git', ['add', '-A'], { cwd: r }); run('git', ['commit', '-qm', 'init'], { cwd: r });
+    guard('branch', r, 'php', '8.4');
+    writeFileSync(join(r, 'composer.json'), '{"name":"a/b","require":{"php":"^8.4","monolog/monolog":"^3.0"}}');
+    eq(guard('commit', r, '-m', 'pin php').data.verdict, 'committed', 'require.php is a runtime pin');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
 t('guard: commits when manifest and lockfile move together', () => gitRepo(r => {
   guard('branch', r, 'node', '24.22.1');
   writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=24.22.1 <25"}}');
@@ -675,6 +743,110 @@ t('config: tsconfig target and engine-strict move with the runtime', () => withF
   ok(/ES2023/.test(e.find(x => x.file === 'tsconfig.json').after), 'target raised');
   ok(/engine-strict=true/.test(e.find(x => x.file === '.npmrc').after), 'engines made enforcing');
 }));
+
+// ───────────────── version precision in written edits ─────────────────
+// Every case here was a real wrong edit found by running the tool against
+// real open-source repositories. A wrong edit is worse than no edit.
+console.log('\nedit precision (regressions from real repos)');
+const applyRule = (lang, target, file, before) => {
+  const r = PIN_RULES[lang](target).find(x => x.file === file || (x.glob && x.glob.test(file)));
+  ok(r, `${lang} has no rule for ${file}`);
+  return r.edit(before);
+};
+
+t('precision: go directive is major.minor, never a patch', () => {
+  // gorilla/mux: `go 1.20` became `go 1.27.3`
+  eq(applyRule('go', '1.27.3', 'go.mod', 'module x\n\ngo 1.20\n').trim().split('\n').pop(), 'go 1.27');
+});
+t('precision: composer caret takes major.minor, not a patch', () => {
+  // briannesbitt/Carbon: "^8.1" became "^8.5.12", pinning consumers to a patch
+  const out = applyRule('php', '8.5.12', 'composer.json', '{"require":{"php":"^8.1"}}');
+  ok(/"php":"\^8\.5"/.test(out), out);
+});
+t('precision: elixir ~> keeps the minor window open', () => {
+  // elixir-plug/plug: "~> 1.15" became "~> 1.20.4", narrowing >=1.20 <2.0 to >=1.20.4 <1.21
+  const out = applyRule('elixir', '1.20.4', 'mix.exs', 'def project, do: [elixir: "~> 1.15"]');
+  ok(/~> 1\.20"/.test(out), out);
+});
+t('precision: python requires-python is a minor floor', () => {
+  // pallets/click: ">=3.10" became ">=3.15.1", rejecting every earlier 3.15 patch
+  const out = applyRule('python', '3.15.1', 'pyproject.toml', '[project]\nrequires-python = ">=3.10"\n');
+  ok(/">=3\.15"/.test(out), out);
+});
+t('precision: rust MSRV is major.minor', () => {
+  // BurntSushi/ripgrep: rust-version became "1.99.1"; MSRV convention is "1.99"
+  const out = applyRule('rust', '1.99.1', 'Cargo.toml', '[package]\nrust-version = "1.96"\n');
+  ok(/rust-version = "1\.99"/.test(out), out);
+});
+t('precision: ruby required_ruby_version is a floor', () => {
+  // sinatra: '>= 2.7.8' became '>= 4.0.9'
+  const out = applyRule('ruby', '4.0.9', 'x.gemspec', "s.required_ruby_version = '>= 2.7.8'\n");
+  ok(/>= 4\.0'/.test(out), out);
+});
+t('precision: perl keeps its zero-padded numeric form', () => {
+  // mojolicious/mojo: `use 5.016;` became `use 5.44.0;`, which Perl reads differently
+  const out = applyRule('perl', '5.44.0', 'Makefile.PL', "use 5.016;\nrequires => {perl => '5.016'},\n");
+  ok(/use 5\.044;/.test(out), out);
+  ok(!/5\.44\.0/.test(out), 'must not emit a v-string where a numeric literal was');
+});
+t('precision: scala NEVER rewrites a cross-build val of another series', () => {
+  // typelevel/cats: `val Scala213 = "2.13.18"` was rewritten to "3.10.0",
+  // silently destroying the 2.13 cross-build
+  const src = 'val Scala212 = "2.12.21"\nval Scala213 = "2.13.18"\nval Scala3 = "3.3.8"\n'
+            + 'ThisBuild / scalaVersion := Scala213\n';
+  const out = applyRule('scala', '3.10.0', 'build.sbt', src);
+  ok(/val Scala213 = "2\.13\.18"/.test(out), 'the 2.13 val must survive untouched');
+  ok(/val Scala212 = "2\.12\.21"/.test(out), 'and so must 2.12');
+});
+t('precision: scala DOES rewrite a val of the same series', () => {
+  const src = 'val Scala3 = "3.3.8"\nThisBuild / scalaVersion := Scala3\n';
+  const out = applyRule('scala', '3.10.0', 'build.sbt', src);
+  ok(/val Scala3 = "3\.10\.0"/.test(out), out);
+});
+t('precision: dotnet leaves a same-band SDK pin alone', () => {
+  // serilog: global.json SDK 10.0.100 was rewritten to runtime 10.0.13 — a downgrade
+  const out = applyRule('dotnet', '10.0.13', 'global.json', '{"sdk":{"version":"10.0.100"}}');
+  eq(out, '{"sdk":{"version":"10.0.100"}}', 'same feature band: no edit');
+});
+t('precision: erlang rewrites the erlang.mk Makefile pin', () => {
+  // ninenines/cowboy pins OTP in the Makefile, not rebar.config
+  const out = applyRule('erlang', '29.1.2', 'Makefile', 'AUTO_CI_OTP ?= OTP-LATEST-27+\n');
+  ok(/OTP-LATEST-29\+/.test(out), out);
+});
+
+// ───────────── add-a-pin when the manifest declares none ─────────────
+console.log('\nadd-pin');
+t('addpin: creates a version file when the manifest pins nothing', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-addpin-'));
+  try {
+    writeFileSync(join(r, 'deno.json'), '{"version":"17.2.0"}');
+    const e = planAddPin('deno', r, '2.9.8');
+    ok(e && e.created, 'a pin is created');
+    eq(e.file, '.deno-version');
+    ok(!/17\.2\.0/.test(e.after), 'must not confuse the package version with the runtime version');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('addpin: adds engines.node without disturbing the rest of package.json', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-addpin2-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{\n  "name": "x",\n  "scripts": { "test": "t" }\n}\n');
+    const e = planAddPin('node', r, '24.22.1');
+    ok(e && !e.created, 'edits the existing manifest');
+    const o = JSON.parse(e.after);
+    eq(o.name, 'x'); eq(o.scripts.test, 't');
+    ok(/^>=24\.22\.1/.test(o.engines.node), o.engines.node);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('addpin: never fires when a pin already exists', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-addpin3-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=20"}}');
+    eq(planAddPin('node', r, '24.22.1'), null);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('addpin: every language can add a pin', () => {
+  for (const a of adapters) ok(ADD_PIN_RULES[a.id], `${a.id} has no add-pin rule`);
+});
 
 // ───────────────────────── the plan ─────────────────────────
 console.log('\nplan synthesis');

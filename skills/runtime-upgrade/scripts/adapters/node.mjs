@@ -1,5 +1,5 @@
 import { join, existsSync, readJson, readText, rel } from '../lib/io.mjs';
-import { rangeMajor, satisfies } from '../lib/semver.mjs';
+import { rangeMajor, satisfies, classifyDeclared } from '../lib/semver.mjs';
 
 export const id = 'node';
 export const label = 'Node.js';
@@ -53,7 +53,11 @@ export function scan({ dir, root, dockerImages, ciText }) {
   for (const l of ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb']) {
     if (existsSync(join(dir, l))) { lockfile = l; break; }
   }
-  const majors = [...new Set(Object.values(declared).map(rangeMajor).filter(Boolean))];
+  // a FLOOR (">=20") is not a PIN (".nvmrc 20.11.1"); only pins can disagree
+  const { pins, floors } = classifyDeclared(declared);
+  const pinMajors = [...new Set(Object.values(pins).map(rangeMajor).filter(Boolean))];
+  const floorMajors = [...new Set(Object.values(floors).map(rangeMajor).filter(Boolean))];
+  const majors = [...new Set([...pinMajors, ...floorMajors])];
   return {
     lang: id,
     name: pkg.name || dir.split('/').pop(),
@@ -63,7 +67,8 @@ export function scan({ dir, root, dockerImages, ciText }) {
     packageManager: String(pkg.packageManager ?? ''),
     lockfile,
     declaredMajors: majors.join(','),
-    drift: majors.length > 1,
+    pinnedMajors: pinMajors.join(','), floorMajors: floorMajors.join(','),
+    drift: pinMajors.length > 1,
     deps: Object.keys(pkg.dependencies || {}).length,
     devDeps: Object.keys(pkg.devDependencies || {}).length,
     workspaceRoot: !!(pkg.workspaces || existsSync(join(dir, 'pnpm-workspace.yaml'))),

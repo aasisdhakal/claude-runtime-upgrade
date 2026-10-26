@@ -125,6 +125,18 @@ export function planConfigEdits(lang, dir, target) {
   return edits;
 }
 
+
+/**
+ * Version precision matters, and getting it wrong is destructive.
+ *
+ *  - `go 1.27` is the conventional directive; `go 1.27.3` over-specifies.
+ *  - composer `"php": "^8.5.12"` constrains consumers to a PATCH; `^8.5` is meant.
+ *  - elixir `"~> 1.20.4"` means >=1.20.4 <1.21, far tighter than `~> 1.20`.
+ * Writing a full patch version into a CONSTRAINT silently narrows it.
+ */
+const mm = v => String(v).split('.').slice(0, 2).join('.');   // 1.27.3 -> 1.27
+const maj = v => String(v).split('.')[0];                      // 27.0.1  -> 27
+
 export const PIN_RULES = {
   node: (target) => [
     { file: 'package.json', rule: 'engines.node',
@@ -137,38 +149,57 @@ export const PIN_RULES = {
   ],
   php: (target) => [
     { file: 'composer.json', rule: 'require.php',
-      edit: t => t.replace(/("require"\s*:\s*\{[^}]*?"php"\s*:\s*")([^"]*)(")/s, `$1^${target}$3`) },
+      edit: t => t.replace(/("require"\s*:\s*\{[^}]*?"php"\s*:\s*")([^"]*)(")/s, `$1^${mm(target)}$3`) },
     { file: '.php-version', rule: '.php-version', edit: () => `${target}\n` },
     { file: '.tool-versions', rule: '.tool-versions', edit: t => t.replace(/^php\s+\S+/mi, `php ${target}`) },
     { file: 'Dockerfile', rule: 'Dockerfile FROM', edit: t => dockerRewrite(t, ['php'], target) },
   ],
   go: (target) => [
-    { file: 'go.mod', rule: 'go directive', edit: t => t.replace(/^go\s+[\d.]+/m, `go ${target}`) },
+    { file: 'go.mod', rule: 'go directive', edit: t => t.replace(/^go\s+[\d.]+/m, `go ${mm(target)}`) },
     { file: '.tool-versions', rule: '.tool-versions', edit: t => t.replace(/^golang\s+\S+/mi, `golang ${target}`) },
     { file: 'Dockerfile', rule: 'Dockerfile FROM', edit: t => dockerRewrite(t, ['golang'], target) },
   ],
   python: (target) => [
+    { file: 'setup.cfg', rule: 'python_requires',
+      edit: t => t.replace(/^(\s*python_requires\s*=\s*)(.*)$/m, `$1>=${mm(target)}`) },
+    { file: 'Pipfile', rule: 'Pipfile python_version',
+      edit: t => t.replace(/(python_version\s*=\s*")([^"]*)(")/, `$1${target}$3`) },
+    { file: 'tox.ini', rule: 'tox basepython',
+      edit: t => t.replace(/(basepython\s*=\s*python)([\d.]+)/g, `$1${target}`) },
+
     { file: 'pyproject.toml', rule: 'requires-python',
-      edit: t => t.replace(/^(\s*requires-python\s*=\s*")([^"]*)(")/m, `$1>=${target}$3`) },
+      edit: t => t.replace(/^(\s*requires-python\s*=\s*")([^"]*)(")/m, `$1>=${mm(target)}$3`) },
     { file: '.python-version', rule: '.python-version', edit: () => `${target}\n` },
     { file: 'runtime.txt', rule: 'runtime.txt', edit: () => `python-${target}\n` },
     { file: '.tool-versions', rule: '.tool-versions', edit: t => t.replace(/^python\s+\S+/mi, `python ${target}`) },
     { file: 'Dockerfile', rule: 'Dockerfile FROM', edit: t => dockerRewrite(t, ['python'], target) },
   ],
   ruby: (target) => [
+    { file: null, glob: /\.gemspec$/, rule: 'gemspec required_ruby_version',
+      edit: t => t.replace(/(required_ruby_version\s*=\s*["'][^\d]*)([\d.]+)/, `$1${mm(target)}`) },
+
     { file: 'Gemfile', rule: 'Gemfile ruby', edit: t => t.replace(/^(\s*ruby\s+["'])([^"']+)(["'])/m, `$1${target}$3`) },
     { file: '.ruby-version', rule: '.ruby-version', edit: () => `${target}\n` },
     { file: '.tool-versions', rule: '.tool-versions', edit: t => t.replace(/^ruby\s+\S+/mi, `ruby ${target}`) },
     { file: 'Dockerfile', rule: 'Dockerfile FROM', edit: t => dockerRewrite(t, ['ruby'], target) },
   ],
   rust: (target) => [
-    { file: 'Cargo.toml', rule: 'rust-version',
-      edit: t => t.replace(/^(\s*rust-version\s*=\s*")([^"]*)(")/m, `$1${target}$3`) },
+    { file: 'rust-toolchain', rule: 'rust-toolchain', edit: () => `${target}\n` },
+
+    { file: 'Cargo.toml', rule: 'rust-version (MSRV)',
+      // MSRV is declared major.minor by convention; a patch MSRV helps nobody
+      edit: t => t.replace(/^(\s*rust-version\s*=\s*")([^"]*)(")/m, `$1${mm(target)}$3`) },
     { file: 'rust-toolchain.toml', rule: 'toolchain channel',
       edit: t => t.replace(/(channel\s*=\s*")([^"]*)(")/, `$1${target}$3`) },
     { file: 'Dockerfile', rule: 'Dockerfile FROM', edit: t => dockerRewrite(t, ['rust'], target) },
   ],
   java: (target) => [
+    { file: 'build.gradle', rule: 'gradle compatibility',
+      edit: t => t.replace(/((?:source|target)Compatibility\s*=?\s*['"]?(?:JavaVersion\.VERSION_)?)([\d._]+)/g, `$1${target}`) },
+    { file: 'build.gradle.kts', rule: 'JavaLanguageVersion',
+      edit: t => t.replace(/(JavaLanguageVersion\.of\()(\d+)(\))/g, `$1${target}$3`) },
+    { file: '.java-version', rule: '.java-version', edit: () => `${target}\n` },
+
     { file: 'pom.xml', rule: 'maven.compiler.release',
       edit: t => t.replace(/(<maven\.compiler\.release>)\s*\d+\s*(<)/, `$1${target}$2`)
                   .replace(/(<java\.version>)\s*[\d.]+\s*(<)/, `$1${target}$2`) },
@@ -183,22 +214,76 @@ export const PIN_RULES = {
     const tag = (target.match(/^\d+\.\d+/) || [target])[0];
     return [
       { file: 'global.json', rule: 'sdk.version',
-        edit: t => t.replace(/("version"\s*:\s*")([^"]*)(")/, `$1${target}$3`) },
+        // global.json pins an SDK BUILD (10.0.100); the EOL feed reports a
+        // RUNTIME version (10.0.13). Writing one into the other reads as a
+        // downgrade, so only move the SDK when the major.minor actually changes.
+        edit: t => {
+          const cur = (t.match(/"version"\s*:\s*"([^"]*)"/) || [])[1] || '';
+          if (cur && mm(cur) === mm(target)) return t;      // same feature band: leave it
+          return t.replace(/("version"\s*:\s*")([^"]*)(")/, `$1${mm(target)}.100$3`);
+        } },
       { file: 'Dockerfile', rule: 'Dockerfile FROM',
         edit: t => dockerRewrite(t, ['dotnet/sdk', 'dotnet/runtime', 'dotnet/aspnet'], tag) },
     ];
   },
-  deno:   (t) => [{ file: 'Dockerfile', rule: 'Dockerfile FROM', edit: x => dockerRewrite(x, ['denoland/deno'], t) }],
-  bun:    (t) => [{ file: '.bun-version', rule: '.bun-version', edit: () => `${t}\n` },
-                  { file: 'Dockerfile', rule: 'Dockerfile FROM', edit: x => dockerRewrite(x, ['oven/bun'], t) }],
-  elixir: (t) => [{ file: 'mix.exs', rule: 'elixir requirement', edit: x => x.replace(/(elixir:\s*")[^"]*(")/, `$1~> ${t}$2`) }],
-  erlang: (t) => [{ file: 'rebar.config', rule: 'minimum_otp_vsn', edit: x => x.replace(/(minimum_otp_vsn\s*,\s*")[^"]*(")/, `$1${t}$2`) }],
-  kotlin: (t) => [{ file: 'build.gradle.kts', rule: 'kotlin plugin version',
-                    edit: x => x.replace(/(kotlin\(["']jvm["']\)\s*version\s*["'])[^"']*(["'])/, `$1${t}$2`) }],
-  scala:  (t) => [{ file: 'build.sbt', rule: 'scalaVersion', edit: x => x.replace(/(scalaVersion\s*:=\s*")[^"]*(")/, `$1${t}$2`) }],
-  perl:   (t) => [{ file: 'cpanfile', rule: 'requires perl',
-                    edit: x => x.replace(/(requires\s+["']perl["']\s*,\s*["']?)[\d._v]+/, `$1${t}`) },
-                  { file: '.perl-version', rule: '.perl-version', edit: () => `${t}\n` }],
+  deno:   (t) => [
+    { file: 'deno.json', rule: 'deno.json deno field', edit: x => x.replace(/("deno"\s*:\s*")([^"]*)(")/, `$1${t}$3`) },
+    { file: '.deno-version', rule: '.deno-version', edit: () => `${t}\n` },
+    { file: 'Dockerfile', rule: 'Dockerfile FROM', edit: x => dockerRewrite(x, ['denoland/deno'], t) }],
+  bun:    (t) => [
+    { file: '.bun-version', rule: '.bun-version', edit: () => `${t}\n` },
+    { file: 'package.json', rule: 'engines.bun',
+      edit: x => x.replace(/("engines"\s*:\s*\{[^}]*?"bun"\s*:\s*")([^"]*)(")/s, `$1>=${t}$3`) },
+    { file: 'Dockerfile', rule: 'Dockerfile FROM', edit: x => dockerRewrite(x, ['oven/bun'], t) }],
+  elixir: (t) => [{ file: 'mix.exs', rule: 'elixir requirement',
+    edit: x => x.replace(/(elixir:\s*")[^"]*(")/, `$1~> ${mm(t)}$2`) }],
+  erlang: (t) => [
+    { file: 'rebar.config', rule: 'minimum_otp_vsn', edit: x => x.replace(/(minimum_otp_vsn\s*,\s*")[^"]*(")/, `$1${t}$2`) },
+    // erlang.mk projects pin OTP in the Makefile, not rebar.config
+    { file: 'Makefile', rule: 'AUTO_CI_OTP',
+      edit: x => x.replace(/(AUTO_CI_OTP\s*\?*=\s*OTP-(?:LATEST-)?)(\d+)/, `$1${String(t).split('.')[0]}`) }],
+  kotlin: (t) => [
+    { file: 'build.gradle.kts', rule: 'kotlin plugin version',
+      edit: x => x.replace(/(kotlin\(["']jvm["']\)\s*version\s*["'])[^"']*(["'])/, `$1${t}$2`) },
+    { file: 'gradle/libs.versions.toml', rule: 'version catalog kotlin',
+      edit: x => x.replace(/^(\s*kotlin\s*=\s*")([^"]*)(")/m, `$1${t}$3`) },
+    { file: 'gradle.properties', rule: 'kotlin.version',
+      edit: x => x.replace(/^(kotlin\.version\s*=\s*)(\S+)/m, `$1${t}`) }],
+  scala:  (t) => [
+    { file: 'build.sbt', rule: 'scalaVersion',
+      // sbt files usually bind scalaVersion to a val, so rewrite the val too
+      edit: x => {
+        // `val Scala213 = "2.13.18"` is a CROSS-BUILD definition. Rewriting it to
+        // a 3.x version silently destroys the 2.13 build; the name encodes the
+        // series it holds. Only touch a val whose series matches the target.
+        const series = String(t).split('.').slice(0, 2).join('.');
+        let out = x.replace(/(scalaVersion\s*:=\s*")[^"]*(")/, `$1${t}$2`);
+        const ident = (x.match(/scalaVersion\s*:=\s*([A-Za-z_]\w*)/) || [])[1];
+        if (ident) {
+          const def = x.match(new RegExp(`val\\s+${ident}\\s*=\\s*"([^"]*)"`));
+          const holds = def ? def[1].split('.').slice(0, 2).join('.') : null;
+          const sameSeries = holds && holds.split('.')[0] === series.split('.')[0];
+          if (sameSeries) out = out.replace(new RegExp(`(val\\s+${ident}\\s*=\\s*")[^"]*(")`), `$1${t}$2`);
+        }
+        return out;
+      } },
+    { file: '.scala-version', rule: '.scala-version', edit: () => `${t}\n` }],
+  perl:   (t) => [
+    { file: 'cpanfile', rule: 'requires perl', edit: x => x.replace(/(requires\s+["']perl["']\s*,\s*["']?)[\d._v]+/, `$1${t}`) },
+    { file: 'Makefile.PL', rule: 'Makefile.PL perl requirement',
+      // Perl writes 5.44 as "5.044" in numeric form and "v5.44" as a v-string;
+      // rewriting 5.016 to 5.44.0 produces a literal the toolchain mis-reads.
+      edit: x => {
+        const [a, b] = String(t).split('.');
+        const padded = `${a}.${String(b).padStart(3, '0')}`;          // 5.44 -> 5.044
+        return x
+          .replace(/(MIN_PERL_VERSION\s*=>\s*["']?)[\d._]+/, `$1${padded}`)
+          .replace(/(requires\s*=>\s*\{[^}]*?perl\s*=>\s*["'])[\d._]+(["'])/s, `$1${padded}$2`)
+          .replace(/^(use\s+)5\.[\d._]+(\s*;)/m, `$1${padded}$2`);
+      } },
+    { file: 'Build.PL', rule: 'requires perl',
+      edit: x => x.replace(/(["']perl["']\s*=>\s*["']?)[\d._v]+/, `$1${t}`) },
+    { file: '.perl-version', rule: '.perl-version', edit: () => `${t}\n` }],
 };
 
 /** Compute every pin edit for a target. Pure: reads files, writes nothing. */
@@ -207,12 +292,17 @@ export function planPinEdits(lang, dir, target) {
   if (!rules) return { edits: [], unsupported: true };
   const edits = [];
   for (const r of rules(target)) {
-    const path = join(dir, r.file);
+    let file = r.file;
+    if (!file && r.glob) {
+      try { file = readdirSync(dir).find(n => r.glob.test(n)); } catch {}
+      if (!file) continue;
+    }
+    const path = join(dir, file);
     if (!existsSync(path)) continue;
     const before = readText(path);
     if (before == null) continue;
     const after = r.edit(before);
-    if (after !== before) edits.push({ file: r.file, path, rule: r.rule, before, after });
+    if (after !== before) edits.push({ file, path, rule: r.rule, before, after });
   }
   return { edits, unsupported: false };
 }
@@ -242,4 +332,69 @@ export function unified(file, before, after, context = 2) {
     for (let k = aj; k < e; k++) out.push(' ' + a[k]);
   }
   return out.join('\n');
+}
+
+
+/**
+ * Pins to CREATE when a project declares no runtime anywhere in its manifest.
+ * Rewriting cannot help a file that never had the field; without this, the
+ * repos that most need a pin are exactly the ones nothing happens to.
+ */
+export const ADD_PIN_RULES = {
+  node: (t) => ({ file: 'package.json', rule: 'add engines.node', needs: 'package.json',
+    edit: x => {
+      const o = JSON.parse(x);
+      if (o.engines?.node) return x;
+      o.engines = { ...(o.engines || {}), node: `>=${t} <${Number(String(t).split('.')[0]) + 1}` };
+      return JSON.stringify(o, null, detectIndent(x)) + (x.endsWith('\n') ? '\n' : '');
+    } }),
+  bun: (t) => ({ file: 'package.json', rule: 'add engines.bun', needs: 'package.json',
+    edit: x => {
+      const o = JSON.parse(x);
+      if (o.engines?.bun) return x;
+      o.engines = { ...(o.engines || {}), bun: `>=${t}` };
+      return JSON.stringify(o, null, detectIndent(x)) + (x.endsWith('\n') ? '\n' : '');
+    } }),
+  deno: (t) => ({ file: '.deno-version', rule: 'add .deno-version', create: `${t}\n` }),
+  php: (t) => ({ file: 'composer.json', rule: 'add require.php', needs: 'composer.json',
+    edit: x => {
+      const o = JSON.parse(x);
+      if (o.require?.php) return x;
+      o.require = { php: `^${t}`, ...(o.require || {}) };
+      return JSON.stringify(o, null, detectIndent(x)) + (x.endsWith('\n') ? '\n' : '');
+    } }),
+  python: (t) => ({ file: '.python-version', rule: 'add .python-version', create: `${t}\n` }),
+  ruby:   (t) => ({ file: '.ruby-version', rule: 'add .ruby-version', create: `${t}\n` }),
+  java:   (t) => ({ file: '.java-version', rule: 'add .java-version', create: `${String(t).split('.')[0]}\n` }),
+  go:     (t) => ({ file: '.tool-versions', rule: 'add .tool-versions golang', create: `golang ${t}\n` }),
+  rust:   (t) => ({ file: 'rust-toolchain.toml', rule: 'add rust-toolchain.toml', create: `[toolchain]\nchannel = "${t}"\n` }),
+  perl:   (t) => ({ file: '.perl-version', rule: 'add .perl-version', create: `${t}\n` }),
+  kotlin: (t) => ({ file: '.tool-versions', rule: 'add .tool-versions kotlin', create: `kotlin ${t}\n` }),
+  scala:  (t) => ({ file: '.scala-version', rule: 'add .scala-version', create: `${t}\n` }),
+  elixir: (t) => ({ file: '.tool-versions', rule: 'add .tool-versions elixir', create: `elixir ${t}\n` }),
+  erlang: (t) => ({ file: '.tool-versions', rule: 'add .tool-versions erlang', create: `erlang ${String(t).split('.')[0]}\n` }),
+  dotnet: (t) => ({ file: 'global.json', rule: 'add global.json',
+    create: JSON.stringify({ sdk: { version: t, rollForward: 'latestFeature' } }, null, 2) + '\n' }),
+};
+
+function detectIndent(text) {
+  const m = text.match(/\n([ \t]+)"/);
+  return m ? (m[1].includes('\t') ? '\t' : m[1].length) : 2;
+}
+
+/** Only fires when planPinEdits found nothing to rewrite. */
+export function planAddPin(lang, dir, target) {
+  const make = ADD_PIN_RULES[lang];
+  if (!make) return null;
+  const r = make(target);
+  const path = join(dir, r.file);
+  if (r.create !== undefined) {
+    if (existsSync(path)) return null;
+    return { file: r.file, path, rule: r.rule, before: '', after: r.create, created: true };
+  }
+  if (r.needs && !existsSync(join(dir, r.needs))) return null;
+  const before = readText(path);
+  if (before == null) return null;
+  let after; try { after = r.edit(before); } catch { return null; }
+  return after === before ? null : { file: r.file, path, rule: r.rule, before, after, created: false };
 }
