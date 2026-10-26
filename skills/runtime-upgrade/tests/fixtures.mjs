@@ -110,6 +110,26 @@ export const FIXTURES = {
       dependencies: { next: '^14.0.0', react: '^18.2.0', '@nestjs/core': '^10.0.0' } });
     w(r, 'composer.json', { name: 'acme/fw-php', require: { php: '^8.1', 'laravel/framework': '^10.0' } });
   },
+  // source containing each severity class, so the scanner is tested on all three
+  'breaking-src': r => {
+    w(r, 'package.json', { name: 'brk', engines: { node: '>=20' }, dependencies: {} });
+    w(r, '.nvmrc', 'v20.11.1\n');
+    w(r, 'src/removed.js', 'const c = crypto.createCipher("aes192", key);\nmodule.exports = c;\n');
+    w(r, 'src/runtime.js', "const url = require('url');\nconst u = url.parse('http://x');\n");
+    w(r, 'src/behaviour.ts', "import { AsyncLocalStorage } from 'async_hooks';\nexport const als = new AsyncLocalStorage();\n");
+    w(r, 'src/clean.js', 'export const ok = 1;\n');
+  },
+  // CI + build config that must move with the runtime
+  'ci-and-config': r => {
+    w(r, 'package.json', { name: 'cfg', engines: { node: '>= 18.x' }, dependencies: {} });
+    w(r, '.nvmrc', 'v18.20.0\n');
+    w(r, 'tsconfig.json', '{"compilerOptions":{"target":"ES2021"}}');
+    w(r, '.npmrc', 'registry=https://registry.npmjs.org/\n');
+    w(r, '.github/workflows/ci.yml',
+      'jobs:\n  test:\n    strategy:\n      matrix:\n        node-version: [18.20.0, 20.11.1]\n    steps:\n' +
+      '      - uses: actions/setup-node@v4\n        with:\n          node-version: 18.20.0\n' +
+      '      - uses: actions/setup-python@v5\n        with:\n          python-version: 3.11\n');
+  },
   'polyglot': r => {
     // one repo, four runtimes — the shape nobody plans for
     w(r, 'api/go.mod', 'module acme/api\n\ngo 1.22\n');

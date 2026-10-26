@@ -7,7 +7,7 @@ import { fetchJson } from '../scripts/lib/io.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
 import { adapters, byId, adaptersForManifest } from '../scripts/adapters/index.mjs';
 import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
-import { PIN_RULES, planPinEdits, unified } from '../scripts/lib/edits.mjs';
+import { PIN_RULES, planPinEdits, unified, planCiEdits, planConfigEdits, ciMatrixAdvice } from '../scripts/lib/edits.mjs';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -604,6 +604,126 @@ t('remediate: unified diff round-trips', () => {
   ok(/^--- a\/f\.txt/m.test(d) && /^\+\+\+ b\/f\.txt/m.test(d), 'headers');
   ok(/^-b$/m.test(d) && /^\+B$/m.test(d), 'the changed line appears on both sides');
 });
+
+// ───────────────────────── source scanning ─────────────────────────
+console.log('\nsource breaking-change scan');
+const scan = (...a) => runJson(process.execPath, [S('scan.mjs'), ...a]);
+
+t('scan: finds the severity classes inside the window', () => withFixture('breaking-src', r => {
+  const v = scan('node', r, '20.11.1', '26.12.1');
+  ok(v.data, 'produced JSON');
+  const kinds = new Set(v.data.details.map(d => d.severity));
+  ok(kinds.has('removed'), 'removed');
+  ok(kinds.has('behaviour'), 'behaviour');
+  // url.parse was deprecated in Node 16 — BEFORE the current version — so it is
+  // not caused by this upgrade and must stay out of the window by default
+  ok(!v.data.details.some(d => /url\.parse/.test(d.what)), 'pre-existing deprecations are excluded by default');
+}));
+t('scan: --include-existing surfaces pre-existing debt separately', () => withFixture('breaking-src', r => {
+  const v = scan('node', r, '20.11.1', '26.12.1', '--include-existing');
+  ok(v.data.preExistingRules > 0, 'pre-existing rules were applied');
+  const pre = v.data.details.filter(d => d.preExisting);
+  ok(pre.some(d => /url\.parse/.test(d.what)), 'url.parse surfaces as pre-existing');
+  ok(v.data.causedByThisUpgrade < v.data.findings, 'and is counted apart from this upgrade');
+  ok(/NOT caused by this upgrade/.test(v.data.preExistingNote), 'and is labelled as such');
+}));
+t('scan: reports file and line, not just a count', () => withFixture('breaking-src', r => {
+  const v = scan('node', r, '20.11.1', '26.12.1');
+  const f = v.data.details.find(d => d.severity === 'removed');
+  ok(/removed\.js$/.test(f.file), `file: ${f.file}`);
+  ok(f.line >= 1, 'line number');
+  ok(f.evidence.length > 0, 'evidence line');
+  ok(f.fix && f.fix.length > 5, 'a fix is suggested');
+}));
+t('scan: respects the upgrade window', () => withFixture('breaking-src', r => {
+  const wide = scan('node', r, '10.0.0', '26.12.1').data.rulesApplied;
+  const narrow = scan('node', r, '24.0.0', '26.12.1').data.rulesApplied;
+  ok(narrow < wide, `narrow window must apply fewer rules (${narrow} vs ${wide})`);
+}));
+t('scan: clean files produce no findings', () => withFixture('single-node', r => {
+  const v = scan('node', r, '20.11.1', '24.22.1');
+  eq(v.data.findings, 0, 'nothing to find in a fixture with no source');
+}));
+t('scan: says "not catalogued" rather than "nothing breaks"', () => withFixture('single-rust', r => {
+  const v = scan('rust', r, '1.70', '1.85');
+  eq(v.data.rulesApplied, 0);
+  ok(/not catalogued|NOT "nothing breaks"/i.test(v.data.note || ''), 'must not imply safety');
+}));
+
+// ───────────────────────── CI and build config ─────────────────────────
+console.log('\nCI and build config rewriting');
+t('config: CI runtime version is rewritten', () => withFixture('ci-and-config', r => {
+  const e = planCiEdits('node', r, '24.22.1');
+  ok(e.length === 1, `expected 1 CI file, got ${e.length}`);
+  ok(/node-version: 24\.22\.1/.test(e[0].after), 'node version moved');
+}));
+t('config: a sibling python-version is left alone', () => withFixture('ci-and-config', r => {
+  const e = planCiEdits('node', r, '24.22.1');
+  ok(/python-version: 3\.11/.test(e[0].after), 'python must not be touched by a node upgrade');
+}));
+t('config: a CI matrix is never collapsed', () => withFixture('ci-and-config', r => {
+  const e = planCiEdits('node', r, '24.22.1');
+  ok(/\[18\.20\.0, 20\.11\.1\]/.test(e[0].after), 'the matrix list must survive verbatim');
+  const adv = ciMatrixAdvice('node', r, '18.20.0', '24.22.1');
+  ok(adv && /migration window/.test(adv.advice), 'and the advice must explain why');
+}));
+t('config: tsconfig target and engine-strict move with the runtime', () => withFixture('ci-and-config', r => {
+  const e = planConfigEdits('node', r, '24.22.1');
+  const files = e.map(x => x.file);
+  ok(files.includes('tsconfig.json'), 'tsconfig');
+  ok(files.includes('.npmrc'), 'npmrc');
+  ok(/ES2023/.test(e.find(x => x.file === 'tsconfig.json').after), 'target raised');
+  ok(/engine-strict=true/.test(e.find(x => x.file === '.npmrc').after), 'engines made enforcing');
+}));
+
+// ───────────────────────── the plan ─────────────────────────
+console.log('\nplan synthesis');
+const plan = (...a) => runJson(process.execPath, [S('plan.mjs'), ...a]);
+
+t('plan: emits ordered steps with exit conditions', () => withFixture('breaking-src', r => {
+  const v = plan(r, '--target', '26.12.1', '--policy', 'gate');
+  ok(v.data, 'produced JSON');
+  const p = v.data.plans[0];
+  ok(p.steps.length >= 3, `expected >=3 steps, got ${p.steps.length}`);
+  for (const s of p.steps) {
+    ok(s.title && s.why && s.exit, `step ${s.n} must have title, why and exit`);
+    ok(Array.isArray(s.actions) && s.actions.length, `step ${s.n} must have actions`);
+  }
+  eq(p.steps.map(s => s.n), p.steps.map((_, i) => i + 1), 'steps are numbered in order');
+}));
+t('plan: hard blockers are cleared before the runtime moves', () => withFixture('breaking-src', r => {
+  const p = plan(r, '--target', '26.12.1').data.plans[0];
+  const phases = p.steps.map(s => s.phase);
+  const ri = phases.indexOf('runtime');
+  if (phases.includes('unblock')) ok(phases.indexOf('unblock') < ri, 'unblock precedes runtime');
+  if (phases.includes('characterize')) ok(phases.indexOf('characterize') < ri, 'characterize precedes runtime');
+  ok(phases.indexOf('dependencies') > ri, 'dependencies follow the runtime, in their own step');
+  ok(phases.indexOf('verify') === phases.length - 1, 'verify is last');
+}));
+t('plan: carries rollback, test strategy and risk', () => withFixture('breaking-src', r => {
+  const p = plan(r, '--target', '26.12.1').data.plans[0];
+  ok(p.rollback?.trigger && p.rollback.procedure.length, 'rollback with a trigger');
+  ok(p.testStrategy?.ladder.length >= 4, 'a test ladder');
+  ok(p.testStrategy.deprecationsFatal.length > 5, 'how to make deprecations fatal');
+  ok(['low', 'medium', 'high'].includes(p.risk.level), 'a risk level');
+  ok(p.risk.signals.length, 'with named signals');
+}));
+t('plan: estimate scales with the work', () => withFixture('breaking-src', r => {
+  const withBreaks = plan(r, '--target', '26.12.1').data.plans[0].estimatePoints;
+  const clean = withFixture('single-node', r2 => plan(r2, '--target', '24.22.1').data.plans[0].estimatePoints);
+  ok(withBreaks > clean, `a repo with breaking changes must estimate higher (${withBreaks} vs ${clean})`);
+}));
+t('plan: separates pre-existing debt from upgrade blockers', () => withFixture('breaking-src', r => {
+  const p = plan(r, '--target', '26.12.1').data.plans[0];
+  ok(p.technicalDebt.length > 0, 'debt is reported');
+  ok(!p.blockers.some(b => /url\.parse/.test(b.detail || '')), 'but never counted as a blocker');
+}));
+t('plan: markdown renders without placeholders', () => withFixture('breaking-src', r => {
+  const v = run(process.execPath, [S('plan.mjs'), r, '--target', '26.12.1', '--format', 'md']);
+  ok(v.stdout.includes('# Upgrade plan'), 'has a heading');
+  ok(!/undefined|\$SK|\[object Object\]/.test(v.stdout), 'no unexpanded placeholders');
+  ok(/### Rollback/.test(v.stdout) && /### Test strategy/.test(v.stdout), 'carries every section');
+}));
 
 // ───────────────────────── doctor ─────────────────────────
 console.log('\ndoctor');

@@ -1,7 +1,7 @@
 // Runtime-pin rewriting. Each rule finds a version declaration and produces the
 // replacement. Rules are pure: they return {file, before, after, rule} and never
 // touch disk, so dry-run and apply share exactly one code path.
-import { join, existsSync, readText } from './io.mjs';
+import { join, existsSync, readText, readdirSync } from './io.mjs';
 
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -14,6 +14,115 @@ function dockerRewrite(text, imageNames, target, suffixMap = {}) {
     const mapped = suffixMap[suffix] ?? suffix;
     return head + target + mapped;
   });
+}
+
+/**
+ * CI workflow files, and the keys inside them that name a runtime version.
+ * A pinned runtime that CI does not also move is the single most common way an
+ * upgrade "passes" locally and then builds on the old version forever.
+ */
+const CI_FILES = [
+  '.github/workflows', '.gitlab-ci.yml', 'bitbucket-pipelines.yml', 'azure-pipelines.yml',
+  '.circleci/config.yml', 'buildspec.yml', 'buildspec.yaml', 'Jenkinsfile',
+];
+const CI_KEY = {
+  node: 'node', php: 'php', python: 'python', ruby: 'ruby', go: 'go',
+  java: 'java', dotnet: 'dotnet', rust: 'rust', deno: 'deno', bun: 'bun',
+  elixir: 'elixir', erlang: 'otp', kotlin: 'kotlin', scala: 'scala', perl: 'perl',
+};
+const CI_IMAGE = {
+  node: ['node'], php: ['php'], python: ['python'], ruby: ['ruby'], go: ['golang'],
+  java: ['eclipse-temurin', 'amazoncorretto', 'openjdk'], dotnet: ['dotnet/sdk'],
+  rust: ['rust'], deno: ['denoland/deno'], bun: ['oven/bun'], elixir: ['elixir'],
+  erlang: ['erlang'], kotlin: ['kotlin'], scala: [], perl: ['perl'],
+};
+
+/** Every CI file under a directory, flattened. */
+export function ciFiles(dir) {
+  const out = [];
+  for (const g of CI_FILES) {
+    const p = join(dir, g);
+    if (!existsSync(p)) continue;
+    let entries = [p];
+    try { const kids = readdirSync(p); if (kids.length) entries = kids.map(n => join(p, n)); } catch {}
+    for (const f of entries) if (/\.(ya?ml)$|Jenkinsfile$/.test(f)) out.push(f);
+  }
+  return out;
+}
+
+/**
+ * Rewrite runtime versions inside CI config. Deliberately conservative:
+ *   - templated values (${{ matrix.x }}) are left alone
+ *   - a MATRIX of versions is EXTENDED with the target, never collapsed —
+ *     dropping the old version is how you lose the only test that proves the
+ *     migration window still works on what production runs today
+ */
+export function planCiEdits(lang, dir, target) {
+  const key = CI_KEY[lang];
+  if (!key) return [];
+  const images = CI_IMAGE[lang] || [];
+  const major = (target.match(/^\d+(\.\d+)?/) || [target])[0];
+  const edits = [];
+  for (const f of ciFiles(dir)) {
+    const before = readText(f);
+    if (before == null) continue;
+    let after = before;
+    // setup-* action inputs: `node-version: 20.11.1`
+    after = after.replace(
+      new RegExp(`(^\\s*${key}[-_]?version\\s*:\\s*["']?)(?!\\$\\{\\{)([0-9][0-9.xX]*)(["']?)`, 'gmi'),
+      (m, head, _v, tail) => head + target + tail);
+    // container images
+    for (const img of images) {
+      after = after.replace(
+        new RegExp(`((?:image|container)\\s*:\\s*["']?\\S*?${img.replace('/', '\\/')}[:@])([^\\s"']+)`, 'gi'),
+        (m, head, tag) => head + target + tag.replace(/^v?[\d.]+/, ''));
+    }
+    if (after !== before) edits.push({ file: f.slice(dir.length + 1), path: f, rule: 'CI runtime version', before, after });
+  }
+  return edits;
+}
+
+/** Matrix entries that still name the OLD version — keep them, and say why. */
+export function ciMatrixAdvice(lang, dir, from, target) {
+  const key = CI_KEY[lang];
+  const hits = [];
+  for (const f of ciFiles(dir)) {
+    const t = readText(f) || '';
+    const m = t.match(new RegExp(`${key}[-_]?version\\s*:\\s*\\[([^\\]]+)\\]`, 'i'));
+    if (m) hits.push({ file: f.slice(dir.length + 1), matrix: m[1].replace(/["']/g, '').trim() });
+  }
+  return hits.length ? {
+    matrices: hits,
+    advice: `Keep ${from} in the matrix alongside ${target} for the whole migration window. `
+          + 'Testing only the new version is how a compatibility fix silently breaks the version still in production.',
+  } : null;
+}
+
+/** Build/runtime configuration that should move with the runtime. */
+export function planConfigEdits(lang, dir, target) {
+  const edits = [];
+  const push = (file, rule, fn) => {
+    const path = join(dir, file);
+    if (!existsSync(path)) return;
+    const before = readText(path); if (before == null) return;
+    const after = fn(before);
+    if (after !== before) edits.push({ file, path, rule, before, after });
+  };
+  if (lang === 'node') {
+    const major = Number(target.split('.')[0]);
+    // tsconfig target should not lag the runtime by generations
+    const tsTarget = major >= 24 ? 'ES2023' : major >= 22 ? 'ES2023' : 'ES2022';
+    push('tsconfig.json', `tsconfig target -> ${tsTarget}`,
+      t => t.replace(/("target"\s*:\s*")(ES\d+|es\d+|ESNext)(")/i, `$1${tsTarget}$3`));
+    // engines are advisory in npm unless engine-strict is set
+    push('.npmrc', 'engine-strict=true',
+      t => /engine-strict/.test(t) ? t.replace(/engine-strict\s*=.*/i, 'engine-strict=true') : t.trimEnd() + '\nengine-strict=true\n');
+  }
+  if (lang === 'php') {
+    push('composer.json', 'config.platform.php',
+      t => t.replace(/("platform"\s*:\s*\{[^}]*?"php"\s*:\s*")([^"]*)(")/s, `$1${target}$3`));
+  }
+  return edits;
 }
 
 export const PIN_RULES = {

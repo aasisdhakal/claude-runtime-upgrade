@@ -54,6 +54,37 @@ Guard **enforces** what this skill promises, rather than trusting the model to r
 
 Also ask, when it is not obvious: **which target version** (otherwise `research.mjs` picks the newest non-EOL LTS), and **which targets** when discovery finds more than ~6.
 
+## Start here — the plan
+
+```bash
+node $SK/scripts/plan.mjs <dir> [--target V] [--policy gate|report] [--format md] [--only a,b]
+```
+
+**One command runs every read-only phase and synthesises the whole plan.** Prefer it over driving the phases by hand; reach for the individual scripts when you need to dig into one.
+
+It produces, per target:
+
+| Section | What it answers |
+|---|---|
+| current → target, EOL | are we on something dead, and what is supported until when |
+| CVE delta | how many unpatched runtime CVEs the upgrade closes |
+| dependency advisories | what the ecosystem auditor says |
+| frameworks | framework EOL — **often the real blocker**, plus any with no upstream feed |
+| source scan | removed APIs, runtime deprecations and **silent behaviour changes**, with file:line |
+| blockers vs noise | ABI-pinned addons separated from N-API no-ops |
+| **ordered steps** | each with *why*, concrete actions, and a machine-checkable **exit condition** |
+| pre-existing debt | deprecations that predate this upgrade — not blocking, but what the next major breaks |
+| test strategy | the ladder, and how to make deprecations fatal for this language |
+| rollback | trigger, procedure, and what reverting re-exposes |
+| risk | level plus the specific signals behind it |
+| estimate | story points scaled to blockers, dependency surface and dead frameworks |
+
+Across several targets it also emits **sequencing** — which repo is the pilot and why, which goes last, and which blockers are shared so they get fixed once.
+
+`--format md` renders a document you can paste into a ticket. Every command it prints is runnable verbatim.
+
+**The step order is not cosmetic.** Hard blockers are cleared *before* the runtime moves, and behaviour changes are characterized with tests *while still on the old version* — capture the current answer first, or there is nothing to compare against. Dependencies move in their own commit after the runtime, so a broken build has one cause.
+
 ## Phase 1 — DISCOVER
 
 ```bash
@@ -111,6 +142,21 @@ The runtime is frequently the smaller half of the work. endoflife.date tracks **
 
 Run this during Phase 3. A framework that is years EOL changes the plan more than the runtime does.
 
+## Phase 3b — SCAN THE SOURCE
+
+```bash
+node $SK/scripts/scan.mjs <lang> <dir> <from> <to> [--include-existing]
+```
+Finds code the upgrade will break, with `file:line`. Three severity classes, and the third is the one that hurts:
+
+- **`removed`** — will throw or fail to build. Must be fixed.
+- **`runtime`** — deprecated, warns loudly, still works. Fix before the *next* major.
+- **`behaviour`** — **still runs, different answer.** No exception, no warning. A grep cannot verify this; only a test can.
+
+Rules fire only inside the upgrade window — scanning for Node 26 removals while going 20 → 22 is noise. `--include-existing` additionally reports deprecations that predate the current version: not caused by this upgrade, but exactly what the next one turns into failures.
+
+**If a language has no rules recorded, the output says "not catalogued here", not "nothing breaks".** Read the upstream release notes.
+
 ## Phase 4 — REMEDIATE
 
 **Bump the manifest floor first.** This is the lever that makes every other tool report against the target instead of the status quo:
@@ -120,7 +166,11 @@ Run this during Phase 3. A framework that is years EOL changes the plan more tha
 ```bash
 node $SK/scripts/remediate.mjs <lang> <dir> <target> [--deps minor|latest|patch|none] [--apply]
 ```
-`remediate.mjs` does both halves of the job — it rewrites every runtime pin (manifest, version file, Dockerfile `FROM`, `.tool-versions`, CI) **and** upgrades the dependency packages with that ecosystem's own tool.
+`remediate.mjs` does both halves of the job — it rewrites every runtime pin (manifest, version file, Dockerfile `FROM`, `.tool-versions`) **and** upgrades the dependency packages with that ecosystem's own tool.
+
+**CI and build config move too.** `plan.mjs` reports them and `lib/edits.mjs` rewrites them: `setup-*` action inputs, container images, `tsconfig` target, `.npmrc engine-strict`, `composer config.platform.php`. A runtime that CI does not also move is how an upgrade passes locally and then builds on the old version forever.
+
+**A CI version matrix is never collapsed.** Keep the old version alongside the new one for the whole migration window — testing only the new one is how a compatibility fix silently breaks what production still runs.
 
 - **Dry-run is the default.** It emits unified diffs and writes nothing.
 - **`--deps minor`** (default) stays inside declared semver ranges — it will NOT move an exact pin like `"ms": "2.1.2"`.

@@ -27,9 +27,19 @@ Renovate and Dependabot own **dependency bumps** and do it well. This owns the *
 
 Use both. This one produces the plan; they execute the bumps.
 
+## One command
+
+```bash
+node skills/runtime-upgrade/scripts/plan.mjs ./repo --target 24.22.1 --format md
+```
+
+Runs every read-only phase and emits the whole plan: EOL and CVE delta, dependency advisories, framework EOL, a source scan with `file:line` for removed APIs and **silent behaviour changes**, blockers separated from N-API noise, pre-existing debt, **ordered steps each with a why and an exit condition**, test strategy, rollback trigger and procedure, risk signals, an estimate — and across several repos, which one is the pilot and why.
+
+Every command it prints is runnable verbatim.
+
 ## What it does
 
-Five gated phases, each with a machine-checkable exit condition.
+Six phases, each with a machine-checkable exit condition.
 
 | Phase | Script | Output |
 |---|---|---|
@@ -37,7 +47,10 @@ Five gated phases, each with a machine-checkable exit condition.
 | **Research** | `research.mjs` | EOL/support windows, unpatched runtime CVEs at current *and* target |
 | **Assess** | `assess.mjs` | dependency advisories, native/ABI blockers, dependency floors |
 | **Remediate** | `remediate.mjs` | **rewrites every runtime pin AND upgrades all dependency packages** |
+| **Scan** | `scan.mjs` | removed APIs, deprecations and **behaviour changes**, with file:line |
 | **Verify** | `verify.mjs` | gates that exit non-zero on failure |
+
+All synthesised by **`plan.mjs`**.
 
 Plus `frameworks.mjs` (framework EOL), `guard.mjs` (enforced write mode) and `doctor.mjs`.
 
@@ -173,7 +186,7 @@ Six phases, `3n + 2` agents, pipelined per target with an adversarial **Challeng
 node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
-85 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
+101 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
 
 CI runs the suite on **ubuntu + macOS × Node 18/20/22/24**, plus an offline job, plus a weekly cron to catch upstream feed changes.
 
