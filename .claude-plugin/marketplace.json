@@ -1,0 +1,14 @@
+{
+  "name": "runtime-upgrade",
+  "owner": { "name": "aasisdhakal" },
+  "plugins": [
+    {
+      "name": "runtime-upgrade",
+      "source": "./",
+      "description": "Upgrade Node.js or PHP runtimes across any repo shape — EOL and CVE research, blocker assessment, and verification gates.",
+      "version": "0.1.0",
+      "category": "security",
+      "keywords": ["nodejs", "php", "upgrade", "eol", "cve", "migration"]
+    }
+  ]
+}

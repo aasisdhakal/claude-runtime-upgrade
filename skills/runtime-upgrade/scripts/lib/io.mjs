@@ -1,0 +1,127 @@
+// Filesystem + HTTP helpers. Zero deps. Works on Node 14+ (https fallback
+// for runtimes older than the global fetch introduced in 18).
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, readdirSync, rmSync } from 'node:fs';
+import { join, resolve, relative, dirname, basename } from 'node:path';
+import { tmpdir } from 'node:os';
+
+export { join, resolve, relative, dirname, basename, existsSync, readdirSync, statSync };
+
+export const CACHE_DIR = process.env.RU_CACHE || join(tmpdir(), 'runtime-upgrade-cache');
+export const OFFLINE = process.env.RU_OFFLINE === '1';
+
+export function readText(p) { try { return readFileSync(p, 'utf8'); } catch { return null; } }
+export function readJson(p) { const t = readText(p); if (t == null) return null; try { return JSON.parse(t); } catch { return null; } }
+
+/** Read a dotted path out of an object without throwing. */
+export function pick(obj, path, dflt = '') {
+  let cur = obj;
+  for (const k of String(path).split('.')) {
+    if (cur == null || typeof cur !== 'object') return dflt;
+    cur = cur[k];
+  }
+  return cur == null ? dflt : cur;
+}
+
+function cacheKey(url) {
+  let h = 5381;
+  for (let i = 0; i < url.length; i++) h = ((h * 33) ^ url.charCodeAt(i)) >>> 0;
+  return h.toString(36) + '-' + url.length;
+}
+
+async function rawGet(url, headers) {
+  if (typeof fetch === 'function') {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 25000);
+    try {
+      const r = await fetch(url, { headers, signal: ctl.signal });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.text();
+    } finally { clearTimeout(t); }
+  }
+  const { get } = await import('node:https');
+  return await new Promise((ok, bad) => {
+    const req = get(url, { headers, timeout: 25000 }, res => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume(); return rawGet(res.headers.location, headers).then(ok, bad);
+      }
+      if (res.statusCode !== 200) { res.resume(); return bad(new Error('HTTP ' + res.statusCode)); }
+      let b = ''; res.setEncoding('utf8');
+      res.on('data', d => b += d); res.on('end', () => ok(b));
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', bad);
+  });
+}
+
+/**
+ * GET with an on-disk cache. Returns {text, cached, stale, error}.
+ * Never throws — callers degrade instead of dying.
+ */
+export async function fetchCached(url, { ttl = 86400, headers = {} } = {}) {
+  mkdirSync(CACHE_DIR, { recursive: true });
+  const f = join(CACHE_DIR, cacheKey(url));
+  let cachedText = null, ageSec = Infinity;
+  if (existsSync(f)) {
+    cachedText = readText(f);
+    try { ageSec = (Date.now() - statSync(f).mtimeMs) / 1000; } catch {}
+  }
+  if (cachedText != null && ageSec < ttl) return { text: cachedText, cached: true, stale: false };
+  if (OFFLINE) {
+    return cachedText != null
+      ? { text: cachedText, cached: true, stale: true, error: 'offline: using cache' }
+      : { text: null, cached: false, stale: false, error: 'offline and no cached copy' };
+  }
+  try {
+    const text = await rawGet(url, { 'user-agent': 'runtime-upgrade-skill', ...headers });
+    try { writeFileSync(f, text); } catch {}
+    return { text, cached: false, stale: false };
+  } catch (e) {
+    if (cachedText != null) return { text: cachedText, cached: true, stale: true, error: String(e.message || e) };
+    return { text: null, cached: false, stale: false, error: String(e.message || e) };
+  }
+}
+
+export async function fetchJson(url, opts) {
+  const r = await fetchCached(url, opts);
+  if (r.text == null) return { data: null, ...r };
+  try { return { data: JSON.parse(r.text), ...r }; }
+  catch (e) { return { data: null, ...r, error: 'bad JSON: ' + e.message }; }
+}
+
+const SKIP = new Set(['node_modules','vendor','.git','dist','build','.next','.nuxt','.venv','venv',
+  '__pycache__','.turbo','coverage','target','bin','obj','.gradle','.terraform','tmp','.cache','out']);
+
+/**
+ * Recursive walk replacing `find`. Portable: no -printf, no bfs/BSD divergence.
+ * Returns absolute paths of files whose basename matches `match`.
+ */
+export function walk(root, { match, maxDepth = 6, limit = 5000, skip = SKIP } = {}) {
+  const hits = [];
+  const stack = [[resolve(root), 0]];
+  while (stack.length && hits.length < limit) {
+    const [dir, depth] = stack.pop();
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isSymbolicLink()) continue;
+      if (e.isDirectory()) {
+        if (skip.has(e.name) || e.name.startsWith('.') && skip.has(e.name)) continue;
+        if (depth < maxDepth) stack.push([full, depth + 1]);
+      } else if (e.isFile() && match(e.name)) {
+        hits.push(full);
+        if (hits.length >= limit) break;
+      }
+    }
+  }
+  return hits.sort();
+}
+
+/** Path relative to root, with the root itself rendered as "." */
+export function rel(root, p) {
+  const r = relative(resolve(root), resolve(p));
+  return r === '' ? '.' : r;
+}
+
+export function emit(obj) { process.stdout.write(JSON.stringify(obj, null, 2) + '\n'); }
+export function die(msg, code = 1) { process.stderr.write('ERROR: ' + msg + '\n'); process.exit(code); }

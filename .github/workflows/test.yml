@@ -1,0 +1,34 @@
+name: tests
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule:
+    # the EOL and CVE feeds move on their own — catch upstream shape changes
+    - cron: '0 6 * * 1'
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ['18', '20', '22', '24']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}' }
+      - name: doctor
+        run: node skills/runtime-upgrade/scripts/doctor.mjs
+      - name: tests
+        run: node skills/runtime-upgrade/tests/run.mjs
+
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: tests with no network access
+        env: { RU_OFFLINE: '1' }
+        run: node skills/runtime-upgrade/tests/run.mjs
