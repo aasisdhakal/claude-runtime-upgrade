@@ -88,6 +88,10 @@ export async function fetchJson(url, opts) {
   catch (e) { return { data: null, ...r, error: 'bad JSON: ' + e.message }; }
 }
 
+// Names that are USUALLY an artefact directory but are sometimes a real source
+// tree. These are the only skips worth telling the user about.
+const AMBIGUOUS_SKIP = new Set(['build', 'out', 'target', 'bin', 'obj', 'dist', 'tmp']);
+
 const SKIP = new Set(['node_modules','vendor','.git','dist','build','.next','.nuxt','.venv','venv',
   '__pycache__','.turbo','coverage','target','bin','obj','.gradle','.terraform','tmp','.cache','out']);
 
@@ -97,24 +101,60 @@ const SKIP = new Set(['node_modules','vendor','.git','dist','build','.next','.nu
  */
 export function walk(root, { match, maxDepth = 6, limit = 5000, skip = SKIP } = {}) {
   const hits = [];
+  // Hitting a cap is not the same as finding everything. next.js scanned
+  // 19,999 files and reported truncated:false; kubernetes lost 14 .go files to
+  // the depth cap and grafana's real module pkg/build/wire/go.mod was invisible
+  // because `build` is in the skip set. Silence on a big repo reads as a clean
+  // result, so the walk now says what it could not see.
+  hits.truncated = false;
+  hits.deepest = 0;
+  hits.depthCapped = [];
+  hits.skipped = [];
   const stack = [[resolve(root), 0]];
-  while (stack.length && hits.length < limit) {
+  while (stack.length) {
+    if (hits.length >= limit) { hits.truncated = true; break; }
     const [dir, depth] = stack.pop();
+    if (depth > hits.deepest) hits.deepest = depth;
     let entries;
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     for (const e of entries) {
       const full = join(dir, e.name);
       if (e.isSymbolicLink()) continue;
       if (e.isDirectory()) {
-        if (skip.has(e.name) || e.name.startsWith('.') && skip.has(e.name)) continue;
+        if (skip.has(e.name) || e.name.startsWith('.') && skip.has(e.name)) {
+          // Only the AMBIGUOUS names are worth reporting. `.git`, `node_modules`
+          // and `__pycache__` are never source trees, so listing them is noise
+          // that buries the one case that matters: grafana's real Go module
+          // lives at pkg/build/wire, and `build` is in this set.
+          if (AMBIGUOUS_SKIP.has(e.name) && hits.skipped.length < 40) hits.skipped.push(rel(root, full));
+          continue;
+        }
         if (depth < maxDepth) stack.push([full, depth + 1]);
+        else if (hits.depthCapped.length < 40) hits.depthCapped.push(rel(root, full));
       } else if (e.isFile() && match(e.name)) {
         hits.push(full);
-        if (hits.length >= limit) break;
+        if (hits.length >= limit) { hits.truncated = true; break; }
       }
     }
   }
-  return hits.sort();
+  return hits;
+}
+
+/**
+ * What a walk could not see, in a form worth printing. Returns null when the
+ * walk was complete — so a caller can say nothing, honestly.
+ */
+export function walkGaps(hits, { what = 'files' } = {}) {
+  const g = {};
+  if (hits.truncated) g.hitFileCap = `stopped after ${hits.length} ${what} — there are more`;
+  if (hits.depthCapped?.length)
+    g.belowDepthLimit = { count: hits.depthCapped.length, examples: hits.depthCapped.slice(0, 5),
+                          meaning: 'directories deeper than the walk limit were never opened' };
+  if (hits.skipped?.length)
+    g.skippedByName = { count: hits.skipped.length, examples: hits.skipped.slice(0, 5),
+                        meaning: 'skipped by name as artefact directories, but these names are ambiguous — '
+                               + 'check whether any is a real source tree (grafana keeps a Go module at pkg/build/wire)' };
+  return Object.keys(g).length ? g : null;
 }
 
 /** Path relative to root, with the root itself rendered as "." */

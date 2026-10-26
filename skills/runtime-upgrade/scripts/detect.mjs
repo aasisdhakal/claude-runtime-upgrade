@@ -2,7 +2,7 @@
 // Phase 1 — DISCOVER. Portable replacement for detect.sh.
 // No find(1), no jq, no python3, no mapfile, no paste. Runs on macOS, Linux, WSL.
 // usage: node detect.mjs [root]
-import { walk, readText, readJson, existsSync, join, resolve, rel, emit, die, readdirSync } from './lib/io.mjs';
+import { walk, walkGaps, readText, readJson, existsSync, join, resolve, rel, emit, die, readdirSync } from './lib/io.mjs';
 import { adapters, matchesManifest, adaptersForManifest } from './adapters/index.mjs';
 import { detectFrameworks } from './lib/frameworks.mjs';
 
@@ -124,11 +124,24 @@ function manifestDeps(dir, lang) {
 // Trees that are not deployables. Reported separately rather than dropped —
 // a fixture pinned to an EOL runtime is worth knowing about, it just is not
 // upgrade WORK and must not carry story points or be chosen as the pilot.
-const NOISE = /(^|\/)(examples?|samples?|fixtures?|testdata|test-?data|benchmarks?|docs?|website|demo|\.devcontainer|\.github|tests?)(\/|$)/i;
+// `compiled` and `npm` cover two real cases found on next.js:
+//   packages/next/src/compiled/@babel/runtime   a VENDORED copy, engines >=6,
+//     which got its own "node 6.9.0 -> 26.12.1" plan worth 10 points
+//   crates/next-napi-bindings/npm/<platform>    8 publish STUBS, engines >=10,
+//     zero dependencies, 10 points each — ~130 of 254 story points were these
+const NOISE = /(^|\/)(examples?|samples?|fixtures?|testdata|test-?data|benchmarks?|docs?|website|demo|compiled|vendored?|third[-_]?party|\.devcontainer|\.github|tests?)(\/|$)/i;
 const allManifestPaths = walk(ROOT, { match: matchesManifest });
 const manifestPaths = allManifestPaths.filter(p => !NOISE.test(rel(ROOT, p)));
 const ancillaryPaths = allManifestPaths.filter(p => NOISE.test(rel(ROOT, p)));
-const dockerPaths = walk(ROOT, { match: n => n === 'Dockerfile' || n.startsWith('Dockerfile.') });
+const allDockerPaths = walk(ROOT, { match: n => n === 'Dockerfile' || n.startsWith('Dockerfile.') });
+// The container-only loop walked EVERY Dockerfile, so examples/with-docker and
+// examples/with-docker-multi-env/docker/{dev,prod,staging} became full targets
+// and plan picked `examples/with-docker` as the pilot — the exact outcome the
+// NOISE filter exists to prevent. Vendored and publish-stub trees are the same
+// kind of thing: real manifests that are not this project's upgrade work.
+const dockerPaths = allDockerPaths.filter(p => !NOISE.test(rel(ROOT, p)));
+const ancillaryDockerPaths = allDockerPaths.filter(p => NOISE.test(rel(ROOT, p)));
+const discoveryGaps = walkGaps(allManifestPaths, { what: 'manifests' });
 
 // ---------- classify repo shape ----------
 const rootPkg = readJson(join(ROOT, 'package.json'));
@@ -218,6 +231,30 @@ for (const df of dockerPaths) {
 // dependencies is still the thing being upgraded, so it is never pruned. But
 // only for the adapter that OWNS that filename; a secondary claimant needs its
 // own evidence.
+/**
+ * A PLATFORM PUBLISH STUB ships one prebuilt binary for one platform and
+ * nothing else: `os` and `cpu` fields, no dependencies, a `.node` or `.wasm`
+ * file as `main`. next.js has eight (`@next/swc-<platform>`), each of which got
+ * its own 10-point "upgrade" plan — and one was chosen as the PILOT. There is
+ * no code in them to upgrade; the engines floor is published metadata.
+ *
+ * Detected by shape, not by path: `npm/` is too generic a directory name to
+ * exclude wholesale, and the next repo would spell it differently anyway.
+ */
+function isPlatformPublishStub(dir) {
+  const pkg = readJson(join(dir, 'package.json'));
+  if (!pkg) return false;
+  const noCode = !Object.keys(pkg.dependencies || {}).length
+              && !Object.keys(pkg.devDependencies || {}).length;
+  const platformScoped = Array.isArray(pkg.os) || Array.isArray(pkg.cpu) || Array.isArray(pkg.libc);
+  const shipsABinary = /\.(node|wasm)$/.test(String(pkg.main || ''));
+  return noCode && platformScoped && shipsABinary;
+}
+
+for (const t of targets)
+  if (t.lang === 'node' && isPlatformPublishStub(t.dir === '.' ? ROOT : join(ROOT, t.dir)))
+    t.platformPublishStub = true;
+
 const meaningful = targets.filter(t =>
   (t.dir === '.' && t.primaryManifest) || t.error || t.containerOnly
   || t.declaredMajors || t.deps > 0 || t.devDeps > 0 || t.lockfile);
@@ -230,8 +267,21 @@ targets.length = 0; targets.push(...meaningful);
 // like a manifest-pinned single-language project
 const rootTargetLangs = [...new Set(targets
   .filter(t => t.dir === '.' && t.declaredMajors && !t.containerOnly).map(t => t.lang))];
+// A repo is a monorepo when it CONTAINS sibling packages, whatever the
+// ecosystem. Keying this on workspace files alone (package.json workspaces,
+// pnpm, turbo, nx, lerna) is a Node-only test, so every non-JS monorepo fell
+// through to 'single' — whose guidance is literally "upgrade the ROOT pin
+// once". Measured: symfony 213 sibling PHP packages, roslyn 121 .NET, k8s 37
+// Go modules, laravel 38, spring-boot 9 — all reported 'single'.
+// Sibling packages that DECLARE their own runtime are the signal; directories
+// that merely contain a manifest are not (django has none and stays 'single').
+const siblingPackages = targets.filter(t =>
+  t.dir !== '.' && t.declaredMajors && !t.containerOnly).length;
 if (gitChildren >= 2) shape = 'polyrepo';
-else if (isWorkspace) shape = 'monorepo';
+// ...but only when the root is itself a target. tokio's root Cargo.toml is a
+// pure workspace with no [package], so it pins nothing and 'multi-package' —
+// "the root pins nothing" — stays the honest answer.
+else if (isWorkspace || (rootTargetLangs.length && siblingPackages >= 2)) shape = 'monorepo';
 else if (rootTargetLangs.length > 1) shape = 'mixed-single';
 else if (rootTargetLangs.length === 1) shape = 'single';
 else if (targets.some(t => !t.containerOnly)) shape = 'multi-package';
@@ -239,23 +289,39 @@ else if (targets.length || dockerPaths.length) shape = 'container-only';
 else shape = 'no-manifest';
 
 const driftCount = targets.filter(t => t.drift).length;
-const undeclared = targets.filter(t => !t.declaredMajors).length;
+// A target with an UNVERSIONED pin (a dated Rust nightly, a floating `stable`
+// channel) is not undeclared — the toolchain is enforced, it just carries no
+// release number. Counting those as undeclared made next.js report 64 Rust
+// targets with "nothing enforces a version here", which was false.
+const undeclaredTargets = targets.filter(t => !t.declaredMajors && !t.unversionedPin);
+const undeclared = undeclaredTargets.length;
 
 emit({
   root: ROOT,
   shape,
+  siblingPackages,
+  // what the walk could NOT see. A cap silently reached on a large repo reads
+  // as "there is nothing more", which is how whole module trees go unreported.
+  discoveryGaps: discoveryGaps || undefined,
   scannedAt: new Date().toISOString(),
   targetCount: targets.length,
   driftCount,
   undeclaredCount: undeclared,
+  // enforced, but with no release number to compare against an EOL feed
+  unversionedPins: targets.filter(t => t.unversionedPin)
+    .map(t => ({ dir: t.dir, lang: t.lang, ...t.unversionedPin })),
   languages: [...new Set(targets.map(t => t.lang))],
+  // stubs are reported, never planned: a prebuilt-binary package has no source
+  platformPublishStubs: targets.filter(t => t.platformPublishStub)
+    .map(t => ({ dir: t.dir, name: t.name, declared: t.declaredMajors,
+                 why: 'ships one prebuilt binary for one platform, no dependencies — the engines floor is published metadata, not a runtime this repo runs' })),
   ancillaryTargets: ancillaryPaths.map(p => rel(ROOT, p)),
   ancillaryNote: ancillaryPaths.length
     ? 'test fixtures, examples, docs and .devcontainer/.github trees. Worth knowing about, '
     + 'but they are not deployables: no story points, never the pilot.'
     : null,
   allTargetsUndeclared: targets.length > 0 && targets.every(t => !t.declaredMajors),
-  undeclaredGuidance: targets.length > 0 && targets.every(t => !t.declaredMajors)
+  undeclaredGuidance: targets.length > 0 && targets.every(t => !t.declaredMajors && !t.unversionedPin)
     ? 'No target declares a runtime anywhere in its manifest or version files. That is itself '
     + 'the finding: nothing pins the version, so CI and production can drift apart silently. '
     + 'Check the CI field below for what is actually used, and add a pin.'

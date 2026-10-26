@@ -133,9 +133,19 @@ function manifestChangedDeps(dir, file) {
 
 /** manifest and lockfile must move together — but only when deps actually moved */
 function pairViolations(dir, files) {
+  // Keying on BASENAMES paired any go.mod in the monorepo with any go.sum
+  // elsewhere in it. A manifest and its lockfile are a pair only inside the
+  // SAME directory.
   const base = f => f.split('/').pop();
-  const names = new Set(files.map(base));
+  const dirOf = f => f.includes('/') ? f.slice(0, f.lastIndexOf('/')) : '.';
+  const byDir = new Map();
+  for (const f of files) {
+    const d = dirOf(f);
+    if (!byDir.has(d)) byDir.set(d, new Set());
+    byDir.get(d).add(base(f));
+  }
   const bad = [];
+  for (const [d, names] of byDir)
   for (const [manifest, locks] of PAIRS) {
     const hasM = names.has(manifest);
     const hasL = locks.some(l => names.has(l));
@@ -222,7 +232,10 @@ if (cmd === 'commit') {
     process.exit(1);
   }
 
-  const full = (phase ? `${phase}: ` : '') + message;
+  // `guard commit -m "runtime: go 1.27.3" --phase runtime` produced
+  // "runtime: runtime: go 1.27.3"
+  const full = (phase && !message.toLowerCase().startsWith(phase.toLowerCase() + ':'))
+    ? `${phase}: ${message}` : message;
   const r = run('git', ['commit', '-m', full], { cwd: DIR, timeout: 30000 });
   if (!r.ok) die(`commit failed: ${(r.stderr || r.stdout).trim()}`);
   emit({ dir: DIR, branch, phase: phase || null, files,

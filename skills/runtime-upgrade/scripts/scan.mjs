@@ -2,10 +2,10 @@
 // Source-level breaking-change scan. Finds code that the upgrade will break,
 // with file:line evidence, BEFORE anything is changed.
 // usage: node scan.mjs <lang> <dir> <from> <to> [--max N]
-import { walk, readText, resolve, existsSync, rel, emit, die } from './lib/io.mjs';
+import { walk, walkGaps, readText, resolve, existsSync, rel, emit, die } from './lib/io.mjs';
 import { byId } from './adapters/index.mjs';
 import { rulesFor, preExistingRules, inheritedCatalogue, SOURCE_EXT } from './lib/breaking.mjs';
-import { stripNonCode } from './lib/strip.mjs';
+import { stripNonCode, stripComments, keepInterpolatable } from './lib/strip.mjs';
 
 const argv = process.argv.slice(2);
 const [langArg, dirArg, from, to] = argv.filter(a => !a.startsWith('--'));
@@ -32,6 +32,10 @@ const ext = SOURCE_EXT[A.id];
 if (!ext) die(`no source extensions known for ${A.id}`, 2);
 
 const files = walk(DIR, { match: n => ext.test(n), maxDepth: 12, limit: 20000 });
+// `truncated` below tracks the FINDINGS cap. This tracks the FILE walk — a
+// different cap, silently reached on next.js (19,999 files) and roslyn (19,995
+// of 22k), where unscanned files read as files with no findings.
+const coverageGaps = walkGaps(files, { what: 'source files' });
 const findings = [];
 let scanned = 0;
 
@@ -46,7 +50,9 @@ for (const f of files) {
   for (const r of rules) {
     // fresh regex per file: a /g rule would carry lastIndex between files
     // a rule may need to see inside strings (Go import paths, PHP interpolation)
-    const haystack = (r.scope === 'any' || r.scope === 'strings') ? raw : text;
+    const haystack = r.scope === 'dquote' ? keepInterpolatable(raw, A.id)
+      : r.scope === 'code-strings' ? stripComments(raw, A.id)
+      : (r.scope === 'any' || r.scope === 'strings') ? raw : text;
     const re = new RegExp(r.re.source, r.re.flags.includes('g') ? r.re.flags : r.re.flags + 'g');
     let m;
     while ((m = re.exec(haystack)) !== null && findings.length < MAX) {
@@ -78,6 +84,8 @@ emit({
   inheritedFrom: inherit,
   preExistingIncluded: INCLUDE_EXISTING,
   filesScanned: scanned,
+  coverageGaps: coverageGaps || undefined,
+  coverageNote: coverageGaps ? 'some files were never opened — a finding count is a floor, not a total' : undefined,
   findings: findings.length,
   truncated: findings.length >= MAX,
   bySeverity,

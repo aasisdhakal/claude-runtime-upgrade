@@ -92,8 +92,15 @@ const epic = {
 };
 const tickets = [epic, ...plans.map(p => ({
   kind: 'task',
-  title: `[${p.name || p.dir}] ${p.lang} ${p.current} -> ${p.target}`,
-  body: describe(p),
+  // a collapsed plan covers many packages making the same move — the title has
+  // to say so, or the ticket reads as covering one directory
+  title: p.packageCount > 1
+    ? `[${p.lang}] ${p.current} -> ${p.target} across ${p.packageCount} packages`
+    : `[${p.name || p.dir}] ${p.lang} ${p.current} -> ${p.target}`,
+  body: describe(p) + (p.packageCount > 1
+    ? `\n\n## Packages covered (${p.packageCount})\n\n${p.collapsedNote}\n\n`
+      + (p.appliesTo || []).map(d => `- \`${d}\``).join('\n') + '\n'
+    : ''),
   labels: ['runtime-upgrade', p.lang, ...(p.eol?.isEol ? ['eol'] : []), ...(p.risk?.level === 'high' ? ['high-risk'] : [])],
   points: p.estimatePoints,
   priority: p.risk?.level === 'high' ? 'High' : p.risk?.level === 'medium' ? 'Medium' : 'Low',

@@ -1,6 +1,8 @@
-import { join, existsSync, readText, rel } from '../lib/io.mjs';
+import { join, existsSync, readText, rel, walk } from '../lib/io.mjs';
 import { classifyDeclared } from '../lib/semver.mjs';
 import { osvAdvisories } from '../lib/osv.mjs';
+
+import { usesCgo } from '../lib/strip.mjs';
 
 export const id = 'go';
 export const label = 'Go';
@@ -53,6 +55,10 @@ export function scan({ dir, root, dockerImages, ciText }) {
     drift: pinMajors.length > 1,
     deps, devDeps: 0,
     // Go links statically; CGO_ENABLED is the only native axis that matters.
-    cgo: /\bC\b/.test(gomod) || existsSync(join(dir, 'cgo.go')),
+    // cgo is `import "C"` in a .go file, never a token in go.mod. The old test
+    // matched the word "C" anywhere in the manifest, so a comment mentioning
+    // "the C zlib library" reported cgo: true while a module that really does
+    // `import "C"` reported false.
+    cgo: usesCgo(dir, { walk, readText, join }).cgo,
   };
 }

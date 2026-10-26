@@ -8,6 +8,7 @@
 import { resolve, existsSync, join, emit, die } from './lib/io.mjs';
 import { runJson, run, have } from './lib/sh.mjs';
 import { byId } from './adapters/index.mjs';
+import { satisfies } from './lib/semver.mjs';
 import { planPinEdits, planCiEdits, planConfigEdits, ciMatrixAdvice } from './lib/edits.mjs';
 import { rulesFor } from './lib/breaking.mjs';
 import { fileURLToPath } from 'node:url';
@@ -53,7 +54,12 @@ const DEPLOY_PINS = ['targetFramework', 'dockerfile', 'nvmrc', 'nodeVersion', 'p
 const FLOORS = ['engines', 'requirePhp', 'requiresPython', 'poetryPython', 'pythonRequires',
                 'gemfileRuby', 'gemspecRuby', 'rustVersion', 'minimumOtp', 'makefileOtp',
                 'goDirective', 'mavenRelease', 'javaVersionProp', 'kotlinPlugin', 'versionCatalog',
-                'scalaVersion', 'mixElixir', 'cpanfilePerl', 'globalJsonSdk', 'denoJson'];
+                'scalaVersion', 'mixElixir', 'cpanfilePerl', 'denoJson'];
+// global.json pins the SDK (10.0.100 / 11.0.100-rc). endoflife.date reports the
+// RUNTIME (10.0.13). They are different number spaces, so treating the SDK as
+// "the current version" made roslyn's root read as "11.0.100 -> 10.0.13,
+// proceed" — a downgrade presented as an upgrade. The TFM is the real axis.
+const NOT_A_RUNTIME_VERSION = ['globalJsonSdk'];
 
 // ───────────── discover ─────────────
 const det = runJson(process.execPath, [S('detect.mjs'), DIR]);
@@ -76,8 +82,11 @@ const plans = [];
 for (const t of targets) {
   const A = byId[t.lang];
   if (!A) continue;
+  // a prebuilt-binary publish stub has no source to upgrade; planning one both
+  // invents story points and can hand it the pilot slot
+  if (t.platformPublishStub) continue;
   const dir = t.dir === '.' ? DIR : join(DIR, t.dir);
-  const current = pickCurrent(t);
+  const current = pickCurrent(t, A);
 
   // ── research ──
   // only pass a target that belongs to THIS language
@@ -99,9 +108,24 @@ for (const t of targets) {
 
   // ── frameworks ──
   const fw = runJson(process.execPath, [S('frameworks.mjs'), dir]);
-  const frameworks = (fw.data?.perTarget || []).flatMap(p => p.frameworks || []);
-  const fwUntracked = (fw.data?.perTarget || []).flatMap(p => p.untracked || []);
+  // frameworks.mjs re-detects the WHOLE subtree under `dir`, so flatMapping
+  // every perTarget entry hung each subdirectory's findings on THIS target. A
+  // monorepo root inherited every nested app's frameworks: next.js's root plan
+  // carried `nextjs 13 (EOL 2024-12-21)` from an upgrade-eval fixture five
+  // levels down, as a major blocker worth +2 points. Grafana's GO plan listed
+  // react sixteen times. Take only the entry for this directory.
+  const mine = (fw.data?.perTarget || []).filter(p => p.dir === '.' && p.lang === t.lang);
+  const dedupe = (xs, key) => {
+    const seen = new Set();
+    return xs.filter(x => { const k = key(x); if (seen.has(k)) return false; seen.add(k); return true; });
+  };
+  const frameworks = dedupe(mine.flatMap(p => p.frameworks || []), f => `${f.product}@${f.declared}`);
+  const fwUntracked = dedupe(mine.flatMap(p => p.untracked || []), u => String(u.dep || u));
   const fwEol = frameworks.filter(f => f.isEol);
+  // findings from BELOW this target are real, but they belong to those targets
+  const fwElsewhere = (fw.data?.perTarget || [])
+    .filter(p => p.dir !== '.' && (p.frameworks || []).some(f => f.isEol))
+    .map(p => ({ dir: p.dir, eol: p.frameworks.filter(f => f.isEol).map(f => `${f.product} ${f.cycle}`) }));
 
   // ── what the edit phase will touch ──
   const pins = planPinEdits(t.lang, dir, target).edits;
@@ -111,6 +135,45 @@ for (const t of targets) {
 
   // ── blockers ──
   const blockers = [];
+  // Does the target actually SATISFY what this project declares? grafana's root
+  // says `engines.node ">= 22 <25"` and the plan happily targeted 26.12.1 with
+  // zero blockers — the string `<25` appeared nowhere in 59 plans. A declared
+  // cap the target breaches is the project telling you not to do this.
+  for (const [field, value] of Object.entries(t.declared || {})) {
+    if (!value || typeof value !== 'string') continue;
+    if (!/[<>=~^]/.test(value)) continue;              // a bare pin, not a range
+    if (/\(test matrix\)/.test(value)) continue;        // deliberate breadth
+    let ok = true;
+    try { ok = satisfies(target, value); } catch { continue; }
+    if (ok) continue;
+    // only a declared UPPER bound is a real contradiction; a floor below the
+    // target is satisfied by definition and is handled by the floor policy
+    if (!/<|~>|\^/.test(value)) continue;
+    blockers.push({ kind: 'declared-constraint-breached', item: `${field}: ${value}`,
+      detail: `the target ${target} does not satisfy the constraint this project declares `
+            + `(${field} = "${value}"). Something here was deliberately capped.`,
+      fix: 'find out why the cap is there before raising it — a cap is usually a known incompatibility, '
+         + 'not an oversight. If it is stale, widen it in the same change and say so.',
+      severity: 'blocker' });
+  }
+  // A .NET Framework TFM is not an old version of .NET — it is a DIFFERENT,
+  // Windows-only runtime. Moving net472 to net10.0 is a cross-platform port:
+  // AppDomains, WCF server, System.Web, Windows-only APIs and binary
+  // serialization all have to go. Counted as "5 release cycles crossed" it read
+  // as an ordinary bump; it is the single largest item in any plan that has one.
+  if (t.netFrameworkTfms?.length)
+    blockers.push({ kind: 'platform-port', item: t.netFrameworkTfms.join(';'),
+      detail: '.NET Framework is a separate Windows-only runtime, not an older .NET. This is a port, not a version bump: '
+            + 'AppDomains, System.Web, WCF server-side and binary serialization have no equivalent.',
+      fix: 'run `dotnet upgrade-assistant analyze` and scope the port before planning any version work',
+      severity: 'blocker' });
+  // netstandard is a compatibility surface, not a runtime. A project that only
+  // targets netstandard has nothing to upgrade.
+  if (t.netStandardTfms?.length && !t.netFrameworkTfms?.length
+      && String(t.declaredMajors || '') === '')
+    blockers.push({ kind: 'not-a-runtime-target', item: t.netStandardTfms.join(';'),
+      detail: 'this project targets only netstandard — a compatibility surface consumed by a runtime, not a runtime itself. There is no version here to move.',
+      severity: 'major' });
   for (const n of (a.nativeBlockers || []))
     blockers.push({ kind: 'native-abi', item: `${n.name}@${n.version}`, detail: n.note, severity: 'blocker' });
   for (const f of dedupeByFileRule((sc.details || []).filter(d => d.severity === 'removed' && !d.preExisting)))
@@ -168,6 +231,13 @@ for (const t of targets) {
              config: cfg.map(e => `${e.file} (${e.rule})`),
              ciMatrix: matrix },
     blockers,
+    // assess's own caveats — dropped entirely before, so on the one repo where
+    // N-API classification is the headline risk the plan showed nativeNoise: []
+    // and no blocker, with no hint that nothing had been checked
+    assessCaveats: (a?.notes || []).length ? a.notes : undefined,
+    nativeEnumerated: a?.nativeEnumerated ?? undefined,
+    // EOL frameworks found UNDER this target — reported, not charged to it
+    frameworksEolBelowThisTarget: fwElsewhere.length ? fwElsewhere.slice(0, 10) : undefined,
     verdict: gateFails ? 'blocked'
            : (blockers.length || editionJump || crossed >= 3) ? 'proceed-with-conditions'
            : 'proceed',
@@ -203,14 +273,19 @@ function dedupeByFileRule(list) {
  *     not what you are upgrading from.
  * Taking the CI version made php-carbon look like 8.5 -> 8.5.12: a no-op.
  */
-function pickCurrent(t) {
+function pickCurrent(t, adapter) {
   const d = t.declared || {};
-  const num = v => {
-    const t = String(v).replace(/^net(?:coreapp)?/, '').split(';')[0];   // net10.0 -> 10.0
-    return (t.match(/(\d+(?:\.\d+){0,2})/) || [])[1];
+  // An adapter that knows how to read its own version strings MUST be the one
+  // that does it. Reimplementing this here read `net472` as "472".
+  const generic = v => {
+    const x = String(v).split(';')[0];
+    return (x.match(/(\d+(?:\.\d+){0,2})/) || [])[1];
   };
-  for (const k of DEPLOY_PINS) if (d[k]) { const m = num(d[k]); if (m) return m; }
-  for (const k of FLOORS)      if (d[k]) { const m = num(d[k]); if (m) return m; }
+  const num = adapter?.normalizeVersion
+    ? (v => adapter.normalizeVersion(String(v).split(/[;|]/)[0]) || undefined)
+    : generic;
+  for (const k of DEPLOY_PINS) if (d[k] && !NOT_A_RUNTIME_VERSION.includes(k)) { const m = num(d[k]); if (m) return m; }
+  for (const k of FLOORS)      if (d[k] && !NOT_A_RUNTIME_VERSION.includes(k)) { const m = num(d[k]); if (m) return m; }
   // last resort: the LOWEST declared major, never the highest
   const all = String(t.declaredMajors || '').split(',').filter(Boolean)
     .sort((a, b) => parseFloat(a) - parseFloat(b));
@@ -379,6 +454,10 @@ function sharedBlockers(ps) {
     .map(([item, dirs]) => ({ item, affects: dirs, note: 'fix once, apply everywhere' }));
 }
 
+// computed BEFORE the object that spreads it: a const referenced above its
+// declaration is a TDZ ReferenceError, not an empty object
+const collapsed = collapseMonorepo(det.data.shape, plans);
+
 const out = {
   root: DIR, shape: det.data.shape, policy: POLICY,
   // emitting an empty plan for a repo that plainly has manifests reads as a
@@ -395,12 +474,65 @@ const out = {
   } : undefined,
   generatedFor: targets.length + ' target(s)',
   undeclaredTargets: undeclared.map(t => `${t.lang}: ${t.dir}`),
-  totalEstimatePoints: plans.reduce((n, p) => n + (p.estimatePoints || 0), 0),
-  verdicts: plans.reduce((m, p) => (m[p.verdict || 'error'] = (m[p.verdict || 'error'] || 0) + 1, m), {}),
+  // see collapseMonorepo below
+  ...collapsed,
+  totalEstimatePoints: (collapsed.plans || plans).reduce((n, p) => n + (p.estimatePoints || 0), 0),
+  verdicts: (collapsed.plans || plans).reduce((m, p) => (m[p.verdict || 'error'] = (m[p.verdict || 'error'] || 0) + 1, m), {}),
   sequencing,
-  plans,
+  plans: collapsed.plans || plans,
 };
 
+/**
+ * One repo, one plan per DISTINCT upgrade — not one per package.
+ *
+ * SKILL.md says "never one ticket per workspace package", and then plan emitted
+ * 215 of them for symfony, 123 for roslyn, 39 for laravel and 38 for k8s, each
+ * with its own story points, sequencing entry and rendered ticket. A monorepo
+ * has one CI, one release train and one decision; the per-package work is the
+ * same mechanical pin edit repeated.
+ *
+ * Packages that differ — a different current version, a different verdict, a
+ * blocker of their own — stay separate, because those are genuinely different
+ * decisions. Identical ones collapse into a single plan that lists them.
+ *
+ * Cost model: the compatibility investigation is paid ONCE; each extra package
+ * adds only the edit. So 215 packages is not 215x the work, and pretending it
+ * is made the estimate useless.
+ */
+function collapseMonorepo(shape, plans) {
+  if (!['monorepo', 'multi-package', 'polyrepo'].includes(shape) || plans.length < 3) return {};
+  const key = p => [p.lang, p.current, p.target, p.verdict,
+                    (p.blockers || []).map(b => b.kind).sort().join('|')].join('::');
+  const groups = new Map();
+  for (const p of plans) {
+    const k = key(p);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(p);
+  }
+  if (groups.size === plans.length) return {};          // nothing is actually alike
+  const out = [];
+  for (const members of groups.values()) {
+    if (members.length === 1) { out.push(members[0]); continue; }
+    const lead = members.find(m => m.dir === '.') || members[0];
+    const extra = members.length - 1;
+    out.push({
+      ...lead,
+      dir: lead.dir,
+      appliesTo: members.map(m => m.dir).sort(),
+      packageCount: members.length,
+      // the investigation once, plus the repeated edit
+      estimatePoints: (lead.estimatePoints || 0) + Math.min(8, Math.ceil(extra / 4)),
+      collapsedNote: `${members.length} packages in this repo make the SAME move `
+        + `(${lead.current} -> ${lead.target}) with the same verdict. They are one change, not `
+        + `${members.length}: the compatibility work is shared and only the pin edit repeats. `
+        + `File ONE ticket for this repo, not one per package.`,
+    });
+  }
+  const saved = plans.length - out.length;
+  return { plans: out,
+           collapsedFromPerPackage: { was: plans.length, now: out.length, merged: saved,
+             why: 'identical upgrades in one repo are one decision; SKILL.md: never one ticket per workspace package' } };
+}
 if (FORMAT === 'md') process.stdout.write(markdown(out));
 else emit(out);
 

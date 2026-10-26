@@ -3,18 +3,21 @@
 // Network-dependent cases are skipped automatically when offline or unreachable.
 import { build, destroy, FIXTURES } from './fixtures.mjs';
 import { runJson, run } from '../scripts/lib/sh.mjs';
-import { fetchJson } from '../scripts/lib/io.mjs';
+import { fetchJson, walk, walkGaps, readText } from '../scripts/lib/io.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
-import { stripNonCode } from '../scripts/lib/strip.mjs';
+import { stripNonCode, stripComments, usesCgo } from '../scripts/lib/strip.mjs';
+import { LOCKFILES, diffLocks, bump } from '../scripts/lib/lockdiff.mjs';
+import { projectTypeChecking, catchability } from '../scripts/lib/typecover.mjs';
 import { PR_PROVIDERS, ISSUE_PROVIDERS, hostOf, slugOf, compareUrl, pickSuggestion } from '../scripts/lib/providers.mjs';
 import { RULES, rulesFor, inheritedCatalogue } from '../scripts/lib/breaking.mjs';
 import { adapters, byId, adaptersForManifest } from '../scripts/adapters/index.mjs';
 import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
 import { PIN_RULES, planPinEdits, unified, planCiEdits, planConfigEdits, ciMatrixAdvice,
+         isCompoundConstraint, raiseLowerBound, declaredButUnreadable,
          planAddPin, ADD_PIN_RULES, mapSuffix, ruleKind } from '../scripts/lib/edits.mjs';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -676,7 +679,33 @@ t('remediate: dotnet container tag uses MAJOR.MINOR, not the full SDK build', ()
   const out = docker.edit('FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build\n');
   ok(/dotnet\/sdk:9\.0\b/.test(out) && !/9\.0\.100/.test(out), `got: ${out.trim()}`);
   const gj = rules.find(r => r.rule === 'sdk.version');
-  ok(/9\.0\.100/.test(gj.edit('{"sdk":{"version":"6.0.418"}}')), 'global.json keeps the full build');
+  // the FEATURE BAND is carried over, never invented: 6.0.418 -> 9.0.418.
+  // Writing `.100` pins a build the project may not have, and under
+  // `rollForward: patch` a wrong band is fatal.
+  eq(JSON.parse(gj.edit('{"sdk":{"version":"6.0.418"}}')).sdk.version, '9.0.418');
+});
+t('remediate: global.json is never moved BACKWARDS', () => {
+  // roslyn pins SDK 11.0.100-rc while the current RUNTIME release is 10.0.13 —
+  // different number spaces. The rewrite emitted a downgrade and called it an
+  // upgrade, fatal under roslyn's own rollForward: patch.
+  const gj = PIN_RULES.dotnet('10.0.13').find(r => r.rule === 'sdk.version');
+  const before = '{"sdk":{"version":"11.0.100-rc.1.26425.128","rollForward":"patch"}}';
+  eq(gj.edit(before), before, 'an SDK already ahead of the runtime target must be left alone');
+});
+t('remediate: a compound constraint is named, never flattened', () => {
+  // `>= 22 <25` -> `>=26.12` silently dropped a deliberate cap;
+  // `>=8.1.0 <8.3 || ~8.4.2` -> `^8.5` destroyed a disjunction
+  for (const [lang, field, value] of [['node', 'engines.node', '>= 22 <25'],
+                                      ['node', 'engines.node', '^20 || ^22'],
+                                      ['php', 'require.php', '>=8.1.0 <8.3 || ~8.4.2']]) {
+    ok(isCompoundConstraint(value), `${value} should read as compound`);
+    const r = PIN_RULES[lang]('26.12.1').find(x => x.rule === field);
+    const before = lang === 'node' ? `{"engines":{"node":"${value}"}}` : `{"require":{"php":"${value}"}}`;
+    eq(r.edit(before), before, `${value} must be left exactly as written`);
+  }
+  // and a simple floor still moves
+  const simple = PIN_RULES.node('26.12.1').find(x => x.rule === 'engines.node');
+  ok(/>=26\.12/.test(simple.edit('{"engines":{"node":">=20"}}')));
 });
 t('remediate: unified diff round-trips', () => {
   const before = 'a\nb\nc\n', after = 'a\nB\nc\n';
@@ -971,6 +1000,1272 @@ t('scope: no pin is invented where sub-packages already declare one', () => {
   } finally { rmSync(r, { recursive: true, force: true }); }
 });
 
+function walkMjs(d, out = []) {
+  for (const e of readdirSync(d, { withFileTypes: true })) {
+    const p = join(d, e.name);
+    if (e.isDirectory()) walkMjs(p, out);
+    else if (e.name.endsWith('.mjs')) out.push(p);
+  }
+  return out;
+}
+// ───────────── advice addressed to the right language ─────────────
+console.log('\nper-language hints');
+t('verify: every language gets its OWN deprecation advice', () => {
+  // node got node advice and EVERY other language got the PHP one, so a Go,
+  // Python or .NET run was told about E_DEPRECATED
+  const src = readFileSync(S('verify.mjs'), 'utf8');
+  for (const lang of ['node', 'php', 'python', 'ruby', 'go', 'rust', 'java', 'dotnet'])
+    ok(src.includes('\n    ' + lang + ': ['), lang + ' has no hint of its own');
+  ok(/a clean build checks shape, never behaviour/.test(src), 'and the fallback must stay honest');
+});
+t('verify: a go run is not told about E_DEPRECATED', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-hint-'));
+  try {
+    writeFileSync(join(r, 'go.mod'), 'module x\n\ngo 1.22\n');
+    const v = runJson(process.execPath, [S('verify.mjs'), 'go', r, '1.24.0']).data;
+    ok(!(v.hints || []).some(h => /E_DEPRECATED/.test(h)), JSON.stringify(v.hints));
+    ok((v.hints || []).some(h => /go vet/.test(h)), JSON.stringify(v.hints));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('guard: the phase is not prefixed twice', () => {
+  const src = readFileSync(S('guard.mjs'), 'utf8');
+  ok(/startsWith\(phase\.toLowerCase\(\) \+ ':'\)/.test(src),
+     '`-m "runtime: x" --phase runtime` produced "runtime: runtime: x"');
+});
+t('guard: a manifest pairs with a lockfile only in the SAME directory', () => {
+  const src = readFileSync(S('guard.mjs'), 'utf8');
+  ok(/const dirOf = /.test(src) && /byDir/.test(src),
+     'basename matching paired any go.mod with any go.sum across a monorepo');
+});
+
+// ───────────── an empty list must not read as "clean" ─────────────
+console.log('\nnot checked is not clean');
+t('assess: every language says whether native artefacts were enumerated', () => {
+  // `nativeAddons: []` read as "no blockers" on languages this script cannot
+  // enumerate, and SKILL.md calls that the highest-value output
+  const r = mkdtempSync(join(tmpdir(), 'ru-ne-'));
+  try {
+    const cases = [['python', 'pyproject.toml', '[project]\nname="x"\nrequires-python=">=3.11"\n'],
+                   ['ruby', 'Gemfile', "ruby '3.3.5'\n"],
+                   ['php', 'composer.json', '{"require":{"php":"^8.3"}}']];
+    for (const [lang, file, body] of cases) {
+      writeFileSync(join(r, file), body);
+      const v = runJson(process.execPath, [S('assess.mjs'), lang, r, '99.0.0']).data;
+      ok(v, `${lang} produced no JSON`);
+      eq(v.nativeEnumerated, false, `${lang} must say it did not enumerate`);
+      ok((v.notes || []).some(n => /not because nothing was found|do not apply here/.test(n)),
+         `${lang} must explain the empty list: ${JSON.stringify(v.notes)}`);
+      rmSync(join(r, file), { force: true });
+    }
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('assess: node without node_modules reports NOT enumerated', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-nonm-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x","dependencies":{"a":"1"}}');
+    const v = runJson(process.execPath, [S('assess.mjs'), 'node', r, '26.12.1']).data;
+    eq(v.nativeEnumerated, false, 'nothing was inspected');
+    ok((v.notes || []).some(n => /NOT run/.test(n)), JSON.stringify(v.notes));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('plan: assess caveats reach the plan', () => {
+  // plan dropped assess.notes entirely, so on the one repo where N-API
+  // classification is the headline risk it showed no blocker and no hint
+  const src = readFileSync(S('plan.mjs'), 'utf8');
+  ok(/assessCaveats/.test(src));
+  ok(/nativeEnumerated: a\?\./.test(src));
+});
+
+console.log('\na declared cap is the project saying no');
+t('plan: a target breaching a declared cap is a blocker', () => {
+  // grafana declares `engines.node ">= 22 <25"`; the plan targeted 26 with zero
+  // blockers and the string `<25` appeared nowhere in 59 plans
+  const r = mkdtempSync(join(tmpdir(), 'ru-cap-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"g","engines":{"node":">= 22 <25"},"dependencies":{"x":"1"}}');
+    const p = runJson(process.execPath, [S('plan.mjs'), r, '--json', '--target', '26.12.1']).data;
+    const b = (p.plans[0].blockers || []).find(x => x.kind === 'declared-constraint-breached');
+    ok(b, `no cap blocker: ${JSON.stringify(p.plans[0].blockers)}`);
+    eq(p.plans[0].verdict, 'blocked');
+    ok(/deliberately capped/.test(b.detail));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('plan: a plain floor below the target is NOT a cap breach', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-nocap-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"g","engines":{"node":">= 20"},"dependencies":{"x":"1"}}');
+    const p = runJson(process.execPath, [S('plan.mjs'), r, '--json', '--target', '26.12.1']).data;
+    eq((p.plans[0].blockers || []).filter(x => x.kind === 'declared-constraint-breached').length, 0,
+       'a floor is satisfied by a higher target, by definition');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────── a pin without a version number is still a pin ─────────────
+console.log('\nunversioned pins');
+t('rust: a dated nightly is a pin, not "nothing declared"', () => {
+  // next.js pins nightly-2026-10-06; because the major regex needs digit.digit,
+  // all 64 of its Rust targets reported that nothing enforced a version
+  const r = mkdtempSync(join(tmpdir(), 'ru-nightly-'));
+  try {
+    writeFileSync(join(r, 'Cargo.toml'), '[package]\nname="x"\nversion="0.1.0"\n');
+    writeFileSync(join(r, 'rust-toolchain.toml'), '[toolchain]\nchannel = "nightly-2026-10-06"\n');
+    const d = runJson(process.execPath, [S('detect.mjs'), r, '--json']).data;
+    eq(d.undeclaredCount, 0, 'the toolchain IS enforced');
+    eq((d.unversionedPins || []).length, 1);
+    eq(d.unversionedPins[0].channel, 'nightly-2026-10-06');
+    ok(/port, not a bump/.test(d.unversionedPins[0].meaning),
+       'and moving to stable must be described as a port');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('rust: a nested crate inherits the toolchain file from above', () => {
+  // rustup resolves the file by walking upward; reading only the crate's own
+  // directory left 62 of 64 next.js crates looking unpinned
+  const r = mkdtempSync(join(tmpdir(), 'ru-inherit-'));
+  try {
+    writeFileSync(join(r, 'Cargo.toml'), '[workspace]\nmembers = ["crates/a"]\n');
+    writeFileSync(join(r, 'rust-toolchain.toml'), '[toolchain]\nchannel = "nightly-2026-10-06"\n');
+    mkdirSync(join(r, 'crates/a'), { recursive: true });
+    writeFileSync(join(r, 'crates/a/Cargo.toml'),
+      '[package]\nname="a"\nversion="0.1.0"\n\n[dependencies]\nserde = "1"\n');
+    const d = runJson(process.execPath, [S('detect.mjs'), r, '--json']).data;
+    const nested = (d.unversionedPins || []).find(p => p.dir === 'crates/a');
+    ok(nested, `nested crate not covered: ${JSON.stringify((d.unversionedPins || []).map(p => p.dir))}`);
+    eq(nested.inheritedFrom, '.', 'and must say where the file came from');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('rust: a floating `stable` channel is reported as floating', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-float-'));
+  try {
+    writeFileSync(join(r, 'Cargo.toml'), '[package]\nname="x"\nversion="0.1.0"\n');
+    writeFileSync(join(r, 'rust-toolchain.toml'), '[toolchain]\nchannel = "stable"\n');
+    const d = runJson(process.execPath, [S('detect.mjs'), r, '--json']).data;
+    ok(/floats/.test(d.unversionedPins[0].meaning), d.unversionedPins[0].meaning);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────── two rules, one file ─────────────
+console.log('\nedits to the same file compose');
+t('pins: rules touching the same file are chained, not raced', () => {
+  // go.mod carries BOTH the `go` directive and the `toolchain` line. Each rule
+  // read the original text independently, so the writes raced and the last one
+  // won — the directive edit vanished and go.mod contradicted itself.
+  const r = mkdtempSync(join(tmpdir(), 'ru-chain-'));
+  try {
+    writeFileSync(join(r, 'go.mod'), 'module x\n\ngo 1.21\n\ntoolchain go1.21.13\n');
+    const { edits } = planPinEdits('go', r, '1.22.5', { raiseFloor: true });
+    const gomod = edits.filter(e => e.file === 'go.mod');
+    eq(gomod.length, 1, 'one edit per file, carrying every rule');
+    ok(/go 1\.22/.test(gomod[0].after), gomod[0].after);
+    ok(/toolchain go1\.22\.5/.test(gomod[0].after), gomod[0].after);
+    ok(gomod[0].rules.length >= 2, `both rules must be recorded: ${JSON.stringify(gomod[0].rules)}`);
+    ok(gomod[0].after.endsWith('\n'), 'and the trailing newline must survive');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('pins: go rewrites its real PINS by default, floor declined', () => {
+  // the `go` directive is a floor; `toolchain` and `.go-version` are the pins.
+  // With no pin rules at all, a default `remediate go` rewrote nothing.
+  const r = mkdtempSync(join(tmpdir(), 'ru-gopin-'));
+  try {
+    writeFileSync(join(r, 'go.mod'), 'module x\n\ngo 1.21\n\ntoolchain go1.21.13\n');
+    writeFileSync(join(r, '.go-version'), '1.21.13\n');
+    const out = planPinEdits('go', r, '1.22.5');
+    const touched = out.edits.map(e => e.file).sort();
+    eq(JSON.stringify(touched), JSON.stringify(['.go-version', 'go.mod']));
+    ok(!/go 1\.22\b/.test(out.edits.find(e => e.file === 'go.mod').after.match(/^go .*/m)[0]),
+       'the FLOOR must stay put without --raise-floor');
+    eq(out.declinedFloors[0].rule, 'go directive');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+console.log('\nnative addons: every packaging convention');
+t('addons: all four ABI conventions are recognised as pinned', () => {
+  // only `addon-115.node` was. The misses are the dangerous direction: an
+  // unmarked ABI-pinned binary segfaults at require() time.
+  const r = mkdtempSync(join(tmpdir(), 'ru-abi-'));
+  const mk = (name, sub, file, extra = {}) => {
+    mkdirSync(join(r, 'node_modules', name, sub), { recursive: true });
+    writeFileSync(join(r, 'node_modules', name, 'package.json'),
+      JSON.stringify({ name, version: '1.0.0', ...extra }));
+    writeFileSync(join(r, 'node_modules', name, sub, file), '');
+  };
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"t","dependencies":{}}');
+    mk('pregyp', 'lib/binding/node-v115-linux-x64', 'mod.node');      // node-pre-gyp
+    mk('prebuildify', 'prebuilds/linux-x64', 'node.abi115.node');     // prebuildify
+    mk('gypstyle', 'build/Release', 'addon-115.node');                // node-gyp
+    mk('napifile', 'prebuilds/linux-x64', 'node.napi.node');          // prebuild, N-API
+    mk('napidecl', 'build/Release', 'x.node', { binary: { napi_versions: [8] } });
+    const v = runJson(process.execPath, [S('assess.mjs'), 'node', r, '26.12.1']).data;
+    const by = Object.fromEntries((v.nativeAddons || []).map(a => [a.name, a.kind]));
+    for (const n of ['pregyp', 'prebuildify', 'gypstyle'])
+      eq(by[n], 'abi-pinned', `${n} must be a blocker, not a shrug (got ${by[n]})`);
+    for (const n of ['napifile', 'napidecl'])
+      eq(by[n], 'napi', `${n} must be N-API (got ${by[n]})`);
+    const blockers = (v.nativeBlockers || []).map(a => a.name).sort();
+    eq(JSON.stringify(blockers), JSON.stringify(['gypstyle', 'prebuildify', 'pregyp']));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('addons: napi-rs is read from the PARENT package', () => {
+  // napi-rs platform subpackages carry no marker of their own — this is the
+  // toolchain next.js uses for @next/swc-*
+  const r = mkdtempSync(join(tmpdir(), 'ru-napirs-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"t","dependencies":{}}');
+    mkdirSync(join(r, 'node_modules/parent/linux-x64'), { recursive: true });
+    writeFileSync(join(r, 'node_modules/parent/package.json'),
+      '{"name":"parent","version":"1.0.0","napi":{"name":"x"}}');
+    writeFileSync(join(r, 'node_modules/parent/linux-x64/package.json'),
+      '{"name":"parent-linux-x64","os":["linux"],"main":"x.linux-x64.node"}');
+    writeFileSync(join(r, 'node_modules/parent/linux-x64/x.linux-x64.node'), '');
+    const v = runJson(process.execPath, [S('assess.mjs'), 'node', r, '26.12.1']).data;
+    const a = (v.nativeAddons || []).find(x => /linux-x64/.test(x.name));
+    eq(a?.kind, 'napi', JSON.stringify(v.nativeAddons));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('addons: an unclassifiable prebuilt is not a clean bill of health', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-unk-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"t","dependencies":{}}');
+    mkdirSync(join(r, 'node_modules/mystery/prebuilds/linux-x64'), { recursive: true });
+    writeFileSync(join(r, 'node_modules/mystery/package.json'), '{"name":"mystery","version":"1.0.0"}');
+    writeFileSync(join(r, 'node_modules/mystery/prebuilds/linux-x64/thing.node'), '');
+    const v = runJson(process.execPath, [S('assess.mjs'), 'node', r, '26.12.1']).data;
+    eq((v.nativeUnknown || []).length, 1, 'it must be reported as UNKNOWN, separately');
+    ok(/cannot tell which it is/.test(v.nativeAddons[0].note), v.nativeAddons[0].note);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('addons: an ABI number beats an N-API marker', () => {
+  // a package can ship both; the numbered binary is what gets loaded
+  const r = mkdtempSync(join(tmpdir(), 'ru-both-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"t","dependencies":{}}');
+    mkdirSync(join(r, 'node_modules/both/prebuilds/linux-x64'), { recursive: true });
+    writeFileSync(join(r, 'node_modules/both/package.json'),
+      '{"name":"both","version":"1.0.0","binary":{"napi_versions":[8]}}');
+    writeFileSync(join(r, 'node_modules/both/prebuilds/linux-x64/node.abi115.node'), '');
+    const v = runJson(process.execPath, [S('assess.mjs'), 'node', r, '26.12.1']).data;
+    eq(v.nativeAddons[0].kind, 'abi-pinned', 'evidence of a pin outranks a claim of portability');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────── one repo is one decision ─────────────
+console.log('\nmonorepo plans do not multiply');
+t('plan: identical upgrades in one repo collapse into one', () => {
+  // SKILL.md says "never one ticket per workspace package", and plan emitted
+  // 215 for symfony, 123 for roslyn, 39 for laravel, 38 for k8s — each with its
+  // own story points and its own rendered ticket
+  const r = mkdtempSync(join(tmpdir(), 'ru-mono-'));
+  try {
+    writeFileSync(join(r, 'composer.json'), '{"name":"a/root","require":{"php":"^8.3"}}');
+    for (let i = 0; i < 6; i++) {
+      mkdirSync(join(r, `src/C${i}`), { recursive: true });
+      writeFileSync(join(r, `src/C${i}/composer.json`), '{"name":"a/c' + i + '","require":{"php":"^8.3"}}');
+    }
+    const p = runJson(process.execPath, [S('plan.mjs'), r, '--json', '--target', '8.5.12']).data;
+    ok(p, 'plan produced JSON');
+    ok(p.collapsedFromPerPackage, 'identical plans must be merged');
+    ok(p.plans.length < 7, `${p.plans.length} plans for 7 identical packages`);
+    const merged = p.plans.find(x => x.packageCount > 1);
+    ok(merged, 'a merged plan must exist');
+    ok(merged.appliesTo.length >= 6, 'and must list every package it covers');
+    ok(/not one per package/.test(merged.collapsedNote));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('plan: packages that differ are NOT merged', () => {
+  // a different current version is a different decision
+  const r = mkdtempSync(join(tmpdir(), 'ru-mono2-'));
+  try {
+    writeFileSync(join(r, 'composer.json'), '{"name":"a/root","require":{"php":"^8.3"}}');
+    for (const [d, v] of [['A', '^8.1'], ['B', '^8.2'], ['C', '^8.3'], ['D', '^8.3']]) {
+      mkdirSync(join(r, `src/${d}`), { recursive: true });
+      writeFileSync(join(r, `src/${d}/composer.json`), `{"name":"a/${d}","require":{"php":"${v}"}}`);
+    }
+    const p = runJson(process.execPath, [S('plan.mjs'), r, '--json', '--target', '8.5.12']).data;
+    const currents = new Set(p.plans.map(x => x.current));
+    ok(currents.size >= 3, `distinct current versions must stay distinct: ${[...currents].join(', ')}`);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('plan: the estimate is not multiplied by package count', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-mono3-'));
+  try {
+    writeFileSync(join(r, 'composer.json'), '{"name":"a/root","require":{"php":"^8.3"}}');
+    for (let i = 0; i < 20; i++) {
+      mkdirSync(join(r, `src/C${i}`), { recursive: true });
+      writeFileSync(join(r, `src/C${i}/composer.json`), '{"name":"a/c' + i + '","require":{"php":"^8.3"}}');
+    }
+    const p = runJson(process.execPath, [S('plan.mjs'), r, '--json', '--target', '8.5.12']).data;
+    ok(p.totalEstimatePoints < 60,
+       `21 identical packages should not cost ${p.totalEstimatePoints} points — the compat work is shared`);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('plan: a collapsed plan is computed before the object that uses it', () => {
+  // a const referenced above its declaration is a TDZ ReferenceError, and this
+  // file has produced that bug four times
+  const src = readFileSync(S('plan.mjs'), 'utf8');
+  const decl = src.indexOf('const collapsed = collapseMonorepo');
+  const use = src.indexOf('...collapsed,');
+  ok(decl > -1 && use > -1 && decl < use, 'declaration must precede use');
+});
+
+// ───────────── targets that are not upgrade work ─────────────
+console.log('\nwhat counts as a target');
+t('detect: a bun image does not mint a node target', () => {
+  // `bun:1` produced a Node target declaring version "1", which plan then
+  // reported as "node 1 -> 26.12.1, blocked" beside the correct bun row
+  const r = mkdtempSync(join(tmpdir(), 'ru-bun-'));
+  try {
+    writeFileSync(join(r, 'Dockerfile'), 'FROM oven/bun:1\nFROM bun:1\n');
+    const d = runJson(process.execPath, [S('detect.mjs'), r, '--json']).data;
+    const nodeTargets = (d.targets || []).filter(t => t.lang === 'node');
+    eq(nodeTargets.length, 0, `bun images must not become node targets: ${JSON.stringify(nodeTargets.map(t => t.declaredMajors))}`);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('detect: a platform publish stub is reported, never planned', () => {
+  // next.js ships 8 `@next/swc-<platform>` stubs — one prebuilt binary each,
+  // no dependencies. Each got a 10-point plan and one became the PILOT.
+  const r = mkdtempSync(join(tmpdir(), 'ru-stub-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"root","dependencies":{"x":"1"},"engines":{"node":">=20"}}');
+    mkdirSync(join(r, 'npm/linux-x64'), { recursive: true });
+    writeFileSync(join(r, 'npm/linux-x64/package.json'), JSON.stringify({
+      name: '@me/swc-linux-x64', os: ['linux'], cpu: ['x64'],
+      main: 'swc.linux-x64.node', engines: { node: '>= 10' } }));
+    const d = runJson(process.execPath, [S('detect.mjs'), r, '--json']).data;
+    eq((d.platformPublishStubs || []).length, 1, 'the stub must still be REPORTED');
+    ok(/prebuilt binary/.test(d.platformPublishStubs[0].why));
+    const p = runJson(process.execPath, [S('plan.mjs'), r, '--json']).data;
+    eq((p.plans || []).filter(x => x.dir.includes('npm/linux-x64')).length, 0,
+       'but never carry story points');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('detect: an examples Dockerfile is not a deployable', () => {
+  // the container-only loop walked every Dockerfile with no NOISE filter, so
+  // plan chose `examples/with-docker` as the pilot
+  const r = mkdtempSync(join(tmpdir(), 'ru-exd-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"root","dependencies":{"x":"1"},"engines":{"node":">=20"}}');
+    mkdirSync(join(r, 'examples/with-docker'), { recursive: true });
+    writeFileSync(join(r, 'examples/with-docker/Dockerfile'), 'FROM node:18\n');
+    const d = runJson(process.execPath, [S('detect.mjs'), r, '--json']).data;
+    ok(!(d.targets || []).some(t => t.dir.startsWith('examples/')),
+       'an example must not be a target');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+console.log('\ncgo lives in .go files');
+t('cgo: a real import "C" is found; prose about C is not', () => {
+  for (const [name, files, want] of [
+    ['real cgo', { 'go.mod': 'module r\n\ngo 1.22\n',
+                   'main.go': 'package main\n\n/*\n#include <zlib.h>\n*/\nimport "C"\n\nfunc main() {}\n' }, true],
+    ['prose only', { 'go.mod': 'module p\n\ngo 1.22\n// the C zlib library\n',
+                     'main.go': 'package main\n// we could import "C" here\nimport "fmt"\nfunc main(){fmt.Println()}\n' }, false],
+  ]) {
+    const r = mkdtempSync(join(tmpdir(), 'ru-cgo-'));
+    try {
+      for (const [f, b] of Object.entries(files)) writeFileSync(join(r, f), b);
+      eq(usesCgo(r, { walk, readText, join }).cgo, want, name);
+    } finally { rmSync(r, { recursive: true, force: true }); }
+  }
+});
+
+console.log('\nJava properties stay coherent');
+t('java: all four compiler properties move together, as majors', () => {
+  // only release and java.version moved, leaving source/target behind — and
+  // `<maven.compiler.release>21.0.9` is not a value javac accepts
+  const pom = PIN_RULES.java('21.0.9').find(r => r.rule === 'maven.compiler.release');
+  const out = pom.edit('<properties>\n<java.version>17</java.version>\n'
+    + '<maven.compiler.release>17</maven.compiler.release>\n'
+    + '<maven.compiler.source>17</maven.compiler.source>\n'
+    + '<maven.compiler.target>17</maven.compiler.target>\n</properties>');
+  eq((out.match(/>21</g) || []).length, 4, out);
+  ok(!/21\.0\.9/.test(out), 'these properties take a release number, not a full version');
+});
+t('java: jvmToolchain and JavaLanguageVersion take an Int', () => {
+  const rs = PIN_RULES.java('21.0.9');
+  eq(rs.find(r => r.rule === 'jvmToolchain').edit('jvmToolchain(17)'), 'jvmToolchain(21)');
+  const g = rs.find(r => /JavaLanguageVersion/.test(String(r.edit)));
+  if (g) ok(/JavaLanguageVersion\.of\(21\)/.test(g.edit('JavaLanguageVersion.of(17)')));
+});
+
+console.log('\na failed audit is not a clean audit');
+t('verify: a crashed auditor is never reported as "no lockfile"', () => {
+  const src = readFileSync(S('verify.mjs'), 'utf8');
+  ok(/This is NOT a clean result/.test(src), 'the three outcomes must be distinguished');
+  ok(/yarnAuditArgs/.test(src), 'yarn v1 and Berry take different commands');
+});
+t('verify: an audit gate with no lockfile says exactly that', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-nolock-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=20"}}');
+    const v = runJson(process.execPath, [S('verify.mjs'), 'node', r, '26.12.1']).data;
+    const g = (v.gates || []).find(x => x.name === 'dependency advisories');
+    ok(/no lockfile — there is nothing to audit/.test(g.detail), g.detail);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+console.log('\nan import specifier is not any old string');
+t('depverify: a string containing an import is not a call site', () => {
+  // a decoy holding `"require(\'uid\')"` was ranked the TOP call site for a
+  // package it never imports, and the probe instructions pointed at it
+  const r = mkdtempSync(join(tmpdir(), 'ru-decoy-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"d","dependencies":{"uid":"1.0.0"}}');
+    writeFileSync(join(r, 'lock.before'), '{"packages":{"node_modules/uid":{"version":"1.0.0"}}}');
+    writeFileSync(join(r, 'package-lock.json'), '{"packages":{"node_modules/uid":{"version":"2.0.0"}}}');
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src/decoy.ts'),
+      '// we might require(\'uid\') later\nconst s = "require(\'uid\')";\nconst t = `from \'uid\'`;\nexport const d = s + t;\n');
+    writeFileSync(join(r, 'src/real.ts'), "import uid from 'uid';\nexport const id = () => uid(8);\n");
+    const v = runJson(process.execPath, [S('depverify.mjs'), 'node', r, '--before', join(r, 'lock.before')]).data;
+    const p = v.probePlan[0];
+    eq(p.filesTouching, 1, `counted the decoy: ${JSON.stringify(p.where)}`);
+    eq(p.where[0].file, 'src/real.ts');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────── a cap reached is not a result ─────────────
+console.log('\ndiscovery honesty');
+t('walk: reports when it stopped early', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-walk-'));
+  try {
+    for (let i = 0; i < 30; i++) writeFileSync(join(r, `f${i}.txt`), 'x');
+    const h = walk(r, { match: n => n.endsWith('.txt'), limit: 10 });
+    eq(h.truncated, true, 'hitting the cap must be reported');
+    ok(walkGaps(h).hitFileCap, 'and surfaced as a gap');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('walk: a complete walk reports no gaps at all', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-walk2-'));
+  try {
+    writeFileSync(join(r, 'a.txt'), 'x');
+    const h = walk(r, { match: n => n.endsWith('.txt') });
+    eq(h.truncated, false);
+    eq(walkGaps(h), null, 'silence must mean "complete", not "did not check"');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('walk: directories below the depth limit are named', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-walk3-'));
+  try {
+    mkdirSync(join(r, 'a/b/c/d'), { recursive: true });
+    writeFileSync(join(r, 'a/b/c/d/deep.txt'), 'x');
+    const h = walk(r, { match: n => n.endsWith('.txt'), maxDepth: 2 });
+    eq(h.length, 0, 'the deep file is genuinely missed');
+    ok(walkGaps(h).belowDepthLimit, 'so the gap must be stated');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('walk: only AMBIGUOUS skips are reported, never .git', () => {
+  // listing .git and node_modules buries the one that matters: grafana keeps a
+  // real Go module at pkg/build/wire, and `build` is in the skip set
+  const r = mkdtempSync(join(tmpdir(), 'ru-walk4-'));
+  try {
+    for (const d of ['.git', 'node_modules', 'build']) mkdirSync(join(r, d), { recursive: true });
+    writeFileSync(join(r, 'x.txt'), 'y');
+    const g = walkGaps(walk(r, { match: n => n.endsWith('.txt') }));
+    const ex = g?.skippedByName?.examples || [];
+    ok(ex.includes('build'), `build must be reported: ${JSON.stringify(ex)}`);
+    ok(!ex.some(x => /\.git|node_modules/.test(x)), `noise reported: ${JSON.stringify(ex)}`);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('scan: the file-walk cap is distinct from the findings cap', () => {
+  const src = readFileSync(S('scan.mjs'), 'utf8');
+  ok(/coverageGaps/.test(src), 'scan must report what it never opened');
+  ok(/a finding count is a floor, not a total/.test(src));
+});
+
+console.log('\nSDKMAN identifiers keep their distribution');
+t('sdkman: the distro suffix survives, and so does the precision', () => {
+  // `java=25.0.4-librca` -> `java=21` left an identifier SDKMAN cannot resolve
+  // and silently discarded the Liberica choice
+  const r = PIN_RULES.java('21.0.9').find(x => x.file === '.sdkmanrc');
+  eq(r.edit('java=25.0.4-librca\n').trim(), 'java=21.0.9-librca');
+  eq(r.edit('java=17.0.2-tem\n').trim(), 'java=21.0.9-tem');
+  eq(r.edit('java=17\n').trim(), 'java=21', 'a bare major stays a bare major');
+  eq(r.edit('java=17-open\n').trim(), 'java=21-open');
+});
+
+console.log('\npins are never invented over a declaration');
+t('addpin: a workspace-inherited MSRV is a declaration', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-ws-'));
+  try {
+    writeFileSync(join(r, 'Cargo.toml'), '[package]\nname="a"\nrust-version.workspace = true\n');
+    const hidden = declaredButUnreadable('rust', r);
+    ok(hidden.length, 'the inherited MSRV must be seen as declared');
+    ok(/workspace\.package/.test(hidden[0].how), hidden[0].how);
+    const p = planAddPin('rust', r, '1.99.1');
+    ok(p?.blocked, 'and no pin may be created beside it');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('addpin: a computed gemspec constraint is a declaration', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-gsc-'));
+  try {
+    writeFileSync(join(r, 'x.gemspec'), 's.required_ruby_version = Gem::Requirement.new(">= #{MIN}")\n');
+    ok(declaredButUnreadable('ruby', r).length, 'a computed constraint still declares a minimum');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('addpin: a rustup override is never created in a subdirectory', () => {
+  // a rust-toolchain.toml in tokio/fuzz changes the toolchain for every
+  // contributor who builds from there
+  const r = mkdtempSync(join(tmpdir(), 'ru-sub-'));
+  try {
+    writeFileSync(join(r, 'Cargo.toml'), '[package]\nname="a"\nversion="0.1.0"\n');
+    const sub = planAddPin('rust', r, '1.99.1', { isRoot: false });
+    ok(sub?.blocked, 'must refuse below the root');
+    ok(/override the toolchain|toolchain OVERRIDE/i.test(sub.why), sub.why);
+    const root = planAddPin('rust', r, '1.99.1', { isRoot: true });
+    ok(root && !root.blocked && root.created, 'but a genuine root still gets one');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────── floors carry more than a lower bound ─────────────
+console.log('\nconstraint preservation');
+t('floors: only the lower bound moves; caps and exclusions survive', () => {
+  // `>=3.9,<4.0` became `>=3.15`, dropping a chosen cap;
+  // `>=3.8,!=3.9.*,<3.14` became `>=3.15`, REVERSING the declared intent
+  eq(raiseLowerBound('>=3.9,<4.0', '3.15'), '>=3.15,<4.0');
+  eq(raiseLowerBound('>=3.9, <4', '3.15'), '>=3.15,<4');
+  eq(raiseLowerBound('>=3.10', '3.15'), '>=3.15');
+  eq(raiseLowerBound('>3.8', '3.15'), '>=3.15');
+});
+t('floors: a cap below the new floor means refuse, not flatten', () => {
+  // raising the floor past the cap makes the constraint unsatisfiable
+  eq(raiseLowerBound('>=3.8,!=3.9.*,<3.14', '3.15'), '>=3.8,!=3.9.*,<3.14');
+});
+t('floors: a compatible-release constraint is not a floor', () => {
+  eq(raiseLowerBound('~=3.9', '3.15'), '~=3.9');
+});
+t('floors: every gemspec in the tree is edited, not the first one', () => {
+  // rails ships 13 gemspecs; one was edited and twelve left declaring a
+  // different minimum — gems published with contradictory support contracts
+  const r = mkdtempSync(join(tmpdir(), 'ru-gs-'));
+  try {
+    writeFileSync(join(r, 'Gemfile'), "ruby '3.3.5'\n");
+    for (const g of ['rails.gemspec', 'activesupport/activesupport.gemspec',
+                     'actionpack/actionpack.gemspec', 'tools/releaser/releaser.gemspec']) {
+      mkdirSync(join(r, g.slice(0, g.lastIndexOf('/')) || '.'), { recursive: true });
+      writeFileSync(join(r, g), 's.required_ruby_version = ">= 3.3.5"\n');
+    }
+    const e = planPinEdits('ruby', r, '4.0.9', { raiseFloor: true })
+      .edits.filter(x => x.rule === 'gemspec required_ruby_version');
+    eq(e.length, 4, `expected all 4 gemspecs, got ${e.map(x => x.file).join(', ')}`);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('floors: the declined preview is the line that would really change', () => {
+  // the old preview grepped for the target's major digit and surfaced
+  // `requires = ["setuptools>=83"]` and `# - Create "v1.x.y" git tag.`
+  const r = mkdtempSync(join(tmpdir(), 'ru-pv-'));
+  try {
+    writeFileSync(join(r, 'pyproject.toml'),
+      '[build-system]\nrequires = ["setuptools>=83"]\n\n[project]\nrequires-python = ">= 3.12"\n');
+    const d = planPinEdits('python', r, '3.15.2').declinedFloors[0];
+    ok(/requires-python/.test(d.would), `showed an unrelated line: ${d.would}`);
+    ok(!/setuptools/.test(d.would), d.would);
+    ok(/->/.test(d.would), 'and must show both sides');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+console.log('\ntox basepython names an executable');
+t('tox: basepython gets major.minor — the binary that exists', () => {
+  // `basepython = python3.15.2` is no executable on any system; every tox env died
+  const tox = PIN_RULES.python('3.15.2').find(r => r.file === 'tox.ini');
+  const out = tox.edit('[testenv:py314]\nbasepython = python3.14\n');
+  ok(/basepython = python3\.15$/m.test(out), out.trim());
+});
+t('tox: a bare python3 is deliberate and is left alone', () => {
+  const tox = PIN_RULES.python('3.15.2').find(r => r.file === 'tox.ini');
+  const before = '[testenv:black]\nbasepython = python3\n';
+  eq(tox.edit(before), before);
+});
+t('tox: the free-threaded suffix is preserved', () => {
+  const tox = PIN_RULES.python('3.15.2').find(r => r.file === 'tox.ini');
+  ok(/python3\.15t$/m.test(tox.edit('basepython = python3.14t\n')));
+});
+
+console.log('\n.NET Framework is a port, not a version');
+t('dotnet: net472 reads as 4.7, never 472', () => {
+  const norm = byId.dotnet.normalizeVersion;
+  ok(norm, 'the adapter must export its normaliser so nobody reimplements it');
+  eq(norm('net472'), '4.7');
+  eq(norm('net46'), '4.6');
+  eq(norm('net8.0'), '8');
+  eq(norm('net10.0'), '10');
+  eq(norm('netstandard2.0'), '', 'netstandard is not a runtime version');
+});
+t('dotnet: plan uses the adapter normaliser, not its own', () => {
+  const src = readFileSync(S('plan.mjs'), 'utf8');
+  ok(/adapter\?\.normalizeVersion/.test(src),
+     'plan reimplemented this and read net472 as version 472 across 119 roslyn plans');
+});
+
+// ───────────── verify judges pins and floors differently ─────────────
+console.log('\nverify: pins vs floors');
+function vRepo(files) {
+  const r = mkdtempSync(join(tmpdir(), 'ru-v-'));
+  for (const [f, body] of Object.entries(files)) {
+    const full = join(r, f);
+    mkdirSync(full.slice(0, full.lastIndexOf('/')), { recursive: true });
+    writeFileSync(full, body);
+  }
+  return r;
+}
+const verifyOf = (lang, dir, target) => runJson(process.execPath, [S('verify.mjs'), lang, dir, target]).data;
+const gate = (v, name) => (v.gates || []).find(g => g.name.includes(name));
+
+t('verify: a library whose floor was correctly NOT raised still passes', () => {
+  // the catch-22: the gate demanded a declared version equal to the target,
+  // while remediate correctly refuses to raise a consumer-facing floor. Every
+  // library — symfony, rails, django, nest — was permanently "blocked".
+  const r = vRepo({ 'package.json': '{"name":"lib","engines":{"node":">= 20"},"dependencies":{}}' });
+  try {
+    const v = verifyOf('node', r, '26.12.1');
+    const g = gate(v, 'declared version matches target');
+    eq(g.status, 'pass', g.detail);
+    ok(/semver-breaking/.test(g.detail), 'and must say why leaving it is correct');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('verify: a stale PIN still fails', () => {
+  const r = vRepo({ 'package.json': '{"name":"app","dependencies":{}}', '.nvmrc': '20.11.1\n' });
+  try {
+    const g = gate(verifyOf('node', r, '26.12.1'), 'declared version matches target');
+    eq(g.status, 'fail', JSON.stringify(g));
+    ok(/PINS still name the old runtime/.test(g.detail), g.detail);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('verify: a stale pin is caught at the TARGET\'s precision, per language', () => {
+  // `majorOf` truncated to the first dotted component, so .php-version 8.1
+  // against target 8.4 compared "8" to "8" and a stale pin reported as clean
+  const cases = [
+    ['php', { 'composer.json': '{"name":"x","require":{"php":"^8.1"}}', '.php-version': '8.1\n' }, '8.4', 'fail'],
+    ['php', { 'composer.json': '{"name":"x","require":{"php":"^8.4"}}', '.php-version': '8.4\n' }, '8.4', 'pass'],
+    ['python', { 'pyproject.toml': '[project]\nname="x"\nrequires-python=">=3.11"\n', '.python-version': '3.11\n' }, '3.13', 'fail'],
+    ['node', { 'package.json': '{"name":"x","dependencies":{}}', '.nvmrc': '20.11.1\n' }, '26.12.1', 'fail'],
+    ['node', { 'package.json': '{"name":"x","dependencies":{}}', '.nvmrc': '26.1.0\n' }, '26.12.1', 'pass'],
+  ];
+  for (const [lang, files, target, want] of cases) {
+    const r = mkdtempSync(join(tmpdir(), 'ru-prec-'));
+    try {
+      for (const [f, b] of Object.entries(files)) writeFileSync(join(r, f), b);
+      const g = gate(verifyOf(lang, r, target), 'declared version matches target');
+      eq(g.status, want, `${lang} pin ${JSON.stringify(Object.values(files)[1])} vs ${target}: ${g.detail}`);
+    } finally { rmSync(r, { recursive: true, force: true }); }
+  }
+});
+t('verify: a floor ABOVE the target is a real failure', () => {
+  const r = vRepo({ 'package.json': '{"name":"lib","engines":{"node":">= 28"},"dependencies":{}}' });
+  try {
+    const g = gate(verifyOf('node', r, '26.12.1'), 'declared version matches target');
+    eq(g.status, 'fail', JSON.stringify(g));
+    ok(/requires more than you are shipping/.test(g.detail), g.detail);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('verify: floors in different packages are not "drift"', () => {
+  // flattening declaredMajors across every nested package made drift
+  // unavoidable on any monorepo, contradicting detect's own driftCount: 0
+  const r = vRepo({
+    'package.json': '{"name":"root","engines":{"node":">= 20"},"workspaces":["a","b"]}',
+    'a/package.json': '{"name":"a","engines":{"node":">= 18"},"dependencies":{"x":"1"}}',
+    'b/package.json': '{"name":"b","engines":{"node":">= 22"},"dependencies":{"y":"1"}}' });
+  try {
+    const g = gate(verifyOf('node', r, '26.12.1'), 'drift');
+    eq(g.status, 'pass', g.detail);
+    ok(/cannot drift/.test(g.detail), g.detail);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('verify: two PINS that disagree are drift', () => {
+  const r = vRepo({ 'package.json': '{"name":"app","dependencies":{}}',
+                    '.nvmrc': '20.11.1\n', '.node-version': '22.1.0\n' });
+  try {
+    const g = gate(verifyOf('node', r, '26.12.1'), 'drift');
+    eq(g.status, 'fail', JSON.stringify(g));
+    ok(/pin two different versions/.test(g.detail), g.detail);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────── research tells the truth about versions ─────────────
+console.log('\nresearch: real versions only');
+t('research: a version that does not exist is refused', async () => {
+  // `research php 8.9` reported supportedLongerThanCurrent: true for a release
+  // that has never existed, and that flowed into a written pin
+  for (const [lang, cur, bogus] of [['php', '8.3', '8.9'], ['python', '3.12', '9.9']]) {
+    const r = run(process.execPath, [S('research.mjs'), lang, cur, bogus]);
+    ok(r.status !== 0, `${lang} ${bogus} must be refused`);
+    ok(/is not a release endoflife\.date knows about/.test(r.stderr), r.stderr.slice(0, 120));
+    ok(/Known cycles:/.test(r.stderr), 'and must list what IS real');
+  }
+}, { net: true });
+t('research: an unrecognised CURRENT version is never reported as healthy', async () => {
+  const v = runJson(process.execPath, [S('research.mjs'), 'dotnet', '472']);
+  ok(v.data?.currentUnrecognised, 'net472 is not a dotnet cycle');
+  ok(/UNKNOWN, not "fine"/.test(v.data.currentUnrecognised.meaning));
+}, { net: true });
+t('research: LTS beats newest wherever the product has LTS', async () => {
+  // java auto-targeted non-LTS 27 (EOL 2027-04) over 25 LTS (EOL 2032-10),
+  // shortening the support window by five years and calling it an upgrade
+  const v = runJson(process.execPath, [S('research.mjs'), 'java', '17']);
+  ok(v.data, 'research ran');
+  eq(v.data.target.lts, true, `picked ${v.data.target.version}, which is not LTS`);
+}, { net: true });
+
+// ───────────── CI edits ─────────────
+console.log('\nCI rewriting');
+function ciRepo(files) {
+  const r = mkdtempSync(join(tmpdir(), 'ru-ci-'));
+  for (const [f, body] of Object.entries(files)) {
+    const full = join(r, f);
+    mkdirSync(full.slice(0, full.lastIndexOf('/')), { recursive: true });
+    writeFileSync(full, body);
+  }
+  return r;
+}
+const wf = (name, body) => [`.github/workflows/${name}`, body];
+t('ci: the lowest-supported job is never collapsed, even in another file', () => {
+  // symfony keeps its 8.1 and 8.2 jobs in separate workflow files, so a
+  // per-file check saw each as single-valued and rewrote every one of them
+  const r = ciRepo(Object.fromEntries([
+    wf('current.yml', 'jobs:\n  a:\n    steps:\n      - with:\n          php-version: "8.4"\n'),
+    wf('lowest.yml',  'jobs:\n  b:\n    steps:\n      - with:\n          php-version: "8.1"\n'),
+  ]));
+  try {
+    const e = planCiEdits('php', r, '8.5.12');
+    eq(e.length, 1, 'only the newest job moves');
+    ok(e[0].file.endsWith('current.yml'), e[0].file);
+    eq(e.skipped.length, 1);
+    ok(/lowest-supported/.test(e.skipped[0].reason));
+    ok(/deletes the only proof/.test(e.skipped[0].advice));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('ci: each setup-* action gets the precision it actually accepts', () => {
+  // setup-php publishes only major.minor builds — "8.5.12" fails to provision.
+  // setup-node takes full semver, where pinning the patch is the better answer.
+  const cases = [['php', '8.4', '8.5.12', '8.5'], ['node', '20.11.1', '24.22.1', '24.22.1']];
+  for (const [lang, from, target, want] of cases) {
+    const r = ciRepo(Object.fromEntries([wf('a.yml',
+      `jobs:\n  a:\n    steps:\n      - with:\n          ${lang}-version: "${from}"\n`)]));
+    try {
+      const e = planCiEdits(lang, r, target);
+      ok(e.length === 1 && new RegExp(`${lang}-version: "${want.replace(/\./g, '\\.')}"`).test(e[0].after),
+         `${lang}: wanted ${want}, got ${e[0]?.after}`);
+    } finally { rmSync(r, { recursive: true, force: true }); }
+  }
+});
+t('ci: an image whose NAME merely contains the runtime is left alone', () => {
+  // dunglas/frankenphp:1.12.1-php8.4 had FrankenPHP's own version replaced
+  const body = 'jobs:\n  a:\n    container:\n      image: dunglas/frankenphp:1.12.1-php8.4\n';
+  const r = ciRepo(Object.fromEntries([wf('a.yml', body)]));
+  try { eq(planCiEdits('php', r, '8.5.12').length, 0); }
+  finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('ci: a templated tag is never written into', () => {
+  // produced `cimg/node:26.12.1<< pipeline.parameters.node-version >>`
+  for (const tag of ['<< pipeline.parameters.node-version >>', '${{ matrix.node }}', '${NODE_VERSION}']) {
+    const r = ciRepo({ '.circleci/config.yml': `jobs:\n  a:\n    docker:\n      - image: cimg/node:${tag}\n` });
+    try { eq(planCiEdits('node', r, '26.12.1').length, 0, tag); }
+    finally { rmSync(r, { recursive: true, force: true }); }
+  }
+});
+t('ci: a genuine image tag still moves', () => {
+  const r = ciRepo(Object.fromEntries([wf('a.yml', 'jobs:\n  a:\n    container:\n      image: node:20-alpine3.19\n')]));
+  try {
+    const e = planCiEdits('node', r, '24.1.0');
+    eq(e.length, 1);
+    ok(/node:24\.1\.0-alpine/.test(e[0].after), e[0].after);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────── a bulk dependency upgrade can wreck a repo ─────────────
+console.log('\ndependency upgrade safety');
+function depRepo(files) { return ciRepo(files); }
+t('deps: a vendored Go module refuses a bulk upgrade', () => {
+  // `go get -u ./...` updated go.mod but not vendor/, and kubernetes could no
+  // longer build a single package — while remediate reported deps.ok: true
+  const r = depRepo({ 'go.mod': 'module k\n\ngo 1.22\n', 'vendor/modules.txt': '# x\n' });
+  try {
+    const v = runJson(process.execPath, [S('remediate.mjs'), 'go', r, '1.24.0', '--deps', 'minor']);
+    ok(v.data.dependencies.refused, 'must refuse');
+    ok(v.data.dependencies.blockers.some(b => /vendors its dependencies/.test(b.why)));
+    eq(v.data.dependencies.command, undefined, 'and must not even name a command to run');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('deps: replace-pinned modules are seen in both spellings', () => {
+  const block = 'module k\n\ngo 1.22\n\nreplace (\n\tk8s.io/api => ./staging/src/k8s.io/api\n)\n';
+  const bare  = 'module k\n\ngo 1.22\n\nreplace k8s.io/api => ./staging/src/k8s.io/api\n';
+  for (const [name, gomod] of Object.entries({ block, bare })) {
+    const r = depRepo({ 'go.mod': gomod });
+    try {
+      const v = runJson(process.execPath, [S('remediate.mjs'), 'go', r, '1.24.0', '--deps', 'minor']);
+      ok(v.data.dependencies.blockers?.some(b => /replace-pinned/.test(b.why)), `${name} form not detected`);
+    } finally { rmSync(r, { recursive: true, force: true }); }
+  }
+});
+t('deps: a go.work workspace blocks a floor raise', () => {
+  const r = depRepo({ 'go.mod': 'module k\n\ngo 1.22\n', 'go.work': 'go 1.21\n\nuse .\n' });
+  try {
+    const v = runJson(process.execPath, [S('remediate.mjs'), 'go', r, '1.24.0', '--deps', 'minor']);
+    ok(v.data.dependencies.blockers.some(b => /go\.work/.test(b.why)));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('deps: Yarn Berry is not driven with Yarn 1 commands', () => {
+  const r = depRepo({ 'package.json': '{"name":"x","packageManager":"yarn@4.18.1"}' });
+  try {
+    const v = runJson(process.execPath, [S('remediate.mjs'), 'node', r, '24.1.0', '--deps', 'minor']);
+    ok(v.data.dependencies.blockers?.some(b => /yarn@4/.test(b.why)), JSON.stringify(v.data.dependencies));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('deps: an ordinary repo is not blocked', () => {
+  const r = depRepo({ 'go.mod': 'module k\n\ngo 1.22\n' });
+  try {
+    const v = runJson(process.execPath, [S('remediate.mjs'), 'go', r, '1.24.0', '--deps', 'minor']);
+    ok(!v.data.dependencies.refused, JSON.stringify(v.data.dependencies.blockers));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('deps: --force-deps is the documented opt-out', () => {
+  const src = readFileSync(S('remediate.mjs'), 'utf8');
+  ok(/--force-deps/.test(src));
+  ok(/only if you have read each one/.test(src), 'and it must say what forcing means');
+});
+
+// ───────────── gate capability is a promise ─────────────
+console.log('\ngate capability');
+t('every gateCapable adapter actually implements a CVE lookup', () => {
+  // go exported runtimeCves(); verify only looked for matchRuntimeCve(), so the
+  // Go gate silently SKIPPED on every run while printing its own description.
+  // A skipped gate reads as a pass.
+  for (const a of adapters) {
+    if (!a.gateCapable) continue;
+    ok(a.matchRuntimeCve || a.runtimeCves,
+       `${a.id} declares gateCapable but exports neither matchRuntimeCve nor runtimeCves`);
+    ok(a.cveSource?.url, `${a.id} is gate-capable but names no CVE source`);
+  }
+});
+t('verify consults both CVE lookup shapes', () => {
+  const src = readFileSync(S('verify.mjs'), 'utf8');
+  ok(/A\.matchRuntimeCve \|\| A\.runtimeCves/.test(src), 'verify must accept either interface');
+});
+t('a gate-capable adapter with no lookup is called a bug, not a pass', () => {
+  const src = readFileSync(S('verify.mjs'), 'utf8');
+  ok(/this is a bug, not a clean bill of health/.test(src));
+});
+t('an adapter that cannot rank severity gates on total', () => {
+  // Go's vuln DB assigns no severity; counting high/critical there is always 0
+  const go = byId.go;
+  eq(go.gateMetric, 'total', 'go must gate on total, not on high/critical');
+  const src = readFileSync(S('verify.mjs'), 'utf8');
+  ok(/A\.gateMetric === 'total'/.test(src), 'verify must honour gateMetric');
+});
+
+// ───────────── diffs git will actually apply ─────────────
+// Under MODE=plan the diff IS the deliverable. These shapes all produced
+// patches git refused: one-line pin files, edits closer than 2x context, and
+// newly created files.
+console.log('\nunified diffs');
+function gitApplies(before, after, name = 'f') {
+  const r = mkdtempSync(join(tmpdir(), 'ru-diff-'));
+  try {
+    const g = (...a) => run('git', ['-C', r, ...a]);
+    g('init', '-q', '.'); g('config', 'user.email', 't@t'); g('config', 'user.name', 't');
+    if (before !== '') writeFileSync(join(r, name), before);
+    g('add', '-A'); g('commit', '-q', '-m', 'x', '--allow-empty');
+    const d = unified(name, before, after);
+    writeFileSync(join(r, 'p.diff'), d);
+    const chk = g('apply', '--check', 'p.diff');
+    return { ok: chk.status === 0, err: (chk.stderr || '').trim(), diff: d };
+  } finally { rmSync(r, { recursive: true, force: true }); }
+}
+const DIFF_CASES = {
+  'a one-line pin file': ['3.14.9\n', '3.15.2\n'],
+  'a file with no trailing newline': ['3.14.9', '3.15.2'],
+  'a file that gains a trailing newline': ['3.14.9', '3.15.2\n'],
+  'two edits closer than 2x context': ['a\nb\nX\nd\ne\nf\nX\nh\n', 'a\nb\nY\nd\ne\nf\nY\nh\n'],
+  'three near edits (tox.ini shape)': ['p1\nq\np2\nq\np3\nq\n', 'P1\nq\nP2\nq\nP3\nq\n'],
+  'two edits far apart': [
+    Array.from({ length: 30 }, (_, i) => 'line' + i).join('\n') + '\n',
+    Array.from({ length: 30 }, (_, i) => i === 2 ? 'Y' : i === 25 ? 'Z' : 'line' + i).join('\n') + '\n'],
+  'the first line': ['a\nb\nc\n', 'Z\nb\nc\n'],
+  'the last line': ['a\nb\nc\n', 'a\nb\nZ\n'],
+  'a block that grows': ['a\nb\nc\n', 'a\nx\ny\nz\nc\n'],
+  'a newly created file': ['', '3.15.2\n'],
+};
+for (const [name, [b, a]] of Object.entries(DIFF_CASES))
+  t(`diff: git apply accepts ${name}`, () => {
+    const r = gitApplies(b, a);
+    ok(r.ok, `${r.err}\n${r.diff.replace(/^/gm, '      ')}`);
+  });
+t('diff: a created file is diffed against /dev/null', () => {
+  const d = unified('new.txt', '', 'x\n');
+  ok(d.startsWith('--- /dev/null\n'), d.split('\n')[0]);
+  ok(/^@@ -0,0 \+1,1 @@$/m.test(d), d);
+});
+t('diff: no change produces no diff', () => eq(unified('f', 'a\n', 'a\n'), ''));
+t('diff: a missing trailing newline is marked', () => {
+  ok(/\\ No newline at end of file/.test(unified('f', 'a', 'b')));
+});
+t('diff: hunks never overlap', () => {
+  const d = unified('f', 'a\nb\nX\nd\ne\nf\nX\nh\n', 'a\nb\nY\nd\ne\nf\nY\nh\n');
+  const heads = [...d.matchAll(/^@@ -(\d+),(\d+)/gm)].map(m => [+m[1], +m[2]]);
+  for (let i = 1; i < heads.length; i++)
+    ok(heads[i][0] > heads[i - 1][0] + heads[i - 1][1] - 1,
+       `hunk ${i} starts at ${heads[i][0]} but the previous ends at ${heads[i - 1][0] + heads[i - 1][1] - 1}`);
+});
+
+// ───────────── probe runner ─────────────
+console.log('\nprobe runner');
+t('probe: refuses an incomplete invocation', () => {
+  const r = run(process.execPath, [S('probe.mjs'), 'node', 'ms', '2.0.0']);
+  ok(r.status !== 0);
+  ok(/usage/.test(r.stderr), r.stderr.slice(0, 120));
+});
+t('probe: refuses a missing probe file', () => {
+  const r = run(process.execPath, [S('probe.mjs'), 'node', 'ms', '1', '2', '--probe', '/no/such']);
+  ok(r.status !== 0);
+  ok(/no such probe file/.test(r.stderr), r.stderr.slice(0, 120));
+});
+t('probe: a compiled language says why it has no runner, and does not claim safety', () => {
+  const f = join(tmpdir(), 'ru-p.txt'); writeFileSync(f, 'x');
+  try {
+    const r = run(process.execPath, [S('probe.mjs'), 'rust', 'serde', '1', '2', '--probe', f]);
+    ok(r.status !== 0);
+    ok(/no runner for "rust"/.test(r.stderr), r.stderr.slice(0, 200));
+    // the honest caveat must survive: a clean build is NOT a behaviour check
+    ok(/behaviour change passes a clean build/i.test(r.stderr), r.stderr.slice(0, 300));
+  } finally { rmSync(f, { force: true }); }
+});
+t('probe: every supported ecosystem can install, run and read back a version', () => {
+  // the three pieces each ecosystem entry must supply; a missing one silently
+  // reported "not installed" for a successful install
+  const src = readFileSync(S('probe.mjs'), 'utf8');
+  const langs = [...src.matchAll(/^  (node|python|php|ruby): \{/gm)].map(m => m[1]);
+  eq(langs.length, 4, 'four ecosystems');
+  for (const l of langs) {
+    const body = src.slice(src.indexOf(`  ${l}: {`));
+    for (const k of ['install:', 'exec:', 'installed:'])
+      ok(body.slice(0, 1400).includes(k), `${l} is missing ${k}`);
+  }
+});
+t('probe: a silent probe is inconclusive, never "identical"', () => {
+  // the dangerous failure: a probe that prints nothing matches itself exactly
+  const src = readFileSync(S('probe.mjs'), 'utf8');
+  ok(/if \(!bOut\.trim\(\)\) outcome = 'inconclusive'/.test(src),
+     'empty output must be downgraded out of "identical"');
+});
+t('probe: identical output carries the limit of what it proved', () => {
+  const src = readFileSync(S('probe.mjs'), 'utf8');
+  ok(/says nothing about calls it did not make/.test(src), 'the caveat must ship with the verdict');
+});
+t('no ESM script calls require() — it is not defined there', () => {
+  // this failed silently inside a catch{} and reported every successful pip and
+  // gem install as "not installed"
+  const bad = [];
+  const SCRIPTS = join(HERE, '..', 'scripts');
+  for (const f of walkMjs(SCRIPTS)) {
+    // strip comments AND strings with the project's own stripper — a message
+    // that merely mentions "require() time" is not a call
+    const code = stripNonCode(readFileSync(f, 'utf8'), 'node');
+    code.split('\n').forEach((ln, i) => {
+      if (/(^|[^.\w$])require\s*\(/.test(ln))
+        bad.push(`${f.slice(SCRIPTS.length + 1)}:${i + 1}: ${ln.trim().slice(0, 80)}`);
+    });
+  }
+  eq(bad.length, 0, 'require() in ESM:\n    ' + bad.join('\n    '));
+});
+
+// ───────────── repo shape ─────────────
+// shape drives the guidance the skill gives. 'single' tells the user to
+// "upgrade the ROOT pin once" — catastrophic advice for a 213-package repo.
+console.log('\nrepo shape');
+function mkRepo(files) {
+  const r = mkdtempSync(join(tmpdir(), 'ru-shape-'));
+  for (const [f, body] of Object.entries(files)) {
+    const full = join(r, f);
+    mkdirSync(full.slice(0, full.lastIndexOf('/')), { recursive: true });
+    writeFileSync(full, body);
+  }
+  return r;
+}
+const shapeOf = r => runJson(process.execPath, [S('detect.mjs'), r, '--json']).data;
+
+t('shape: a lone project is single', () => {
+  const r = mkRepo({ 'pyproject.toml': '[project]\nname="x"\nrequires-python=">=3.11"\n' });
+  try { const d = shapeOf(r); eq(d.shape, 'single'); eq(d.siblingPackages, 0); }
+  finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('shape: sibling packages make a monorepo in ANY ecosystem', () => {
+  // the defect: this was a Node-only test, so every PHP/Go/.NET/Java monorepo
+  // was reported 'single'
+  const cases = {
+    php: { 'composer.json': '{"require":{"php":"^8.2"}}',
+           'src/A/composer.json': '{"require":{"php":"^8.2"}}',
+           'src/B/composer.json': '{"require":{"php":"^8.2"}}' },
+    go: { 'go.mod': 'module m\n\ngo 1.22\n',
+          'a/go.mod': 'module m/a\n\ngo 1.22\n',
+          'b/go.mod': 'module m/b\n\ngo 1.22\n' },
+  };
+  for (const [lang, files] of Object.entries(cases)) {
+    const r = mkRepo(files);
+    try {
+      const d = shapeOf(r);
+      eq(d.shape, 'monorepo', `${lang} with 2 siblings and no workspace file`);
+      eq(d.siblingPackages, 2, lang);
+    } finally { rmSync(r, { recursive: true, force: true }); }
+  }
+});
+t('shape: one sibling is not yet a monorepo', () => {
+  const r = mkRepo({ 'composer.json': '{"require":{"php":"^8.2"}}',
+                     'src/A/composer.json': '{"require":{"php":"^8.2"}}' });
+  try { eq(shapeOf(r).shape, 'single'); }
+  finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('shape: a pure workspace root stays multi-package', () => {
+  // a root that pins nothing must not be told to "upgrade the ROOT pin once"
+  const r = mkRepo({ 'Cargo.toml': '[workspace]\nmembers = ["a", "b"]\n',
+                     'a/Cargo.toml': '[package]\nname="a"\nrust-version="1.70"\n',
+                     'b/Cargo.toml': '[package]\nname="b"\nrust-version="1.70"\n' });
+  try {
+    const d = shapeOf(r);
+    eq(d.shape, 'multi-package', 'no root package means no root pin');
+    ok(d.siblingPackages >= 2, 'siblings are still counted');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('shape: guidance exists for every shape it can emit', () => {
+  const src = readFileSync(S('detect.mjs'), 'utf8');
+  const emitted = [...src.matchAll(/shape = '([a-z-]+)'/g)].map(m => m[1]);
+  const guided = [...src.matchAll(/^\s+'?([a-z-]+)'?:\s*'[^']{20,}/gm)].map(m => m[1]);
+  for (const sh of new Set(emitted))
+    ok(guided.includes(sh), `shape '${sh}' is emitted but has no guidance`);
+});
+
+// ───────────── dependency behaviour verification ─────────────
+// A type checker catches SHAPE changes only. It cannot catch the same call
+// returning a different answer. These cover the machinery that finds where
+// that matters.
+console.log('\ndependency change detection');
+t('lockdiff: understands every supported lockfile', () => {
+  ok(LOCKFILES.length >= 10, `${LOCKFILES.length} lockfiles`);
+  for (const f of ['package-lock.json', 'composer.lock', 'Cargo.lock', 'go.sum',
+                   'Gemfile.lock', 'poetry.lock', 'mix.lock', 'pnpm-lock.yaml'])
+    ok(LOCKFILES.includes(f), f);
+});
+t('lockdiff: classifies the size of a move', () => {
+  eq(bump('1.0.0', '1.0.1').level, 'patch');
+  eq(bump('1.0.0', '1.3.0').level, 'minor');
+  eq(bump('1.0.0', '3.0.0').level, 'major');
+  eq(bump('1.0.0', '3.0.0').majorsCrossed, 2);
+  eq(bump('1.0.0', '1.0.0'), null, 'no move is not a change');
+});
+t('lockdiff: npm lockfile, added/removed/changed', () => {
+  const before = JSON.stringify({ packages: { 'node_modules/a': { version: '1.0.0' },
+                                              'node_modules/b': { version: '2.0.0' } } });
+  const after = JSON.stringify({ packages: { 'node_modules/a': { version: '3.0.0' },
+                                             'node_modules/c': { version: '1.0.0' } } });
+  const d = diffLocks('package-lock.json', before, after);
+  eq(d.counts.changed, 1); eq(d.counts.added, 1); eq(d.counts.removed, 1); eq(d.counts.major, 1);
+  eq(d.changed[0].name, 'a');
+});
+t('lockdiff: a nested transitive package is read', () => {
+  // transitive moves are where silent behaviour changes hide
+  const before = JSON.stringify({ packages: { 'node_modules/a/node_modules/deep': { version: '1.0.0' } } });
+  const after = JSON.stringify({ packages: { 'node_modules/a/node_modules/deep': { version: '2.0.0' } } });
+  eq(diffLocks('package-lock.json', before, after).changed[0].name, 'deep');
+});
+t('lockdiff: composer and cargo', () => {
+  const cb = JSON.stringify({ packages: [{ name: 'acme/x', version: 'v1.0.0' }] });
+  const ca = JSON.stringify({ packages: [{ name: 'acme/x', version: 'v2.0.0' }] });
+  eq(diffLocks('composer.lock', cb, ca).changed[0].level, 'major');
+  const rb = '[[package]]\nname = "tokio"\nversion = "1.0.0"\n';
+  const ra = '[[package]]\nname = "tokio"\nversion = "1.4.0"\n';
+  eq(diffLocks('Cargo.lock', rb, ra).changed[0].level, 'minor');
+});
+
+t('lockdiff: the same package installed at several versions at once', () => {
+  // a large repo installs duplicates constantly — nest ships semver at 2
+  // versions and glob at 4. Collapsing them to one hid 4 of 6 real moves.
+  const mk = o => JSON.stringify({ packages: Object.fromEntries(
+    Object.entries(o).map(([k, v]) => [k, { version: v }])) });
+  const before = mk({ 'node_modules/semver': '6.3.1', 'node_modules/sver/node_modules/semver': '6.3.1' });
+  const after  = mk({ 'node_modules/semver': '7.8.5', 'node_modules/sver/node_modules/semver': '6.3.1' });
+  const d = diffLocks('package-lock.json', before, after);
+  eq(d.counts.changed, 1, 'the move must be seen even though a copy stayed put');
+  eq(d.changed[0].from, '6.3.1'); eq(d.changed[0].to, '7.8.5');
+  ok(d.changed[0].copies, 'and the duplication is reported');
+  ok(/may resolve to any of them/.test(d.changed[0].note));
+});
+t('lockdiff: a reshuffled lockfile is not an upgrade', () => {
+  // the mirror risk of keying by name: iteration order deciding the answer
+  const mk = o => JSON.stringify({ packages: Object.fromEntries(
+    Object.entries(o).map(([k, v]) => [k, { version: v }])) });
+  const a = mk({ 'node_modules/x': '1.0.0', 'node_modules/p/node_modules/x': '2.0.0' });
+  const b = mk({ 'node_modules/p/node_modules/x': '2.0.0', 'node_modules/x': '1.0.0' });
+  eq(diffLocks('package-lock.json', a, b).counts.changed, 0);
+});
+t('lockdiff: npm lockfile v1 has no packages map', () => {
+  const v1 = deps => JSON.stringify({ lockfileVersion: 1, dependencies: deps });
+  const d = diffLocks('package-lock.json',
+    v1({ a: { version: '1.0.0', dependencies: { b: { version: '2.0.0' } } } }),
+    v1({ a: { version: '1.0.0', dependencies: { b: { version: '3.0.0' } } } }));
+  eq(d.counts.changed, 1, 'the nested dependencies tree must be walked');
+  eq(d.changed[0].name, 'b');
+});
+
+t('lockdiff: pnpm v9 quotes scoped keys', () => {
+  // only SCOPED names are quoted in v9, so an unquoted-only pattern dropped
+  // every @babel/*, @swc/*, @types/* — 0 of 2113 parsed on next.js
+  const v9 = (ver) => `lockfileVersion: '9.0'\n\npackages:\n\n  '@babel/core@${ver}':\n    resolution: {integrity: sha}\n\n  postcss@8.5.23:\n    resolution: {integrity: sha}\n`;
+  const d = diffLocks('pnpm-lock.yaml', v9('7.0.0'), v9('7.26.10'));
+  eq(d.counts.changed, 1);
+  eq(d.changed[0].name, '@babel/core');
+});
+t('lockdiff: pnpm v6 slash-prefixed keys still parse', () => {
+  const v6 = (ver) => `lockfileVersion: 6.0\n\npackages:\n\n  /@babel/core@${ver}:\n    dev: false\n`;
+  eq(diffLocks('pnpm-lock.yaml', v6('7.0.0'), v6('7.26.10')).changed[0].name, '@babel/core');
+});
+
+console.log('\nwhat a type checker can and cannot catch');
+t('typecover: an untyped project is reported as unchecked', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-tc-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x"}');
+    const p = projectTypeChecking('node', r);
+    eq(p.checker, null);
+    ok(/NOTHING catches/.test(p.note), p.note);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('typecover: TypeScript is detected, and strictness distinguished', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-tc2-'));
+  try {
+    writeFileSync(join(r, 'tsconfig.json'), '{"compilerOptions":{"strict":true}}');
+    const p = projectTypeChecking('node', r);
+    eq(p.checker, 'typescript'); eq(p.strict, true);
+    writeFileSync(join(r, 'tsconfig.json'), '{"compilerOptions":{}}');
+    ok(/non-strict/.test(projectTypeChecking('node', r).note));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('typecover: a compiler is a checker, but never for behaviour', () => {
+  for (const lang of ['go', 'rust', 'java', 'dotnet']) {
+    const p = projectTypeChecking(lang, '/nonexistent');
+    eq(p.enabled, true, lang);
+    ok(/NOT behaviour/i.test(p.note), `${lang}: ${p.note}`);
+  }
+});
+t('typecover: behaviour is NEVER statically checked, in any language', () => {
+  // the whole premise: no configuration makes this true
+  for (const lang of ['node', 'python', 'go', 'rust', 'java', 'ruby', 'php']) {
+    const c = catchability(lang, '/nonexistent', 'anything');
+    eq(c.behaviourChecked, false, lang);
+    eq(c.needsRuntimeProbe, true, lang);
+  }
+});
+
+t('typecover: "not installed" is unknown, never "checked"', () => {
+  // shapeChecked was `pkg.typed !== false`, so a repo with no node_modules —
+  // the normal state of a fresh clone — reported every package as statically
+  // checked and majorsWithNoStaticCheck: 0. A safety claim from not looking.
+  const r = mkdtempSync(join(tmpdir(), 'ru-tcu-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x","dependencies":{"ghost":"1"}}');
+    writeFileSync(join(r, 'tsconfig.json'), '{"compilerOptions":{"strict":true}}');
+    const c = catchability('node', r, 'ghost');
+    eq(c.verdict, 'unknown', JSON.stringify(c));
+    eq(c.shapeChecked, false, 'must not claim a check it did not verify');
+    ok(/unknown, not confirmed/.test(c.why), c.why);
+    eq(c.behaviourChecked, false);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+console.log('\nimport specifiers live inside strings');
+t('strings: stripComments keeps the module specifier', () => {
+  // stripNonCode blanks strings, which erases the package name being searched
+  const src = "// require('ms') in a comment\nconst ms = require('ms');\n";
+  const noComments = stripComments(src, 'node');
+  ok(/require\('ms'\)/.test(noComments), `specifier erased: ${JSON.stringify(noComments)}`);
+  ok(!/in a comment/.test(noComments), 'the comment is still removed');
+  const full = stripNonCode(src, 'node');
+  ok(!/'ms'/.test(full), 'stripNonCode still blanks strings, as it should');
+});
+t('strings: call sites are found, comment mentions are not', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-cs-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x","dependencies":{"ms":"2.1.2"}}');
+    writeFileSync(join(r, 'lock.before'), JSON.stringify({ packages: { 'node_modules/ms': { version: '2.1.2' } } }));
+    writeFileSync(join(r, 'package-lock.json'), JSON.stringify({ packages: { 'node_modules/ms': { version: '3.0.0' } } }));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src/real.js'), "const ms = require('ms');\n");
+    writeFileSync(join(r, 'src/talk.js'), "// we should drop require('ms') one day\n");
+    const v = runJson(process.execPath, [S('depverify.mjs'), 'node', r, '--before', join(r, 'lock.before')]);
+    ok(v.data, 'produced JSON');
+    const p = v.data.probePlan.find(x => x.package === 'ms');
+    ok(p, 'ms is in the probe plan');
+    eq(p.filesTouching, 1, 'only the real call site counts');
+    eq(p.where[0].file, 'src/real.js');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('depverify: refuses without a before-snapshot', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-nb-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(r, 'package-lock.json'), '{"packages":{}}');
+    const v = run(process.execPath, [S('depverify.mjs'), 'node', r]);
+    ok(v.status !== 0, 'must refuse');
+    ok(/before/i.test(v.stderr), 'and say a snapshot is needed BEFORE upgrading');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('depverify: ranks an unchecked major above a checked patch', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-rank-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(r, 'lock.before'), JSON.stringify({ packages: {
+      'node_modules/big': { version: '1.0.0' }, 'node_modules/small': { version: '2.0.0' } } }));
+    writeFileSync(join(r, 'package-lock.json'), JSON.stringify({ packages: {
+      'node_modules/big': { version: '4.0.0' }, 'node_modules/small': { version: '2.0.1' } } }));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src/a.js'), "require('big');require('big');\nrequire('small');\n");
+    const v = runJson(process.execPath, [S('depverify.mjs'), 'node', r, '--before', join(r, 'lock.before')]);
+    eq(v.data.probePlan[0].package, 'big', 'the major move ranks first');
+    ok(v.data.probePlan[0].priority > v.data.probePlan[1].priority);
+    ok(/different answer/i.test(v.data.theGap), 'and the premise is stated');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('depverify: nextStep is a command you can actually run', () => {
+  // this threw on a real repo because the field was named `name`, not `package`
+  const r = mkdtempSync(join(tmpdir(), 'ru-ns-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x","dependencies":{"ms":"2.1.3"}}');
+    writeFileSync(join(r, 'lock.before'), JSON.stringify({ packages: { 'node_modules/ms': { version: '2.0.0' } } }));
+    writeFileSync(join(r, 'package-lock.json'), JSON.stringify({ packages: { 'node_modules/ms': { version: '2.1.3' } } }));
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src/a.js'), "const ms = require('ms');\n");
+    const v = runJson(process.execPath, [S('depverify.mjs'), 'node', r, '--before', join(r, 'lock.before')]);
+    ok(v.data, 'produced JSON on a repo with a direct call site');
+    const cmd = v.data.nextStep;
+    ok(/probe\.mjs/.test(cmd), 'names the probe runner');
+    const m = cmd.match(/node (\S+probe\.mjs) (\S+) (\S+) (\S+) (\S+) --probe (\S+)/);
+    ok(m, `nextStep is not a parseable command:\n${cmd}`);
+    ok(existsSync(m[1]), `probe runner path does not exist: ${m[1]}`);
+    eq(m[2], 'node'); eq(m[3], 'ms'); eq(m[4], '2.0.0'); eq(m[5], '2.1.3');
+    ok(m[6].endsWith('.mjs'), `wrong probe extension for node: ${m[6]}`);
+    ok(!/undefined/.test(cmd), `nextStep contains "undefined": ${cmd}`);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('depverify: no output field ever contains the string "undefined"', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-undef-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(r, 'lock.before'), JSON.stringify({ packages: { 'node_modules/a': { version: '1.0.0' } } }));
+    writeFileSync(join(r, 'package-lock.json'), JSON.stringify({ packages: { 'node_modules/a': { version: '2.0.0' } } }));
+    const v = runJson(process.execPath, [S('depverify.mjs'), 'node', r, '--before', join(r, 'lock.before')]);
+    ok(v.data, 'produced JSON');
+    ok(!/"[^"]*undefined[^"]*"/.test(JSON.stringify(v.data)), 'a template literal interpolated undefined');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('depverify: a transitive change is reported, not hidden', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-tr-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x"}');
+    writeFileSync(join(r, 'lock.before'), JSON.stringify({ packages: { 'node_modules/deep': { version: '1.0.0' } } }));
+    writeFileSync(join(r, 'package-lock.json'), JSON.stringify({ packages: { 'node_modules/deep': { version: '2.0.0' } } }));
+    const v = runJson(process.execPath, [S('depverify.mjs'), 'node', r, '--before', join(r, 'lock.before')]);
+    eq(v.data.summary.changedButNotImported, 1);
+    ok(/still reaches you/i.test(v.data.changedButNotImported[0].note));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
 // ───────────── source autofix ─────────────
 console.log('\nsource autofix');
 function fix(...a) { return runJson(process.execPath, [S('fix.mjs'), ...a]); }
@@ -993,11 +2288,19 @@ function srcRepo(files, fn) {
 }
 
 t('fix: only rules with a hand-written autofix are applied', () => {
-  const auto = Object.values(RULES).flat().filter(r => r.autofix);
-  ok(auto.length >= 10, `expected a real autofix set, got ${auto.length}`);
+  const all = Object.values(RULES).flat();
+  const auto = all.filter(r => r.autofix);
+  ok(auto.length >= 5, `expected a real autofix set, got ${auto.length}`);
   // a behaviour change needs a test, not an edit — never an autofix
-  eq(Object.values(RULES).flat().filter(r => r.severity === 'behaviour' && r.autofix).length, 0,
+  eq(all.filter(r => r.severity === 'behaviour' && r.autofix).length, 0,
      'no behaviour-class rule may carry an autofix');
+  // An autofix must be a pure RENAME: same meaning, every time it matches.
+  // Two rules broke this — PHP's `${}` rewrite (which also hit escaped dollars,
+  // .env placeholders and preg backreferences) and Go's x/exp prefix strip
+  // (whose stdlib replacements have different signatures). Both now report only.
+  for (const r of auto)
+    ok(!/scope.*any/.test(String(r.scope)) || r.scope !== 'any',
+       `${r.what}: an autofix may not run on raw text including comments`);
 });
 t('fix: --list separates automatic from needs-a-human, with reasons', () => srcRepo(
   { 'package.json': '{"name":"x","engines":{"node":">=20"}}', 'a.js': 'const x = 1;\n' }, r => {
@@ -1022,21 +2325,50 @@ t('fix: NEVER edits inside a comment', () => srcRepo(
     eq(v.data.editCount, 1, 'exactly one edit — the real call, not the comment');
     eq(v.data.changes[0].edits[0].line, 2, 'on line 2');
   }));
-t('fix: a rule scoped to strings still fires (php interpolation)', () => srcRepo(
+t('scan: a dquote-scoped rule sees interpolation, and NOTHING else', () => srcRepo(
+  { 'composer.json': '{"name":"a/b","require":{"php":"^8.0"}}',
+    'real.php': '<?php\n$s = "hello ${name}";\n',
+    'literal.php': "<?php\n$s = '${PUSHER_APP_KEY}';\n",
+    'escaped.php': '<?php\n$s = "<?php \\${$v} = 1;";\n',
+    'backref.php': "<?php\n$s = preg_replace('/x/', '${1}', 'y');\n",
+    'comment.php': '<?php\n// use ${name} here\n',
+    'tpl.blade.php': '<div x-text="`${total}`"></div>\n' }, r => {
+    // The autofix for this rule rewrote all five of the non-findings into
+    // valid-but-wrong PHP that `php -l` accepted. Detection must be narrow.
+    const v = scan('php', r, '8.0', '8.4');
+    const files = (v.data.details || []).map(d => d.file);
+    eq(files.length, 1, `expected only real.php, got ${JSON.stringify(files)}`);
+    eq(files[0], 'real.php');
+  }));
+t('fix: the php interpolation rule offers no autofix', () => srcRepo(
   { 'composer.json': '{"name":"a/b","require":{"php":"^8.0"}}',
     'a.php': '<?php\n$s = "hello ${name}";\n' }, r => {
-    // interpolation only exists INSIDE a string; blanking strings killed it
+    // it is reported, and left to a human — rewriting it is a judgement call
     const v = fix('php', r, '8.0', '8.4');
-    eq(v.data.editCount, 1, 'the interpolation is found');
-    eq(v.data.changes[0].edits[0].after, '{$name}');
+    eq(v.data.editCount, 0, 'must not rewrite');
+    const rule = RULES.php.find(x => /\$\{\} string interpolation/.test(x.what));
+    eq(rule.autofix, null);
+    eq(rule.scope, 'dquote');
   }));
-t('fix: a rule scoped to any still fires (go import path)', () => srcRepo(
+t('scan: a code-strings rule sees import paths but not prose', () => srcRepo(
+  { 'go.mod': 'module x\n\ngo 1.20\n',
+    'real.go': 'package main\nimport "golang.org/x/exp/slices"\n',
+    'prose.go': 'package main\n// we should drop golang.org/x/exp/slices someday\n' }, r => {
+    const v = scan('go', r, '1.20', '1.27');
+    const files = (v.data.details || []).map(d => d.file);
+    eq(files.length, 1, `expected only real.go, got ${JSON.stringify(files)}`);
+    eq(files[0], 'real.go');
+  }));
+t('fix: the go x/exp rule offers no autofix', () => srcRepo(
   { 'go.mod': 'module x\n\ngo 1.20\n',
     'a.go': 'package main\nimport "golang.org/x/exp/slices"\n' }, r => {
-    // a Go import path IS a string literal
+    // stripping the prefix compiles to a DIFFERENT program: stdlib maps.Keys
+    // returns iter.Seq, and slices.SortFunc takes cmp() int, not less() bool
     const v = fix('go', r, '1.20', '1.27');
-    eq(v.data.editCount, 1, 'the import path is found');
-    eq(v.data.changes[0].edits[0].after, 'slices');
+    eq(v.data.editCount, 0, 'must not rewrite');
+    const rule = RULES.go.find(x => /graduated to the stdlib/.test(x.what));
+    eq(rule.autofix, null);
+    ok(/signatures CHANGED/.test(rule.fix), 'and must say why it is a port');
   }));
 t('fix: --only applies a subset', () => srcRepo(
   { 'mix.exs': 'def project, do: [elixir: "~> 1.12"]\n',
@@ -1249,8 +2581,22 @@ t('addpin: never fires when a pin already exists', () => {
     eq(planAddPin('node', r, '24.22.1'), null);
   } finally { rmSync(r, { recursive: true, force: true }); }
 });
-t('addpin: every language can add a pin', () => {
-  for (const a of adapters) ok(ADD_PIN_RULES[a.id], `${a.id} has no add-pin rule`);
+t('addpin: every language that CAN add a pin, does', () => {
+  // dotnet is deliberately absent. A global.json does not exist by default, and
+  // creating one makes every contributor's build select a specific SDK — a
+  // version that is not derivable from a runtime release number anyway.
+  const DELIBERATELY_ABSENT = new Set(['dotnet']);
+  for (const a of adapters) {
+    if (DELIBERATELY_ABSENT.has(a.id)) {
+      eq(ADD_PIN_RULES[a.id], undefined, `${a.id} must NOT invent a pin`);
+      continue;
+    }
+    ok(ADD_PIN_RULES[a.id], `${a.id} has no add-pin rule`);
+  }
+});
+t('addpin: the reason dotnet has none is written down', () => {
+  const src = readFileSync(join(HERE, '..', 'scripts', 'lib', 'edits.mjs'), 'utf8');
+  ok(/No dotnet entry on purpose/.test(src), 'a deliberate omission must say so');
 });
 
 // ───────────────────────── the plan ─────────────────────────

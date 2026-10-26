@@ -1,7 +1,7 @@
 export const meta = {
   name: 'runtime-upgrade',
-  description: 'Upgrade a Node.js or PHP runtime across any repo shape: discover, research EOL/CVEs, assess blockers, plan, adversarially verify',
-  whenToUse: 'When upgrading/bumping a Node or PHP version across one or many repos, or auditing runtime EOL/CVE exposure at scale. Pass args: {root, cvePolicy:"gate"|"report", mode:"plan"|"write", target?, lang?, only?}',
+  description: 'Upgrade any of 15 language runtimes across any repo shape: discover, research EOL/CVEs, assess blockers, plan, adversarially verify',
+  whenToUse: 'When upgrading/bumping a language runtime across one or many repos, or auditing runtime EOL/CVE exposure at scale. Pass args: {root, cvePolicy:"gate"|"report", mode:"plan"|"write", target?, lang?, only?}',
   phases: [
     { title: 'Discover', detail: 'detect.mjs over the root — repo shape, every runtime target, version drift' },
     { title: 'Research', detail: 'per target: EOL windows + runtime CVE delta' },

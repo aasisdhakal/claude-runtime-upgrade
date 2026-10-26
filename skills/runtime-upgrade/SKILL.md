@@ -90,16 +90,29 @@ Across several targets it also emits **sequencing** — which repo is the pilot 
 ```bash
 node $SK/scripts/detect.mjs <root> 
 ```
-Emits `{root, shape, target_count, targets[]}`. `shape` is one of `single`, `monorepo`, `polyrepo`, `mixed-single`, `container-only`, `no-manifest` — handle all six:
+Emits `{root, shape, targetCount, targets[], siblingPackages, discoveryGaps, platformPublishStubs}`.
+`shape` is one of `single`, `monorepo`, `multi-package`, `polyrepo`, `mixed-single`, `container-only`,
+`no-manifest` — handle all seven:
 
 | shape | what to do |
 |---|---|
 | `single` | one target, straightforward |
-| `monorepo` | root + workspaces. Upgrade the **root** runtime pin once; each workspace gets its own compat pass. Don't file one ticket per package |
+| `monorepo` | root + sibling packages, in **any** ecosystem — not just a declared JS workspace. Upgrade the **root** runtime pin once; each package gets its own compat pass. **One ticket for the repo**, never one per package |
+| `multi-package` | packages below a root that pins **nothing** (a bare `[workspace]` Cargo.toml). Each package is its own target; do not try to edit a root package that is not there |
 | `polyrepo` | a directory of independent repos. Each is its own unit of work with its own branch and rollback |
 | `mixed-single` | Node **and** PHP in one repo (Laravel+Vite, Symfony+Encore). Run both adapters; **upgrade them in separate commits** |
 | `container-only` | no manifest, runtime pinned only in a Dockerfile. Add a manifest pin as part of the work — otherwise nothing enforces the version |
 | `no-manifest` | report it and stop. There is nothing to upgrade until someone declares a runtime |
+
+Two fields worth reading before you trust a count:
+
+- **`discoveryGaps`** — what the walk could NOT see: a file cap reached, directories below the depth
+  limit, and directories skipped by an ambiguous name (`build`, `out`, `target`, `bin`, `dist`).
+  Absent means the walk was complete. Present means the target list is a floor, not a total — grafana
+  keeps a real Go module at `pkg/build/wire`, and `build` is in that skip set.
+- **`platformPublishStubs`** — packages that ship one prebuilt binary for one platform and nothing
+  else (`os`/`cpu` fields, no dependencies, a `.node` main). They are reported and never planned:
+  there is no source in them to upgrade, and their `engines` floor is published metadata.
 
 **Report `drift: true` as a finding, not a lookup result.** A repo whose `.nvmrc` and Dockerfile disagree has a bug before the upgrade starts. Check `declared_majors` — more than one value means the version differs across files.
 
@@ -172,9 +185,24 @@ node $SK/scripts/remediate.mjs <lang> <dir> <target> [--deps minor|latest|patch|
 ```
 `remediate.mjs` does both halves of the job — it rewrites every runtime pin (manifest, version file, Dockerfile `FROM`, `.tool-versions`) **and** upgrades the dependency packages with that ecosystem's own tool.
 
-**CI and build config move too.** `plan.mjs` reports them and `lib/edits.mjs` rewrites them: `setup-*` action inputs, container images, `tsconfig` target, `.npmrc engine-strict`, `composer config.platform.php`. A runtime that CI does not also move is how an upgrade passes locally and then builds on the old version forever.
+**CI and build config move too**, and `remediate --apply` writes them: `setup-*` action inputs,
+container images, `tsconfig` target, `.npmrc engine-strict`, `composer config.platform.php`. A runtime
+that CI does not also move is how an upgrade passes locally and then builds on the old version forever.
+Pass `--no-ci` to touch only the runtime pins.
 
-**A CI version matrix is never collapsed.** Keep the old version alongside the new one for the whole migration window — testing only the new one is how a compatibility fix silently breaks what production still runs.
+Three rules the rewriter follows, each of which it previously broke:
+- **Only the repo's newest CI version moves.** A job pinned below it is a lowest-supported job, and
+  symfony keeps those in separate files (`phpunit-bridge.yml` at 8.1, `json-schema.yml` at 8.2). They
+  are returned in `ciAndConfig.keptDeliberately` — add the target as another job rather than
+  collapsing them.
+- **A templated tag is not a version.** `cimg/node:<< pipeline.parameters.node-version >>` and
+  `${{ matrix.node }}` are left alone.
+- **An image name is matched whole.** `dunglas/frankenphp:1.12.1-php8.4` is not a PHP image.
+
+**A CI version matrix is never collapsed, and nothing here extends one for you.** `ciMatrixAdvice`
+reports the matrix it found and leaves it exactly as written; adding the target as a new entry is a
+hand edit. Keep the old version alongside the new one for the whole migration window — testing only
+the new one is how a compatibility fix silently breaks what production still runs.
 
 - **Dry-run is the default.** It emits unified diffs and writes nothing.
 - **`--deps minor`** (default) stays inside declared semver ranges — it will NOT move an exact pin like `"ms": "2.1.2"`.
@@ -192,6 +220,46 @@ Rules that hold for both:
 - **One major at a time**, commit between each. Never stack two majors in one diff.
 - Regenerate the lockfile with the **new** runtime's package manager.
 - Under `MODE=plan`, emit diffs only.
+
+### A bulk dependency upgrade can wreck a repo — it is checked first
+
+Some repos own their dependency resolution through their own tooling, and a generic bulk upgrade
+corrupts them. `remediate` refuses rather than wrecking, and names each condition in
+`dependencies.blockers`:
+
+| condition | what the generic command does |
+|---|---|
+| a `vendor/modules.txt` exists | `go get -u ./...` updates `go.mod` but not `vendor/`, and then **no package builds** ("inconsistent vendoring") |
+| `replace … => ./local` directives | those `require` lines are placeholders the repo maintains itself; a bulk upgrade rewrites them to published tags |
+| a `go.work` governs the module | the workspace carries its own `go` directive; raising a module floor past it fails outright |
+| `packageManager: yarn@2+` | Berry removed `yarn upgrade`; the Yarn 1 command fails |
+
+Measured on kubernetes: the unchecked path rewrote 126 `require` lines including the dead
+`client-go v1.5.2` tag, never regenerated `vendor/`, left the tree unbuildable — and reported
+`deps.ok: true`, after which the guard happily committed it.
+
+`--force-deps` runs anyway. Read every blocker first; there is no safe default that ignores them.
+
+### Raising a floor preserves everything except the lower bound
+
+A floor is often more than a minimum. `>=3.9,<4.0` has a chosen cap; `>=8.1.0 <8.3 || ~8.4.2` is a
+disjunction; `>=3.8,!=3.9.*,<3.14` excludes a release *and* caps above it. Replacing the whole value
+silently changes what the project claims to support — in the last case it reverses it.
+
+So: only the `>=` term moves, every other term is preserved verbatim, and a constraint that cannot be
+rewritten safely is **left exactly as written** and reported in `runtimePins.compoundConstraints`.
+A cap that would sit below the new floor is a refusal, not a flatten.
+
+### A pin is never invented over a declaration that already exists
+
+"No edit was possible" and "nothing is declared" are different findings. A `rust-version.workspace =
+true`, a `required_ruby_version = Gem::Requirement.new(...)`, a `<java.version>${jdk.version}</java.version>`
+and an `engines` block in a JSONC `package.json` all DECLARE a version this rewriter cannot read.
+Creating a pin beside one adds a second, contradictory source of truth — see
+`runtimePins.pinNotCreated`.
+
+And a `rust-toolchain.toml` is only ever created at the repo **root**: in a subdirectory it is a
+rustup override that silently changes the toolchain for everyone who builds there.
 
 ## Phase 4a — WRITE THE SOURCE FIXES
 
@@ -280,6 +348,66 @@ Then the parts a script cannot do:
 - **Make deprecations loud**: `NODE_OPTIONS="--throw-deprecation --pending-deprecation" npm test` · PHP: `error_reporting(E_ALL)` plus a handler that throws on `E_DEPRECATED` (it is **not** in PHP's default `error_reporting`).
 - **Golden/characterization tests** — capture outputs on the old runtime, replay on the new. Catches what no unit test asserts: date/number formatting, sort stability, serialization, hashing, locale.
 - **Outbound TLS**: both runtimes periodically tighten hostname/cert validation. Check every connection string.
+
+## Phase 5a — PROVE THE UPGRADED DEPENDENCIES STILL BEHAVE
+
+A runtime bump moves the whole dependency tree with it. The gap nobody closes:
+
+> **A type checker only ever rejects a SHAPE change** — a renamed export, a changed
+> signature, a different return type. It cannot reject *the same call returning a different
+> answer*: an unstable sort, a timezone rule, a rounding mode, a changed hash, a new default.
+> Those compile clean and are wrong at runtime. In Python, Ruby, PHP or plain JS nothing
+> checks even the shape.
+
+So after the lockfile moves, the only honest proof is to **run the dependency both ways**.
+
+**Take the before-snapshot BEFORE remediating** — once the lockfile is overwritten it is gone:
+
+```bash
+cp package-lock.json /tmp/lock.before          # or composer.lock, Gemfile.lock, poetry.lock…
+node $SK/scripts/remediate.mjs node <dir> 24.22.1 --deps latest --apply
+node $SK/scripts/depverify.mjs node <dir> --before /tmp/lock.before --top 8
+```
+
+`depverify` answers three questions and ranks what to probe:
+1. **What actually moved**, across 10 lockfile formats, major-first — transitive moves included.
+2. **Where this repo touches it** — real call sites, with comments stripped but *strings kept*
+   (an import specifier **is** a string literal).
+3. **What would have caught a regression** — the project's real type-checking story, and the
+   standing answer that behaviour is caught by nothing, in any language.
+
+A package that moved a major, is used in many files, and is statically unchecked ranks highest.
+A transitive move with no direct import is still reported — it still reaches you.
+
+Then probe the top entries. Write the probe from the **real call sites**, never from the
+package's README — a probe of an API this repo never calls proves nothing:
+
+```bash
+node $SK/scripts/probe.mjs node ms 2.0.0 2.1.3 --probe ./probe.mjs
+```
+
+It installs each version into its own scratch dir, runs the same probe against both, and
+diffs. Exit 1 means the behaviour changed. Node, Python, PHP and Ruby are supported — the
+four where this matters most, because three of them have no type checking at all.
+
+Rules that make a probe worth running:
+- **Print one labelled line per call.** The diff is line-level; unlabelled output is unreadable.
+- **Print the result, not just "it didn't throw."** A probe that only proves absence of a crash
+  is near-worthless and creates false confidence.
+- **Keep it deterministic.** Clocks, random seeds, temp paths and unpromised iteration order
+  differ between runs and drown the signal. Normalise them *in the probe* — only its author
+  knows which of those are the thing being tested.
+- **Never report "identical" for a probe that did not run on both versions.** `could-not-run`
+  and `inconclusive` are real answers; a silent probe matches itself exactly and is downgraded
+  out of `identical` automatically.
+- Identical output proves only that *the calls the probe made* still answer the same.
+
+For compiled languages there is no runner: use the repo's own build and test suite — but say
+plainly that a clean build checks shape only. A behaviour change passes it.
+
+To do this across many packages with agents writing the probes, run the companion workflow
+`dep-behaviour-check`, which probes each package and has a second agent adversarially judge
+whether the probe would actually have caught a regression.
 
 ## Rollout
 

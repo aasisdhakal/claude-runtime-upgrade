@@ -56,16 +56,36 @@ export const RULES = {
   ],
   php: [
     R('8.0.0', /\bcreate_function\s*\(/,                  'removed',  'create_function() was removed', 'use a closure'),
-    R('8.0.0', /\beach\s*\(/,                             'removed',  'each() was removed', 'use foreach'),
-    R('8.0.0', /\{\s*\$[A-Za-z_]\w*\s*\}/,                'removed',  'curly-brace string offset access was removed', 'use square brackets'),
-    R('8.1.0', /\$\w+\s*=\s*null\s*;[\s\S]{0,80}?function\s+\w+\s*\([^)]*\?\s*\w+\s+\$\w+\s*=\s*null/, 'runtime',
-      'implicitly nullable parameter types are deprecated', 'declare ?Type explicitly'),
+    // `->each(` and `::each(` are ordinary method calls; only the bare global
+    // function was removed. Without the lookbehind this fired on every
+    // Collection::each in Laravel (141 false positives).
+    R('8.0.0', /(?<![\w$>:\\])each\s*\(/,                 'removed',  'each() was removed', 'use foreach'),
+    // The removed syntax is VARIABLE-then-brace (`$str{4}`). The old pattern
+    // matched brace-then-variable (`{$method}`) — which is modern dynamic
+    // access, legal in every version: 322 false positives in Laravel alone,
+    // including PHP 8 match arms. `$this->{$m}` is not matched, because the
+    // brace there follows `->`, not a bare variable name.
+    R('8.0.0', /\$\w+\s*\{\s*(?:-?\d+|\$\w+|'[^']*'|"[^"]*")\s*\}/, 'removed',
+      'curly-brace string offset access was removed', 'use square brackets'),
+    // Deprecated in 8.4, not 8.1. The construct is a NON-nullable type with a
+    // null default (`Foo $x = null`); the old pattern matched `?Foo $x = null`,
+    // which is the explicitly-nullable form the fix asks for.
+    // Anchored to parameter position so it cannot fire on a property.
+    R('8.4.0', /[(,]\s*(?:(?:final|public|private|protected|readonly)\s+)*(?!\?)(?!(?:null|mixed|public|private|protected|final|readonly|static|var)\b)[A-Za-z_][\w\\]*\s+\$\w+\s*=\s*null\b/,
+      'runtime', 'implicitly nullable parameter types are deprecated (PHP 8.4)', 'declare ?Type explicitly'),
     R('8.1.0', /\bstrftime\s*\(|\bgmstrftime\s*\(/,       'runtime',  'strftime()/gmstrftime() are deprecated', 'use IntlDateFormatter or date()'),
     R('8.1.0', /\bFILTER_SANITIZE_STRING\b/,              'runtime',  'FILTER_SANITIZE_STRING is deprecated', 'use htmlspecialchars()'),
     R('8.2.0', /\butf8_encode\s*\(|\butf8_decode\s*\(/,   'runtime',  'utf8_encode()/utf8_decode() are deprecated', 'use mb_convert_encoding()'),
-    // interpolation only exists inside a double-quoted string
-    R('8.2.0', /\$\{\s*(\$?\w+)\s*\}/,                     'runtime',  '${} string interpolation is deprecated', 'use {$var}',
-      m => { const n = m.match(/\$\{\s*\$?(\w+)\s*\}/)[1]; return '{$' + n + '}'; }, 'strings'),
+    // Interpolation exists ONLY inside a double-quoted string or a heredoc —
+    // scope 'dquote' blanks everything else, including single-quoted literals,
+    // nowdocs, comments and the JS template literals that live in .blade.php.
+    // NO AUTOFIX: this one rewrote escaped dollars (`"\\${$var}"`), .env
+    // placeholders and preg_replace backreferences into valid-but-wrong PHP
+    // that `php -l` accepts. Rewriting it is a judgement call, not a mechanical
+    // one, so it is reported and left to a human.
+    R('8.2.0', /(?<!\\)\$\{\s*\$?\w+\s*\}/,                'runtime',
+      '${} string interpolation is deprecated', 'use {$var} — check it is really interpolation and not an escaped or literal ${}',
+      null, 'dquote'),
     R('8.3.0', /\bReflectionClass::getStaticProperties\b/, 'runtime', 'nullable return deprecated', 'check the PHP 8.3 UPGRADING notes'),
     R('8.4.0', /\bmysqli_execute\s*\(|\bsession_set_save_handler\s*\(\s*\w+\s*,/, 'runtime',
       'several signatures were deprecated in 8.4', 'see UPGRADING for the exact call'),
@@ -92,10 +112,20 @@ export const RULES = {
   go: [
     R('1.16.0', /\bio\/ioutil\b/,                         'runtime',  'io/ioutil is deprecated', 'use io and os'),
     R('1.20.0', /\bmath\/rand"\s*\)?[\s\S]{0,40}rand\.Seed\s*\(/, 'runtime', 'rand.Seed is deprecated', 'the global source is auto-seeded; use rand.New for determinism'),
-    // a Go import path IS a string literal, so this rule must see strings
+    // A Go import path IS a string literal, so this rule must see strings —
+    // but scope 'any' also sees COMMENTS, and a file whose only mention of
+    // x/exp was prose produced two findings. 'code-strings' keeps string
+    // literals and drops comments.
+    //
+    // NO AUTOFIX. Dropping the `golang.org/x/exp/` prefix compiles to a
+    // different program: x/exp `maps.Keys` returns `[]K` while the stdlib's
+    // returns an `iter.Seq`, and `slices.SortFunc` changed from `less() bool`
+    // to `cmp() int`. The rewritten file does not build. Graduating off x/exp
+    // is a real porting job, so it is reported and left to a human.
     R('1.21.0', /\bgolang\.org\/x\/exp\/(slices|maps)\b/, 'runtime',
-      'x/exp/slices and x/exp/maps graduated to the stdlib', 'import "slices" / "maps"',
-      m => m.replace(/golang\.org\/x\/exp\//, ''), 'any'),
+      'x/exp/slices and x/exp/maps graduated to the stdlib',
+      'import "slices" / "maps" — the signatures CHANGED (maps.Keys returns iter.Seq, slices.SortFunc takes cmp() int), so this is a port, not a rename',
+      null, 'code-strings'),
   ],
   java: [
     R('17', /\bsun\.misc\.Unsafe\b/,                      'runtime',  'sun.misc.Unsafe is being removed incrementally', 'use VarHandle / MemorySegment'),

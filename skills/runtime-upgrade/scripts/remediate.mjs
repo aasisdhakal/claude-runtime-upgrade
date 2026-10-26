@@ -13,8 +13,8 @@
 import { resolve, join, existsSync, readText, emit, die } from './lib/io.mjs';
 import { have, run, runJson } from './lib/sh.mjs';
 import { byId } from './adapters/index.mjs';
-import { planPinEdits, planAddPin, unified, ruleKind } from './lib/edits.mjs';
-import { writeFileSync } from 'node:fs';
+import { planPinEdits, planAddPin, unified, ruleKind, planCiEdits, planConfigEdits } from './lib/edits.mjs';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 
@@ -60,7 +60,10 @@ const DEP_RECIPES = {
                 latest: ['update', '--with-all-dependencies'], lockfile: ['update', '--lock'] }),
   go: () => ({ tool: 'go', check: ['list', '-m', '-u', 'all'], checkOk: [0, 1],
                patch: ['get', '-u=patch', './...'], minor: ['get', '-u', './...'],
-               latest: ['get', '-u', './...'], lockfile: ['mod', 'tidy'] }),
+               latest: ['get', '-u', './...'], lockfile: ['mod', 'tidy'],
+               // go.sum alone is not the whole lockfile when a tree vendors:
+               // vendor/modules.txt must agree or nothing builds
+               after: existsSync(join(DIR, 'vendor', 'modules.txt')) ? ['mod', 'vendor'] : null }),
   python: () => {
     const poetry = existsSync(join(DIR, 'poetry.lock'));
     const uv = existsSync(join(DIR, 'uv.lock'));
@@ -102,10 +105,22 @@ const DEP_RECIPES = {
 
 // ---------------- step 1: runtime pins ----------------
 const RAISE_FLOOR = has('raise-floor');
-const { edits, declinedFloors, unsupported } = planPinEdits(A.id, DIR, target, { raiseFloor: RAISE_FLOOR });
+const { edits, declinedFloors, compoundConstraints, unsupported } = planPinEdits(A.id, DIR, target, { raiseFloor: RAISE_FLOOR });
 // A project that declares the runtime nowhere in its manifest has nothing to
 // rewrite — and is precisely the project that needs a pin. Add one.
 let addedPin = null;
+let pinRefusal = null;
+// "the repo root" is where the VCS says it is, not wherever we were pointed
+function isRepoRoot(d) {
+  if (existsSync(join(d, '.git'))) return true;
+  const top = run('git', ['-C', d, 'rev-parse', '--show-toplevel'], { timeout: 5000 });
+  if (top.status === 0 && top.stdout.trim()) return resolve(top.stdout.trim()) === resolve(d);
+  // no VCS to ask: a Cargo/npm workspace manifest above us means we are not it
+  for (const up of ['..', '../..', '../../..'])
+    for (const mf of ['Cargo.toml', 'go.work', 'pnpm-workspace.yaml'])
+      if (existsSync(join(d, up, mf))) return false;
+  return true;
+}
 let alreadyCurrent = false;
 // A workspace root often declares nothing while its members all do. Creating a
 // toolchain pin there overrides every member and claims "the project declared
@@ -121,7 +136,13 @@ if (!edits.length && !argv.includes('--no-add-pin')) {
   if (declaredElsewhere) {
     // nothing to add: the repo DOES declare this runtime, just not here
     alreadyCurrent = false;
-  } else addedPin = planAddPin(A.id, DIR, target);
+  } else addedPin = planAddPin(A.id, DIR, target, { isRoot: isRepoRoot(DIR) });
+  // "no edit was possible" is not "nothing is declared". A workspace-inherited
+  // MSRV, a computed gemspec constraint and a property-indirected pom all
+  // DECLARE a version this rewriter cannot read. Creating a pin beside one adds
+  // a contradictory source of truth — and a rust-toolchain.toml in a directory
+  // is a rustup override that changes the toolchain for every contributor.
+  if (addedPin?.blocked) { pinRefusal = addedPin; addedPin = null; }
   // creating engines.node / require.php is creating a floor, not a pin
   if (addedPin && ruleKind(addedPin.rule) === 'floor' && !RAISE_FLOOR) {
     declinedFloors.push({ file: addedPin.file, rule: addedPin.rule, kind: 'floor',
@@ -140,11 +161,73 @@ if (!edits.length && !argv.includes('--no-add-pin')) {
 }
 const pinDiffs = edits.map(e => ({ file: e.file, rule: e.rule, diff: unified(e.file, e.before, e.after) }));
 
+// ---------------- step 1b: CI and build config ----------------
+// These were computed only by the read-only plan.mjs, so SKILL.md's promise
+// that "CI and build config move too" was never kept by any write path. An
+// upgrade that leaves .github/workflows on the old version is the exact failure
+// the skill warns about: it passes locally and builds on the old runtime forever.
+const CI = argv.includes('--no-ci') ? [] : planCiEdits(A.id, DIR, target);
+const CONFIG = argv.includes('--no-ci') ? [] : planConfigEdits(A.id, DIR, target);
+const sideEdits = [...CI, ...CONFIG];
+const ciKept = CI.skipped || [];
+
 // ---------------- step 2: dependency packages ----------------
+/**
+ * Some repos own their dependency resolution through their OWN tooling, and a
+ * generic bulk upgrade corrupts them. Measured on kubernetes:
+ *   `go get -u ./...` rewrote the deliberate `k8s.io/api v0.0.0` placeholders
+ *   (maintained by hack/update-vendor.sh and replace-pinned to ./staging/...)
+ *   to real tags, never regenerated vendor/, and left the tree unable to build
+ *   at all — while remediate reported deps.ok: true and guard committed it.
+ *
+ * So check first, and refuse rather than wreck. `--force-deps` is the opt-out.
+ */
+function dependencySafety(lang, dir) {
+  const blocks = [];
+  const read = f => { try { return readFileSync(join(dir, f), 'utf8'); } catch { return ''; } };
+  if (lang === 'go') {
+    const gomod = read('go.mod');
+    if (existsSync(join(dir, 'vendor', 'modules.txt')))
+      blocks.push({ why: 'this module vendors its dependencies',
+        risk: 'a bulk `go get -u` updates go.mod but not vendor/, and `go build` then fails with "inconsistent vendoring" on every package',
+        instead: 'run `go get -u ./... && go mod tidy && go mod vendor` as one unit, or let the repo\'s own vendor script do it' });
+    // replace directives come in two spellings: a bare `replace x => ./y` line
+    // and a `replace ( ... )` block whose lines carry no keyword at all. k8s and
+    // grafana both use the block form, so keying on the keyword saw none of them.
+    const localReplace = [...gomod.matchAll(/^\s*(?:replace\s+)?(\S+)\s+=>\s+\.{1,2}\//gm)].map(m => m[1]);
+    if (localReplace.length)
+      blocks.push({ why: `${localReplace.length} module(s) are replace-pinned to a local path`,
+        risk: 'their `require` lines are placeholders the repo maintains itself; a bulk upgrade rewrites them to published tags and breaks the local wiring',
+        instead: 'upgrade the published dependencies only, and leave replace-pinned requires alone',
+        examples: localReplace.slice(0, 3) });
+    if (existsSync(join(dir, 'go.work')) || existsSync(join(dir, '..', 'go.work')))
+      blocks.push({ why: 'a go.work workspace governs this module',
+        risk: 'the workspace carries its own `go` directive; raising a module floor past it fails with "module ... requires go >= X, but go.work lists go Y"',
+        instead: 'move the go.work directive first (`go work edit -go=<version>`), then the members' });
+  }
+  if (lang === 'node') {
+    // yarn berry removed `upgrade` in favour of `up`; the v1 recipe just errors
+    const pmField = (() => { try { return JSON.parse(read('package.json')).packageManager || ''; } catch { return ''; } })();
+    const berry = /^yarn@([2-9]|\d{2})/.test(pmField);
+    if (berry) blocks.push({ why: `package.json declares ${pmField}`,
+      risk: 'Yarn Berry removed `yarn upgrade`; the command this tool would run fails with "Couldn\'t find the node_modules state file"',
+      instead: 'use `yarn up` (Berry) — this tool\'s recipe targets Yarn 1' });
+  }
+  return blocks;
+}
+
 const recipe = (DEP_RECIPES[A.id] || (() => null))();
 const deps = { mode: DEPS, tool: recipe?.tool ?? null, note: recipe?.note ?? null };
 
-if (DEPS !== 'none' && recipe) {
+const depBlocks = DEPS !== 'none' ? dependencySafety(A.id, DIR) : [];
+const FORCE_DEPS = argv.includes('--force-deps');
+if (DEPS !== 'none' && depBlocks.length && !FORCE_DEPS) {
+  deps.refused = true;
+  deps.blockers = depBlocks;
+  deps.error = `dependency upgrade REFUSED — ${depBlocks.length} condition(s) make a bulk upgrade unsafe here. ` +
+               `Nothing was run. Pass --force-deps only if you have read each one.`;
+} else if (DEPS !== 'none' && recipe) {
+  if (depBlocks.length) deps.forcedPast = depBlocks;
   if (!have(recipe.tool)) {
     deps.error = `${recipe.tool} is not installed — dependency packages were NOT upgraded`;
   } else if (!recipe[DEPS]) {
@@ -161,7 +244,7 @@ if (DEPS !== 'none' && recipe) {
 }
 
 // ---------------- apply ----------------
-const applied = { pins: [], deps: null, lockfile: null };
+const applied = { pins: [], ci: null, deps: null, lockfile: null };
 if (APPLY) {
   // never write anywhere guard would refuse to commit
   const pre = runJson(process.execPath, [join(HERE, 'guard.mjs'), 'preflight', DIR]);
@@ -172,6 +255,8 @@ if (APPLY) {
     process.exit(1);
   }
   for (const e of edits) { writeFileSync(e.path, e.after); applied.pins.push({ file: e.file, rule: e.rule }); }
+  applied.ci = [];
+  for (const e of sideEdits) { writeFileSync(e.path, e.after); applied.ci.push({ file: e.file, rule: e.rule }); }
 
   if (deps.command) {
     if (deps.preCommand) {
@@ -193,6 +278,12 @@ if (APPLY) {
     const r = run(recipe.tool, recipe.lockfile, { cwd: DIR, timeout: 900000 });
     applied.lockfile = { command: [recipe.tool, ...recipe.lockfile].join(' '), ok: r.ok,
                          output: (r.stdout || r.stderr).slice(0, 3000) };
+    if (recipe.after) {
+      const v = run(recipe.tool, recipe.after, { cwd: DIR, timeout: 900000 });
+      applied.vendor = { command: [recipe.tool, ...recipe.after].join(' '), ok: v.ok,
+                         why: 'go.sum and vendor/modules.txt must agree or the tree does not build',
+                         output: (v.stdout || v.stderr).slice(0, 3000) };
+    }
   } else if (LOCK && !hadLock) {
     applied.lockfile = { skipped: 'the project has no lockfile — creating one is not this tool\'s call' };
   }
@@ -204,14 +295,36 @@ emit({
   unsupportedLanguage: unsupported || undefined,
   runtimePins: { count: edits.length, files: edits.map(e => `${e.file} (${e.rule})`), diffs: pinDiffs,
                  declinedFloors: declinedFloors || [],
+                 // a cap, exclusion or disjunction that no mechanical rewrite
+                 // preserves — left alone and named rather than flattened
+                 compoundConstraints: compoundConstraints || [],
                  raiseFloor: RAISE_FLOOR,
                  addedPin: addedPin ? { file: addedPin.file, created: addedPin.created,
                    why: 'the project declared no runtime in its manifest — nothing enforced the version' } : null,
                  declaredElsewhere,
+                 // why no pin was created here, when one could have been
+                 pinNotCreated: pinRefusal || undefined,
                  status: edits.length ? 'rewritten'
-                       : declaredElsewhere ? 'declined — this runtime is declared in sub-packages, not here'
+                       : pinRefusal?.declaredButUnreadable
+                           ? 'declined — a version IS declared here, in a form this tool cannot rewrite'
+                       : pinRefusal?.rootOnly
+                           ? `declined — creating ${pinRefusal.rootOnly} here would override the toolchain for everyone building in this directory`
+                       : declaredElsewhere ? (String(declaredElsewhere).split(',').some(x => x.trim().startsWith('.'))
+                           ? 'declined — an edit was possible here but was judged unsafe; the version is declared in this directory'
+                           : 'declined — this runtime is declared in sub-packages, not here')
                        : alreadyCurrent ? 'already-on-target'
                        : 'declined — an edit was possible but unsafe (see the language playbook)' },
+  ciAndConfig: {
+    count: sideEdits.length,
+    files: sideEdits.map(e => `${e.file} (${e.rule})`),
+    diffs: sideEdits.map(e => unified(e.file, e.before, e.after)),
+    // jobs deliberately pinned BELOW the repo's newest are the compatibility
+    // matrix; collapsing them deletes the only proof the declared floor works
+    keptDeliberately: ciKept,
+    note: sideEdits.length
+      ? 'CI moves with the runtime — otherwise the upgrade passes locally and CI builds the old version forever'
+      : 'no CI or build-config file names this runtime',
+  },
   dependencies: deps,
   applied: APPLY ? applied : undefined,
   nextSteps: APPLY

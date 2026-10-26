@@ -20,40 +20,145 @@ const gates = [];
 const add = (status, name, detail = '') => gates.push({ status, name, detail });
 const PASS = 'pass', FAIL = 'fail', SKIP = 'skip';
 
-// ---- gate 1 + 2: declared version agrees everywhere, and names the target ----
+// ---- gate 1 + 2: pins agree, and pins name the target ----
+// These two gates used to flatten `declaredMajors` across EVERY target in the
+// repo — floors, pins, vendored copies, publish stubs and examples alike. On
+// kubernetes, symfony, rails, roslyn and next.js that guaranteed a FAIL while
+// detect itself reported driftCount: 0, and on any library it produced a
+// catch-22: the gate demanded a declared version equal to the target, while
+// remediate correctly refused to raise the consumer-facing floor to get it.
+//
+// So judge the two kinds separately:
+//   a PIN  says what THIS checkout runs      -> must equal the target
+//   a FLOOR says the minimum consumers need  -> must be <= the target
+// A floor below the target is satisfied, not violated. That is what a floor is.
 const det = runJson(process.execPath, [join(import.meta.dirname ?? new URL('.', import.meta.url).pathname, 'detect.mjs'), DIR]);
-const mine = det.data?.targets?.filter(t => t.lang === A.id) || [];
-const majors = [...new Set(mine.flatMap(t => String(t.declaredMajors || '').split(',').filter(Boolean)))];
-if (!majors.length) add(SKIP, 'version drift', 'no declared version found');
-else if (majors.length === 1) add(PASS, 'no version drift', `declared: ${majors[0]}`);
-else add(FAIL, 'version drift', `declared majors disagree: ${majors.join(', ')}`);
+const mine = (det.data?.targets || []).filter(t => t.lang === A.id);
+const split = v => String(v || '').split(',').map(x => x.trim()).filter(Boolean);
+const cmpMajor = (a, b) => {
+  const A2 = String(a).split('.').map(Number), B2 = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(A2.length, B2.length); i++) {
+    const x = A2[i] || 0, y = B2[i] || 0;
+    if (x !== y) return x - y;
+  }
+  return 0;
+};
 
+const drifted = mine.filter(t => t.drift);
+const allPins = [...new Set(mine.flatMap(t => split(t.pinnedMajors)))];
+const allFloors = [...new Set(mine.flatMap(t => split(t.floorMajors)))];
+
+if (!mine.length) add(SKIP, 'version drift', 'no target for this language');
+else if (drifted.length)
+  add(FAIL, 'version drift',
+    `${drifted.length} target(s) pin two different versions at once: ` +
+    drifted.slice(0, 3).map(t => `${t.dir} [${t.pinnedMajors}]`).join('; '));
+else if (!allPins.length)
+  add(PASS, 'no version drift', 'nothing is pinned — only consumer-facing floors are declared, which cannot drift');
+else add(PASS, 'no version drift', `pinned: ${allPins.join(', ')}`);
+
+// gate 2 — pins must BE the target; floors must merely PERMIT it
 const wantMajor = A.id === 'node' ? tmaj.split('.')[0] : tmaj;
-if (!majors.length) add(SKIP, 'declared version matches target');
-else if (majors.includes(wantMajor)) add(PASS, 'declared version matches target', wantMajor);
-else add(FAIL, 'declared version matches target', `declared ${majors.join(',')} but target is ${wantMajor}`);
+// Compare at the precision the TARGET names, not at the first dotted component.
+// `majorOf` truncated both sides, so a `.php-version` pinned to 8.1 against a
+// target of 8.4 compared "8" to "8" and passed — a stale pin reported as clean.
+// `wantMajor` is already per-language (node "26", php "8.4", go "1.27").
+const atTargetPrecision = v => {
+  const depth = String(wantMajor).split('.').length;
+  return String(v).split('.').slice(0, depth).join('.');
+};
+const stalePins = allPins.filter(p => atTargetPrecision(p) !== String(wantMajor));
+const floorsAbove = allFloors.filter(f => cmpMajor(f, wantMajor) > 0);
+if (!allPins.length && !allFloors.length) add(SKIP, 'declared version matches target', 'nothing declares a version');
+else if (stalePins.length)
+  add(FAIL, 'declared version matches target',
+    `these PINS still name the old runtime: ${stalePins.join(', ')} (target ${wantMajor})`);
+else if (floorsAbove.length)
+  add(FAIL, 'declared version matches target',
+    `a declared FLOOR is above the target: ${floorsAbove.join(', ')} > ${wantMajor} — the project requires more than you are shipping`);
+else if (!allPins.length)
+  add(PASS, 'declared version matches target',
+    `nothing is pinned; the floor(s) ${allFloors.join(', ')} permit ${wantMajor}. ` +
+    `Raising a floor is semver-breaking for consumers, so leaving it put is correct, not a gap.`);
+else add(PASS, 'declared version matches target', `pins read ${allPins.join(', ')}`);
 
 // ---- gate 3: runtime CVEs at the target ----
-if (A.gateCapable && A.matchRuntimeCve) {
-  const db = await fetchJson(A.cveSource.url);
-  if (!db.data) add(SKIP, 'runtime CVEs at target', db.error || 'database unavailable');
+// Two adapters implement this two different ways: node exposes a synchronous
+// matcher over a curated database (`matchRuntimeCve`), go queries OSV directly
+// (`runtimeCves`). verify only ever looked for the first, so Go — advertised in
+// SKILL.md as gate-capable — SKIPPED every time while printing the note that
+// describes the gate it had just not run. A "pass" on a Go repo meant nothing.
+if (A.gateCapable && (A.matchRuntimeCve || A.runtimeCves)) {
+  let hits = null, err = null;
+  if (A.matchRuntimeCve) {
+    const db = await fetchJson(A.cveSource.url);
+    if (!db.data) err = db.error || 'database unavailable';
+    else hits = A.matchRuntimeCve(db.data, target);
+  } else {
+    // this adapter returns { hits, error } rather than a bare array — the gate
+    // had never actually run, so the shape mismatch had never been exercised
+    try {
+      const r = await A.runtimeCves(target);
+      if (Array.isArray(r)) hits = r;
+      else { hits = r?.hits ?? null; err = r?.error ?? null; }
+    } catch (e) { err = String(e.message || e); }
+  }
+  if (err || !hits) add(SKIP, 'runtime CVEs at target', err || 'database unavailable');
   else {
-    const hits = A.matchRuntimeCve(db.data, target);
-    const blocking = hits.filter(h => h.severity === 'high' || h.severity === 'critical').length;
-    if (blocking === 0) add(PASS, 'runtime CVEs at target', `0 high/critical at ${target}`);
-    else add(FAIL, 'runtime CVEs at target', `${blocking} high/critical still open at ${target}: ${hits.slice(0, 3).map(h => h.id).join(', ')}`);
+    // Go's vulnerability database assigns no severity at all, so counting
+    // high/critical there would always yield 0 — a guaranteed false pass.
+    // gateMetric says which number this adapter can honestly gate on.
+    const onTotal = A.gateMetric === 'total';
+    const blocking = onTotal ? hits.length
+      : hits.filter(h => h.severity === 'high' || h.severity === 'critical').length;
+    const what = onTotal ? 'total' : 'high/critical';
+    if (blocking === 0) add(PASS, 'runtime CVEs at target', `0 ${what} at ${target}`);
+    else add(FAIL, 'runtime CVEs at target',
+      `${blocking} ${what} still open at ${target}: ${hits.slice(0, 3).map(h => h.id || h).join(', ')}`);
   }
 } else {
-  add(SKIP, 'runtime CVEs at target', A.gateNote || 'no curated runtime CVE database');
+  add(SKIP, 'runtime CVEs at target',
+    A.gateCapable ? 'adapter declares gateCapable but implements no CVE lookup — this is a bug, not a clean bill of health'
+                  : (A.gateNote || 'no curated runtime CVE database'));
+}
+
+function yarnAuditArgs(dir) {
+  const v = run('yarn', ['--version'], { cwd: dir, timeout: 10000 });
+  const major = parseInt(String(v.stdout || '').trim().split('.')[0], 10);
+  return major >= 2 ? ['npm', 'audit', '--json'] : ['audit', '--json'];
 }
 
 // ---- gate 4: dependency advisories ----
 if (A.id === 'node') {
-  let audit = { data: null };
-  if (existsSync(join(DIR, 'pnpm-lock.yaml')) && have('pnpm')) audit = runJson('pnpm', ['audit', '--json'], { cwd: DIR });
-  else if (existsSync(join(DIR, 'package-lock.json')) && have('npm')) audit = runJson('npm', ['audit', '--omit=dev', '--json'], { cwd: DIR });
+  // Three outcomes, not two. A crashed auditor used to be indistinguishable
+  // from "no lockfile": when pnpm audit failed on a broken store, verify said
+  // SKIP "no lockfile or package manager" with the lockfile RIGHT THERE and
+  // pnpm installed — so under policy=gate the advisory gate silently evaporated.
+  // yarn.lock was also never implemented despite being reported as absent.
+  let audit = { data: null }, tool = null, why = null;
+  const LOCKS = [['pnpm-lock.yaml', 'pnpm', ['audit', '--json']],
+                 ['package-lock.json', 'npm', ['audit', '--omit=dev', '--json']],
+                 ['bun.lock', 'bun', ['audit', '--json']],
+                 // yarn v1 and Berry take DIFFERENT commands: `yarn audit` vs
+                 // `yarn npm audit`. Running Berry's form under v1 fails with
+                 // `Command "npm" not found`, which then read as "no lockfile".
+                 ['yarn.lock', 'yarn', yarnAuditArgs(DIR)]];
+  const present = LOCKS.filter(([f]) => existsSync(join(DIR, f)));
+  if (!present.length) why = 'this project has no lockfile — there is nothing to audit';
+  else {
+    const usable = present.find(([, t]) => have(t));
+    if (!usable) why = `found ${present.map(([f]) => f).join(', ')} but none of their package managers is installed`;
+    else {
+      tool = usable[1];
+      audit = runJson(tool, usable[2], { cwd: DIR });
+      if (!audit.data?.metadata?.vulnerabilities)
+        why = `\`${tool} ${usable[2].join(' ')}\` produced no usable report` +
+              (audit.stderr ? `: ${String(audit.stderr).trim().split('\n')[0].slice(0, 160)}` : '') +
+              '. This is NOT a clean result — the gate could not run.';
+    }
+  }
   const v = audit.data?.metadata?.vulnerabilities;
-  if (!v) add(SKIP, 'dependency advisories', 'no lockfile or package manager');
+  if (!v) add(SKIP, 'dependency advisories', why);
   else {
     const n = (v.critical || 0) + (v.high || 0);
     n === 0 ? add(PASS, 'dependency advisories', '0 critical/high')
@@ -109,10 +214,22 @@ emit({
   lang: A.id, dir: DIR, target, policy: POLICY, image: IMAGE || null,
   gates, summary: counts, failed,
   verdict: failed === 0 ? 'pass' : (POLICY === 'gate' ? 'blocked' : 'findings-reported'),
-  hints: A.id === 'node'
-    ? ['run the suite with NODE_OPTIONS="--throw-deprecation --pending-deprecation" to make deprecations fail',
-       '--pending-deprecation reports what the NEXT major removes — one cycle de-risks the following one']
-    : ['E_DEPRECATED (8192) is NOT in PHP default error_reporting — set error_reporting(E_ALL) plus a handler that throws during tests'],
+  // was: node gets node hints, EVERY other language gets the PHP one — so a
+  // dotnet, Go or Python run was told about E_DEPRECATED
+  hints: ({
+    node: ['run the suite with NODE_OPTIONS="--throw-deprecation --pending-deprecation" to make deprecations fail',
+           '--pending-deprecation reports what the NEXT major removes — one cycle de-risks the following one'],
+    php: ['E_DEPRECATED (8192) is NOT in PHP default error_reporting — set error_reporting(E_ALL) plus a handler that throws during tests'],
+    python: ['run with `-W error::DeprecationWarning` — Python hides DeprecationWarning outside __main__ by default',
+             'PYTHONWARNINGS=error::DeprecationWarning covers subprocesses too'],
+    ruby: ['run with `-w` and set Warning[:deprecated] = true — Ruby 3 silences deprecations by default'],
+    go: ['`go vet ./...` and `staticcheck` carry the deprecation knowledge the compiler does not',
+         'the build succeeding proves SHAPE only — a behaviour change compiles clean'],
+    rust: ['`cargo build` denies nothing by default; add `#![deny(deprecated)]` or `RUSTFLAGS="-D deprecated"`'],
+    java: ['compile with `-Xlint:deprecation -Werror` — javac reports deprecations as notes otherwise'],
+    dotnet: ['build with `-warnaserror` and check the obsoletion diagnostics (SYSLIB*, CA*) for this TFM'],
+  }[A.id]) || [`${A.label}: make deprecations fail the build however this toolchain allows — `
+             + 'a clean build checks shape, never behaviour'],
 });
 
 process.exit(failed > 0 && POLICY === 'gate' ? 1 : 0);

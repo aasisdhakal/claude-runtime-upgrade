@@ -15,6 +15,28 @@ export const cveSource = { url: null, note: 'none in OSV — Microsoft Security 
 export const ciKey = /\bdotnet[-_]?version/i;
 export const imageRe = /\b(?:mcr\.microsoft\.com\/)?dotnet\/(?:sdk|runtime|aspnet)[:@]([^\s"']+)/gi;
 
+/**
+ * The one place a .NET version string is turned into a comparable number.
+ * EXPORTED because plan.mjs reimplemented this and reintroduced the exact bug
+ * the comments below describe: it read `net472` as version "472", making a
+ * .NET Framework project look newer than .NET 10, and scored a cross-platform
+ * port as a 2-point, zero-cycle change. 119 of roslyn's 123 plans were that.
+ *
+ *   net8.0, net10.0   .NET (Core) — the major is before the dot
+ *   net46, net472     .NET FRAMEWORK 4.6 / 4.7.2 — the digits are 4.x, NOT 46
+ *   netstandard2.0    not a runtime version at all
+ */
+export const normalizeVersion = v => {
+  const s2 = String(v);
+  const core = s2.match(/^net(?:coreapp)?(\d+)\.\d+/);     // net8.0 -> 8
+  if (core) return core[1];
+  const fw = s2.match(/^net(\d)(\d)(\d)?$/);                // net472 -> 4.7
+  if (fw) return `${fw[1]}.${fw[2]}`;
+  if (/^netstandard/.test(s2)) return '';                    // not a runtime version
+  const plain = s2.match(/^(\d+)\./);                       // 8.0.401 -> 8
+  return plain ? plain[1] : '';
+};
+
 export function scan({ dir, root, dockerImages, ciText }) {
   let proj = '', projFile = '';
   try {
@@ -40,16 +62,7 @@ export function scan({ dir, root, dockerImages, ciText }) {
   //   net46, net472     .NET FRAMEWORK 4.6 / 4.7.2 — digits are 4.x, NOT 46
   // Reading net46 as "46" made a .NET Framework project look newer than .NET 10
   // and scored a cross-platform port as a 2-point, zero-cycle change.
-  const norm = v => {
-    const s2 = String(v);
-    const core = s2.match(/^net(?:coreapp)?(\d+)\.\d+/);     // net8.0 -> 8
-    if (core) return core[1];
-    const fw = s2.match(/^net(\d)(\d)(\d)?$/);                // net472 -> 4.7
-    if (fw) return `${fw[1]}.${fw[2]}`;
-    if (/^netstandard/.test(s2)) return '';                    // not a runtime version
-    const plain = s2.match(/^(\d+)\./);                       // 8.0.401 -> 8
-    return plain ? plain[1] : '';
-  };
+  const norm = normalizeVersion;
   const majors = [...new Set(Object.entries(declared)
     .filter(([k]) => k !== 'langVersion' && k !== 'rollForward')
     .flatMap(([, v]) => String(v).split(/[;|]/).map(norm)).filter(Boolean))];

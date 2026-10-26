@@ -46,10 +46,27 @@ const notEol = c => c.eol === false || (typeof c.eol === 'string' && c.eol > tod
 const inSupport = c => c.support === false || (typeof c.support === 'string' && c.support > today);
 const isLts = c => c.lts !== false && c.lts != null;
 
+// An unknown version must say so. `find()` returns {} for a cycle that does not
+// exist, and every downstream field then read as null while `isEol` read false —
+// so `research php 8.9`, `research python 9.9` and `research dotnet 472` all
+// reported a healthy, supported runtime that has never existed, and that
+// fiction flowed into plan and into a written pin.
+const knownCycles = cycles.map(c => String(c.cycle));
+// An unrecognised CURRENT version is reported, not fatal — the caller may be
+// asking about a runtime this product tracks under a different slug (net472
+// lives under `dotnetfx`, not `dotnet`). But it must never read as healthy.
+const currentIsUnknown = !!(curMajor && !knownCycles.includes(String(curMajor)));
 // target: newest cycle still in ACTIVE support; else newest not-yet-EOL
 let target = targetArg;
 if (!target) {
-  const prefer = isNode
+  // LTS beats newest wherever a product HAS an LTS concept. This was applied to
+  // Node only, and for Java it could not fall back either: endoflife.date's
+  // corretto cycles carry no `support` field at all, so the "in active support"
+  // pool was always empty and the fallback picked the newest cycle — recommending
+  // Spring Boot move off Java 25 LTS (supported to 2032) onto non-LTS 27
+  // (supported to 2027-04), SHORTENING the support window by five years.
+  const hasLtsConcept = cycles.some(c => c.lts === true || typeof c.lts === 'string');
+  const prefer = hasLtsConcept
     ? cycles.filter(c => notEol(c) && isLts(c))
     : cycles.filter(c => notEol(c) && inSupport(c));
   const pool = prefer.length ? prefer : cycles.filter(notEol);
@@ -57,6 +74,10 @@ if (!target) {
   target = best?.latest || '';
 }
 let tgtMajor = majorOf(target);
+if (targetArg && !knownCycles.includes(String(tgtMajor)))
+  die(`${A.label} ${targetArg} is not a release endoflife.date knows about.\n` +
+      `Known cycles: ${knownCycles.slice(0, 14).join(', ')}${knownCycles.length > 14 ? ', …' : ''}\n` +
+      `A target that does not exist would be written into a pin as if it did.`, 2);
 let cur = find(curMajor), tgt = find(tgtMajor);
 
 // A newer number is not automatically a better target. Java 27 is non-LTS and
@@ -159,6 +180,11 @@ const curEol = typeof cur.eol === 'string' ? cur.eol : (cur.eol === false ? null
 const curSup = typeof cur.support === 'string' ? cur.support : (cur.support === false ? null : '');
 
 emit({
+  currentUnrecognised: currentIsUnknown ? {
+    value: current,
+    meaning: `endoflife.date has no cycle "${curMajor}" for ${A.eolProduct} — every EOL and support field below is UNKNOWN, not "fine"`,
+    knownCycles: knownCycles.slice(0, 16),
+  } : undefined,
   lang: A.id,
   label: A.label,
   today,

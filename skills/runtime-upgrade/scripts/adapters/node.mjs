@@ -13,7 +13,11 @@ export const cveSource = {
   note: 'nodejs/security-wg — curated, semver-ranged, authoritative',
 };
 export const ciKey = /\b(?:node|nodejs)[-_]?version/i;
-export const imageRe = /\b(node|bun|deno)[:@]([^\s"']+)/gi;
+// ONLY node. Claiming bun and deno here made detect mint a Node target from a
+// `bun:1` image and plan then reported "node 1 -> 26.12.1, blocked" beside the
+// correct "bun 1 -> 1.4.4" row — the same Dockerfile counted twice, once as a
+// runtime that does not exist. Those runtimes have their own adapters.
+export const imageRe = /\bnode[:@]([^\s"']+)/gi;
 
 export function matchRuntimeCve(db, version) {
   const hits = [];
@@ -46,7 +50,7 @@ export function scan({ dir, root, dockerImages, ciText }) {
     nvmrc:        (readText(join(dir, '.nvmrc')) || '').trim(),
     nodeVersion:  (readText(join(dir, '.node-version')) || '').trim(),
     toolVersions: toolVersion(readText(join(dir, '.tool-versions')), /^nodejs\s+(\S+)/mi),
-    dockerfile:   dockerImages.filter(s => /^(node|bun|deno)/i.test(s)).join(' | '),
+    dockerfile:   dockerImages.filter(s => /^node[:@]/i.test(s)).join(' | '),
     ci:           ciText,
   };
   let lockfile = '';
