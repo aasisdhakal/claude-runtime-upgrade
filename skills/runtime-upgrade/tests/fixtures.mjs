@@ -56,6 +56,62 @@ export const FIXTURES = {
     w(r, '.nvmrc', 'v18\n');
     w(r, 'Dockerfile', 'FROM node:22-alpine AS a\nFROM node:22-alpine AS b\n');
   },
+  'single-go': r => {
+    w(r, 'go.mod', 'module github.com/acme/svc\n\ngo 1.21\n\ntoolchain go1.21.5\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n\tgithub.com/spf13/cobra v1.8.0\n)\n');
+    w(r, 'go.sum', '');
+    w(r, 'Dockerfile', 'FROM golang:1.21-alpine AS build\n');
+  },
+  'single-python': r => {
+    w(r, 'pyproject.toml', '[project]\nname = "acme-svc"\nrequires-python = ">=3.9"\ndependencies = ["django>=4.0", "requests>=2.0"]\n');
+    w(r, '.python-version', '3.9.18\n');
+    w(r, 'Dockerfile', 'FROM python:3.9-slim\n');
+    w(r, 'poetry.lock', '');
+  },
+  'single-ruby': r => {
+    w(r, 'Gemfile', "source 'https://rubygems.org'\nruby '3.0.6'\ngem 'rails', '~> 7.0'\ngem 'pg'\n");
+    w(r, '.ruby-version', 'ruby-3.0.6\n');
+    w(r, 'Gemfile.lock', 'PLATFORMS\n  x86_64-linux\n  ruby\n\nRUBY VERSION\n   ruby 3.0.6p216\n');
+  },
+  'single-rust': r => {
+    w(r, 'Cargo.toml', '[package]\nname = "acme"\nedition = "2021"\nrust-version = "1.70"\n\n[dependencies]\ntokio = "1"\nserde = "1"\n');
+    w(r, 'rust-toolchain.toml', '[toolchain]\nchannel = "1.70.0"\n');
+    w(r, 'Cargo.lock', '');
+  },
+  'single-java': r => {
+    w(r, 'pom.xml', '<project><artifactId>acme-svc</artifactId>\n<properties><maven.compiler.release>17</maven.compiler.release></properties>\n<dependencies><dependency><groupId>org.springframework</groupId></dependency></dependencies></project>\n');
+    w(r, '.sdkmanrc', 'java=17.0.9-tem\n');
+    w(r, 'Dockerfile', 'FROM eclipse-temurin:17-jre-alpine\n');
+  },
+  'single-dotnet': r => {
+    w(r, 'Acme.Api.csproj', '<Project Sdk="Microsoft.NET.Sdk">\n<PropertyGroup><TargetFramework>net6.0</TargetFramework></PropertyGroup>\n<ItemGroup><PackageReference Include="Newtonsoft.Json" /></ItemGroup>\n</Project>\n');
+    w(r, 'global.json', { sdk: { version: '6.0.418', rollForward: 'latestFeature' } });
+    w(r, 'Dockerfile', 'FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build\n');
+  },
+  // CI accuracy: a Node project whose workflow ALSO pins a python version
+  'ci-cross-language': r => {
+    w(r, 'package.json', { name: 'cross', engines: { node: '>=20' } });
+    w(r, '.github/workflows/ci.yml',
+      'jobs:\n  build:\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 20.11.1\n      - uses: actions/setup-python@v5\n        with:\n          python-version: 3.8.10\n');
+  },
+  // a CI test matrix is deliberate breadth, not disagreement
+  'ci-matrix': r => {
+    w(r, 'pyproject.toml', '[project]\nname = "matrixed"\nrequires-python = ">=3.9"\n');
+    w(r, '.github/workflows/test.yml',
+      'jobs:\n  test:\n    strategy:\n      matrix:\n        python: ["3.9", "3.11", "3.12"]\n    steps:\n      - uses: actions/setup-python@v5\n        with:\n          python-version: "3.9"\n      - uses: actions/setup-python@v5\n        with:\n          python-version: "3.11"\n      - uses: actions/setup-python@v5\n        with:\n          python-version: "3.12"\n');
+  },
+  // templated CI values must be ignored, not parsed as versions
+  'ci-templated': r => {
+    w(r, 'package.json', { name: 'templated', engines: { node: '>=22' } });
+    w(r, '.github/workflows/ci.yml',
+      'jobs:\n  b:\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: ${{ matrix.node }}\n');
+  },
+  'polyglot': r => {
+    // one repo, four runtimes — the shape nobody plans for
+    w(r, 'api/go.mod', 'module acme/api\n\ngo 1.22\n');
+    w(r, 'web/package.json', { name: 'web', engines: { node: '>=20' } });
+    w(r, 'ml/pyproject.toml', '[project]\nname = "ml"\nrequires-python = ">=3.11"\n');
+    w(r, 'legacy/composer.json', { name: 'acme/legacy', require: { php: '^8.1' } });
+  },
   // node_modules shaped to exercise the ABI-vs-N-API classifier, which is the
   // most expensive thing this skill can get wrong.
   'abi-classify': r => {

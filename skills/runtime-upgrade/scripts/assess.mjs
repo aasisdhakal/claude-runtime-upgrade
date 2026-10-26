@@ -4,6 +4,8 @@
 import { join, resolve, existsSync, readJson, readdirSync, statSync, walk, emit, die } from './lib/io.mjs';
 import { have, run, runJson } from './lib/sh.mjs';
 import { byId } from './adapters/index.mjs';
+import { readFileSync } from 'node:fs';
+const require2fs = p => { try { return readFileSync(p, 'utf8'); } catch { return null; } };
 
 const [, , langArg, dirArg, target] = process.argv;
 if (!langArg || !dirArg || !target) die('usage: assess.mjs <lang> <dir> <target-version>', 2);
@@ -114,6 +116,68 @@ if (A.id === 'node') {
   notes.push('every loaded extension must be recompiled for a new PHP MINOR — PHP has no N-API equivalent');
   notes.push('diff `php -m` between the old and new image; an extension present on old and missing on new is a boot-time failure');
   notes.push('never set config.platform-check=false to silence errors — it defers a build error into a runtime crash');
+  if (A.gateNote) notes.push(A.gateNote);
+
+} else {
+  // ---------- generic adapter path ----------
+  // Dependency advisories come from each ecosystem's own auditor when present.
+  // Nothing here is faked: if the tool is absent we say so rather than report zero.
+  const AUDITORS = {
+    go:     { cmd: 'govulncheck', args: ['-format', 'json', './...'], install: 'go install golang.org/x/vuln/cmd/govulncheck@latest' },
+    python: { cmd: 'pip-audit',   args: ['-f', 'json'],               install: 'pipx install pip-audit' },
+    ruby:   { cmd: 'bundle',      args: ['audit', 'check', '--quiet'], install: 'gem install bundler-audit && bundle audit update' },
+    rust:   { cmd: 'cargo',       args: ['audit', '--json'],          install: 'cargo install cargo-audit' },
+    dotnet: { cmd: 'dotnet',      args: ['list', 'package', '--vulnerable', '--include-transitive'], install: 'ships with the .NET SDK' },
+    java:   { cmd: null,          args: [],                            install: 'OWASP dependency-check, or `mvn versions:display-dependency-updates`' },
+  };
+  const au = AUDITORS[A.id];
+  result.dependencyAdvisories = { tool: au?.cmd || null };
+  if (au?.cmd && have(au.cmd)) {
+    const r = runJson(au.cmd, au.args, { cwd: DIR, timeout: 180000 });
+    result.dependencyAdvisories = r.data
+      ? { tool: au.cmd, raw: r.data }
+      : { tool: au.cmd, output: (r.stdout || r.stderr).slice(0, 4000), exitStatus: r.status };
+  } else {
+    result.dependencyAdvisories.error =
+      `${au?.cmd || 'no standard auditor'} not installed — dependency advisories NOT checked. Install: ${au?.install || 'n/a'}`;
+    notes.push(result.dependencyAdvisories.error);
+  }
+
+  // ---------- toolchain presence ----------
+  const RUNTIME_BIN = { go: 'go', python: 'python3', ruby: 'ruby', rust: 'rustc', java: 'java', dotnet: 'dotnet' }[A.id];
+  if (RUNTIME_BIN && have(RUNTIME_BIN)) {
+    const vflag = A.id === 'go' ? ['version'] : A.id === 'java' ? ['-version'] : ['--version'];
+    const r = run(RUNTIME_BIN, vflag, { timeout: 15000 });
+    result.installedRuntime = ((r.stdout || r.stderr).split('\n')[0] || '').trim();
+  } else {
+    notes.push(`${RUNTIME_BIN || A.id} not installed locally — runtime inspection skipped`);
+  }
+
+  // ---------- the native/compiled-artifact axis, per language ----------
+  // Shapes differ enough that a shared classifier would lie. Each adapter
+  // states its own, and assess surfaces what can be checked cheaply.
+  const target = byId[A.id];
+  result.nativeModel = target.scan ? null : null;
+  result.nativeAddons = [];
+  result.nativeBlockers = [];
+  if (A.id === 'go') {
+    const gomod = require2fs(join(DIR, 'go.mod'));
+    const cgo = /"C"/.test(gomod || '');
+    result.nativeNote = cgo
+      ? 'CGO is in use — the build is no longer statically self-contained; the target image needs a matching libc and toolchain'
+      : 'pure Go: statically linked, no ABI axis. CGO_ENABLED=0 builds move between images freely';
+    result.cgo = cgo;
+  } else if (A.id === 'python') {
+    result.nativeNote = 'binary wheels are tagged cp3XX-<abi>-<platform>. A new MINOR needs wheels published for that tag, or a source build with a compiler. Check `pip debug --verbose` for supported tags.';
+  } else if (A.id === 'ruby') {
+    result.nativeNote = 'native gems (C extensions) relink against the interpreter and must be rebuilt for a new MINOR. Check Gemfile.lock PLATFORMS for precompiled entries.';
+  } else if (A.id === 'rust') {
+    result.nativeNote = 'no ABI axis: crates always compile from source. `edition` is independent of toolchain version and does not need to move together.';
+  } else if (A.id === 'java') {
+    result.nativeNote = 'bytecode major version is the compatibility axis, not a binary ABI. `--release N` lets a newer JDK emit older bytecode, so the JDK and the target level move independently.';
+  } else if (A.id === 'dotnet') {
+    result.nativeNote = 'TFM (net8.0) is the compatibility axis; global.json `rollForward` decides which installed SDK a build will accept.';
+  }
   if (A.gateNote) notes.push(A.gateNote);
 }
 

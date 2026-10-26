@@ -19,6 +19,7 @@ export const cveSource = {
   url: 'https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName=cpe:2.3:a:php:php:{version}:*:*:*:*:*:*:*',
   note: 'NVD CPE — historical, noisy, rate-limited (5 req/30s without NVD_API_KEY, 50 with)',
 };
+export const ciKey = /\bphp[-_]?version/i;
 export const imageRe = /\b(php)[:@]([^\s"']+)/gi;
 
 export function scan({ dir, root, dockerImages, ciText }) {

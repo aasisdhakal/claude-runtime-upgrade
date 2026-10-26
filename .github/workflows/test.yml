@@ -20,6 +20,8 @@ jobs:
         with: { node-version: '${{ matrix.node }}' }
       - name: doctor
         run: node skills/runtime-upgrade/scripts/doctor.mjs
+      - name: install dev-only differential oracle
+        run: npm install --no-save semver
       - name: tests
         run: node skills/runtime-upgrade/tests/run.mjs
 

@@ -3,9 +3,21 @@ name: runtime-upgrade
 description: Upgrade a language runtime (Node.js or PHP) across any repo shape — single, monorepo, polyrepo, mixed-language, or container-only. Covers discovery, EOL/CVE research, blocker assessment, code upgrade, and the test/rollout workflow. Use when asked to upgrade, bump, or modernise a Node or PHP version, to check what runtime a project is on, to audit runtime EOL/CVE exposure, or to plan a version migration.
 ---
 
-# Runtime upgrade (Node.js · PHP)
+# Runtime upgrade (Node.js · PHP · Go · Python · Ruby · Rust · Java · .NET)
 
-Takes any repo from "what are we on?" to a verified upgrade. Five gated phases. The deterministic work runs in shell; you supply judgement.
+Takes any repo from "what are we on?" to a verified upgrade. Five gated phases. The deterministic work runs in zero-dependency Node; you supply judgement.
+
+## Gate capability — read this before promising anything
+
+Only **two** runtimes have a curated, version-ranged CVE database. The rest cannot be hard-gated on runtime CVEs, and `research.mjs` says so per language:
+
+| Runtime | Gate | Metric | Why |
+|---|---|---|---|
+| **Node.js** | ✅ | high/critical | `nodejs/security-wg`, severity-rated |
+| **Go** | ✅ | **total** | OSV `stdlib` is version-ranged but carries **no severity** |
+| PHP · Python · Ruby · Rust · Java · .NET | ❌ | — | no unified runtime CVE feed; gate on EOL + the ecosystem auditor |
+
+Under `CVE_POLICY=gate` for a non-gating language, gate on **EOL/support status and dependency advisories**, and present runtime CVEs as advisory. Check `gateCapable` and `gateMetric` in the research output and say which you are enforcing. Never imply a gate you cannot enforce.
 
 `SK=~/.claude/skills/runtime-upgrade` in the examples below.
 
@@ -50,8 +62,10 @@ Emits `{root, shape, target_count, targets[]}`. `shape` is one of `single`, `mon
 ## Phase 2 — RESEARCH
 
 ```bash
-node $SK/scripts/research.mjs node 20.11.1          # target auto-selected
-node $SK/scripts/research.mjs php  8.1  8.4         # explicit target
+node $SK/scripts/research.mjs node   20.11.1        # target auto-selected
+node $SK/scripts/research.mjs php    8.1  8.4       # explicit target
+node $SK/scripts/research.mjs go     1.21           # gates on TOTAL stdlib advisories
+node $SK/scripts/research.mjs python 3.9            # advisory only — gateCapable false
 RU_NVD=1 node $SK/scripts/research.mjs php 8.1      # opt into the NVD CPE lookup (slow, advisory)
 ```
 Returns EOL dates, support/maintenance windows, and — for Node — exact unpatched runtime CVE counts at both current and target, plus `cve_delta`.
@@ -82,8 +96,9 @@ Then apply judgement the scripts cannot:
 - PHP: set `require.php` → Rector will not apply target-version rules until you do
 
 Then follow the per-language playbook:
-- `references/nodejs.md`
-- `references/php.md`
+- `references/nodejs.md` — ABI ladder, N-API, AsyncContextFrame, eslint-plugin-n
+- `references/php.md` — bootstrap, Zend ABI, Rector, `composer prohibits`
+- `references/languages.md` — Go, Python, Ruby, Rust, Java, .NET: discovery paths, ABI model, codemod tool
 
 Rules that hold for both:
 - **One major at a time**, commit between each. Never stack two majors in one diff.
@@ -136,3 +151,4 @@ Reports Node version, platform, which tools are present, **what degrades without
 | `RU_ENGINES=1` | enable the direct-dependency floor pre-flight (network-bound) |
 | `RU_NVD=1` | enable the PHP NVD CPE lookup (advisory only) |
 | `NVD_API_KEY` | raises NVD from 5 to 50 requests per 30s |
+| `RU_JAVA_DISTRO` | which JDK distribution to resolve EOL against (default `amazon-corretto`) — **set this or Java EOL dates will be wrong** |

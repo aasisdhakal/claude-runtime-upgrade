@@ -46,6 +46,16 @@ function satisfiesOne(ver, raw) {
       if (wildPatch) return ver[0] === base[0] && ver[1] === base[1];
       return cmp(ver, base) === 0;
     }
+    // X-ranges: a partial version denotes an INTERVAL, so `>` and `<=` must
+    // bound against the end of that interval, not its start.
+    //   >1.2   -> >=1.3.0        >1     -> >=2.0.0
+    //   <=1.2  -> <1.3.0         <=1    -> <2.0.0
+    //   >=1.2  -> >=1.2.0        <1.2   -> <1.2.0   (start bound, unchanged)
+    const partial = wildMinor || wildPatch;
+    if (partial && (op === '>' || op === '<=')) {
+      const next = wildMinor ? [base[0] + 1, 0, 0] : [base[0], base[1] + 1, 0];
+      return op === '>' ? cmp(ver, next) >= 0 : cmp(ver, next) < 0;
+    }
     const c = cmp(ver, base);
     return op === '>=' ? c >= 0 : op === '<=' ? c <= 0 : op === '>' ? c > 0 : c < 0;
   }

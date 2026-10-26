@@ -7,6 +7,8 @@ import { fetchJson } from '../scripts/lib/io.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
 import { adapters, byId } from '../scripts/adapters/index.mjs';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -101,13 +103,83 @@ t('rangeMajor', () => { eq(rangeMajor('>= 20.x'), '20'); eq(rangeMajor('^18.2.0'
 t('rangeMajorMinor', () => { eq(rangeMajorMinor('^8.1'), '8.1'); eq(rangeMajorMinor('>=7.4.0'), '7.4'); });
 t('compare orders cycles', () => { ok(compare('24', '8.5') > 0, '24>8.5'); ok(compare('8.5', '8.4') > 0, '8.5>8.4'); });
 
+// Differential + fuzz against npm `semver` when it is installed. These are the
+// only tests that can prove the hand-rolled matcher correct rather than merely
+// consistent with my own assumptions. Skipped when `semver` is unavailable.
+// `semver` is a DEV-only aid: the skill itself ships zero dependencies.
+// Try several roots so CI can supply it with `npm i --no-save semver`.
+function loadSemver() {
+  for (const base of [import.meta.url, `file://${process.cwd()}/x.js`,
+                      `file://${join(HERE, 'x.js')}`, `file://${join(HERE, '..', 'x.js')}`]) {
+    try { return createRequire(base)('semver'); } catch {}
+  }
+  return null;
+}
+t('differential vs npm semver on 143 real engines ranges', () => {
+  const semver = loadSemver(); if (!semver) return 'skip';
+  const corpus = JSON.parse(readFileSync(join(HERE, 'engines-corpus.json'), 'utf8'));
+  const versions = ['0.10.48','8.17.0','12.22.12','16.20.2','18.20.8','20.11.1','20.20.2',
+                    '22.12.0','22.23.4','24.0.0','24.22.1','26.12.1'];
+  const bad = [];
+  for (const r of corpus) for (const v of versions) {
+    let want; try { want = semver.satisfies(v, r, { loose: true, includePrerelease: true }); } catch { continue; }
+    if (satisfies(v, r) !== want) bad.push(`${v} vs ${JSON.stringify(r)}`);
+  }
+  ok(bad.length === 0, `${bad.length} mismatches, e.g. ${bad.slice(0, 3).join(' | ')}`);
+});
+t('fuzz vs npm semver — 40k generated comparisons', () => {
+  const semver = loadSemver(); if (!semver) return 'skip';
+  let seed = 1337;                                   // deterministic: failures reproduce
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const pick = a => a[Math.floor(rnd() * a.length)];
+  const num = () => Math.floor(rnd() * 30);
+  const ops = ['', '>=', '<=', '>', '<', '=', '^', '~', '>= ', '<= ', '> ', '< ', '^ ', '~ '];
+  const vv = () => { const n = Math.floor(rnd() * 3);
+    return n === 0 ? `${num()}` : n === 1 ? `${num()}.${pick([num(), 'x', '*'])}`
+                                          : `${num()}.${num()}.${pick([num(), 'x', '*'])}`; };
+  const range = () => Array.from({ length: 1 + Math.floor(rnd() * 3) }, () =>
+    Array.from({ length: 1 + Math.floor(rnd() * 2) }, () => pick(ops) + vv()).join(' ')).join(' || ');
+  const versions = ['0.10.0','8.0.0','12.22.0','16.14.0','18.20.8','20.11.1','22.12.0','24.22.1','26.12.1','30.0.0'];
+  const bad = [];
+  for (let i = 0; i < 4000 && bad.length < 5; i++) {
+    const r = range();
+    for (const v of versions) {
+      let want; try { want = semver.satisfies(v, r, { loose: true }); } catch { continue; }
+      if (satisfies(v, r) !== want) bad.push(`${v} vs ${JSON.stringify(r)}`);
+    }
+  }
+  ok(bad.length === 0, `mismatches: ${bad.join(' | ')}`);
+});
+t('X-range bounds follow npm semantics', () => {
+  // a partial version is an INTERVAL; > and <= bound against its end
+  ok(!satisfies('26.12.1', '> 26.x'), '>26.x excludes all of 26');
+  ok(!satisfies('24.22.1', '> 24'),   '>24 excludes all of 24');
+  ok(satisfies('0.10.0', '<= 0'),     '<=0 includes all of 0.x');
+  ok(satisfies('12.22.0', '<= 12.x'), '<=12.x includes all of 12');
+  ok(satisfies('1.3.0', '>1.2'),      '>1.2 starts at 1.3.0');
+  ok(!satisfies('1.2.9', '>1.2'),     '>1.2 excludes 1.2.9');
+  ok(satisfies('20.11.1', '>=20.x'),  '>=20.x starts at 20.0.0');
+});
+
 // ───────────────────────── adapters ─────────────────────────
 console.log('\nadapters');
-t('registry exposes node and php', () => eq(adapters.map(a => a.id).sort(), ['node', 'php']));
+t('registry exposes all supported languages', () =>
+  eq(adapters.map(a => a.id).sort(), ['dotnet','go','java','node','php','python','ruby','rust']));
 t('node is gate-capable, php is not', () => { ok(byId.node.gateCapable === true, 'node'); ok(byId.php.gateCapable === false, 'php'); });
+t('no two adapters claim the same manifest filename', () => {
+  const seen = new Map();
+  for (const a of adapters) for (const m of a.manifests) {
+    ok(!seen.has(m), `${m} claimed by both ${seen.get(m)} and ${a.id}`);
+    seen.set(m, a.id);
+  }
+});
+t('every adapter has a distinct id and an imageRe', () => {
+  eq(new Set(adapters.map(a => a.id)).size, adapters.length, 'ids unique');
+  for (const a of adapters) ok(a.imageRe instanceof RegExp, `${a.id} imageRe`);
+});
 t('php carries a gate explanation', () => ok((byId.php.gateNote || '').length > 40, 'gateNote must explain why no hard gate'));
 t('every adapter declares required fields', () => {
-  for (const a of adapters) for (const k of ['id','label','manifests','eolProduct','osvEcosystem','gateCapable','cveSource'])
+  for (const a of adapters) for (const k of ['id','label','manifests','eolProduct','osvEcosystem','gateCapable','cveSource','imageRe','scan'])
     ok(a[k] !== undefined, `${a.id} missing ${k}`);
 });
 
@@ -145,6 +217,86 @@ t('shape: no-manifest reports and stops', () => withFixture('no-manifest', r => 
   const d = detect(r); eq(d.shape, 'no-manifest', 'shape'); eq(d.targetCount, 0, 'count');
   ok(/nothing to upgrade/i.test(d.shapeGuidance), 'guidance explains the stop');
 }));
+
+console.log('\ndiscovery — every language');
+const LANGS = [
+  ['single-go',     'go',     '1.21', 'go.sum'],
+  ['single-python', 'python', '3.9',  'poetry.lock'],
+  ['single-ruby',   'ruby',   '3.0',  'Gemfile.lock'],
+  ['single-rust',   'rust',   '1.70', 'Cargo.lock'],
+  ['single-java',   'java',   '17',   ''],
+  ['single-dotnet', 'dotnet', '6',    ''],
+];
+for (const [fx, lang, major, lock] of LANGS) {
+  t(`lang: ${lang} discovered with version ${major}`, () => withFixture(fx, r => {
+    const d = detect(r);
+    const tg = d.targets.find(x => x.lang === lang);
+    ok(tg, `no ${lang} target found; got ${d.targets.map(x => x.lang).join(',') || 'none'}`);
+    eq(tg.declaredMajors, major, `${lang} version`);
+    eq(tg.drift, false, `${lang} must not report drift`);
+    if (lock) eq(tg.lockfile, lock, `${lang} lockfile`);
+  }));
+}
+t('lang: one target per directory per adapter (no pom/gradle double-count)', () => withFixture('single-java', r => {
+  const d = detect(r);
+  eq(d.targets.filter(x => x.lang === 'java').length, 1, 'exactly one java target');
+}));
+t('lang: dotnet prefers global.json over *.csproj but reports both', () => withFixture('single-dotnet', r => {
+  const d = detect(r);
+  const tg = d.targets.find(x => x.lang === 'dotnet');
+  eq(tg.declared.targetFramework, 'net6.0', 'TFM read from csproj');
+  eq(tg.declared.globalJsonSdk, '6.0.418', 'sdk read from global.json');
+}));
+t('lang: polyglot repo surfaces all four runtimes', () => withFixture('polyglot', r => {
+  const d = detect(r);
+  eq([...new Set(d.targets.map(x => x.lang))].sort(), ['go', 'node', 'php', 'python'], 'languages');
+  eq(d.targets.length, 4, 'one target per runtime');
+}));
+
+console.log('\nCI accuracy');
+t('ci: a node target ignores python-version in the same workflow', () => withFixture('ci-cross-language', r => {
+  const d = detect(r);
+  const tg = d.targets.find(x => x.lang === 'node');
+  eq(tg.declaredMajors, '20', 'only the node version counts');
+  eq(tg.drift, false, 'a sibling python pin must not create drift');
+  ok(!/3\.8/.test(tg.declared.ci || ''), 'python version must not leak into the node CI field');
+}));
+t('ci: a test matrix is recorded, not reported as drift', () => withFixture('ci-matrix', r => {
+  const d = detect(r);
+  const tg = d.targets.find(x => x.lang === 'python');
+  eq(tg.drift, false, 'a multi-version CI matrix is deliberate breadth');
+  ok(Array.isArray(tg.ciMatrix) && tg.ciMatrix.length >= 3, 'the matrix is still surfaced');
+  ok(/test matrix/.test(tg.declared.ci || ''), 'labelled as a matrix');
+}));
+t('ci: templated values are ignored', () => withFixture('ci-templated', r => {
+  const d = detect(r);
+  const tg = d.targets.find(x => x.lang === 'node');
+  eq(tg.declaredMajors, '22', 'only the real declaration counts');
+  eq(tg.drift, false, '${{ matrix.node }} must not parse as a version');
+}));
+t('ci: every adapter scopes its own CI key', () => {
+  for (const a of adapters) ok(a.ciKey instanceof RegExp, `${a.id} must declare ciKey`);
+  ok(byId.node.ciKey.test('node-version: 20'), 'node matches node-version');
+  ok(!byId.node.ciKey.test('python-version: 3.8'), 'node must NOT match python-version');
+  ok(byId.python.ciKey.test('python-version: 3.11'), 'python matches python-version');
+  ok(!byId.python.ciKey.test('node-version: 20'), 'python must NOT match node-version');
+});
+
+console.log('\ngate capability — honesty contract');
+t('gate: exactly node and go can gate, and go gates on total', () => {
+  const gating = adapters.filter(a => a.gateCapable).map(a => a.id).sort();
+  eq(gating, ['go', 'node'], 'only runtimes with a curated version-ranged CVE DB may gate');
+  eq(byId.go.gateMetric, 'total', 'go has no severity data, so it gates on total');
+  eq(byId.node.gateMetric ?? 'blocking', 'blocking', 'node gates on high/critical');
+});
+t('gate: every non-gating adapter explains why', () => {
+  for (const a of adapters.filter(x => !x.gateCapable))
+    ok((a.gateNote || '').length > 60, `${a.id} must explain why it cannot gate`);
+});
+t('gate: java eolProduct is a real distribution, not "java"', () => {
+  ok(byId.java.eolAliases.includes(byId.java.eolProduct), 'must be one of the tracked JDK distributions');
+  ok(!byId.java.eolAliases.includes('java'), 'endoflife.date has no bare "java" product');
+});
 
 // ───────────────────────── drift ─────────────────────────
 console.log('\ndrift');

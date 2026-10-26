@@ -5,17 +5,28 @@ import { fetchJson, CACHE_DIR, OFFLINE, emit } from './lib/io.mjs';
 import { adapters } from './adapters/index.mjs';
 
 const TOOLS = [
-  ['node',     'required', 'everything — this skill is Node-native'],
-  ['docker',   'optional', 'image-level verification gates (version, ABI, extensions)'],
-  ['git',      'optional', 'branch creation in write mode'],
-  ['npm',      'node',     'dependency advisories + direct dependency floors'],
-  ['pnpm',     'node',     'advisories for pnpm workspaces'],
-  ['yarn',     'node',     'advisories for yarn projects'],
-  ['php',      'php',      'extension list, Zend module API, thread safety'],
-  ['composer', 'php',      'advisories, `prohibits`, `check-platform-reqs` — the whole PHP assess phase'],
-  ['rector',   'php',      'automated code migration (80-90% of PHP version changes)'],
-  ['phpstan',  'php',      'type-aware compatibility analysis'],
-  ['phpcs',    'php',      'PHPCompatibility sniffs'],
+  ['node',         'required', 'everything — this skill is Node-native'],
+  ['docker',       'optional', 'image-level verification gates (version, ABI, extensions)'],
+  ['git',          'optional', 'branch creation in write mode'],
+  ['npm',          'node',     'dependency advisories + direct dependency floors'],
+  ['pnpm',         'node',     'advisories for pnpm workspaces'],
+  ['yarn',         'node',     'advisories for yarn projects'],
+  ['php',          'php',      'extension list, Zend module API, thread safety'],
+  ['composer',     'php',      'advisories, `prohibits`, `check-platform-reqs` — the whole PHP assess phase'],
+  ['rector',       'php',      'automated code migration (80-90% of PHP version changes)'],
+  ['phpstan',      'php',      'type-aware compatibility analysis'],
+  ['phpcs',        'php',      'PHPCompatibility sniffs'],
+  ['go',           'go',       'toolchain version and CGO inspection'],
+  ['govulncheck',  'go',       'reachability-aware dependency advisories'],
+  ['python3',      'python',   'interpreter version and wheel ABI tags'],
+  ['pip-audit',    'python',   'dependency advisories'],
+  ['ruby',         'ruby',     'interpreter version'],
+  ['bundle',       'ruby',     'bundler-audit dependency advisories'],
+  ['cargo',        'rust',     'cargo-audit dependency advisories'],
+  ['rustc',        'rust',     'toolchain version'],
+  ['java',         'java',     'JDK version and vendor'],
+  ['mvn',          'java',     'dependency tree and update reports'],
+  ['dotnet',       'dotnet',   '`dotnet list package --vulnerable` and SDK resolution'],
 ];
 
 const tools = TOOLS.map(([cmd, scope, why]) => {
@@ -46,11 +57,21 @@ emit({
   offline: OFFLINE,
   tools,
   dataSources: sources,
-  languages: adapters.map(a => ({
-    id: a.id, label: a.label, gateCapable: a.gateCapable,
-    eolProduct: a.eolProduct, osvEcosystem: a.osvEcosystem,
-    ready: a.id === 'node' ? have('node') : have('php') || have('composer'),
-  })),
+  languages: adapters.map(a => {
+    const probe = { node: 'node', php: 'php', go: 'go', python: 'python3',
+                    ruby: 'ruby', rust: 'rustc', java: 'java', dotnet: 'dotnet' }[a.id];
+    return {
+      id: a.id, label: a.label,
+      gateCapable: a.gateCapable,
+      gateMetric: a.gateMetric || (a.gateCapable ? 'blocking' : null),
+      gateNote: a.gateCapable ? null : a.gateNote,
+      eolProduct: a.eolProduct, osvEcosystem: a.osvEcosystem,
+      runtimeInstalled: probe ? have(probe) : false,
+      // discovery and EOL/CVE research work without the runtime installed;
+      // only local inspection (extensions, ABI stamps) needs it
+      discoverable: true,
+    };
+  }),
   nvdApiKey: process.env.NVD_API_KEY ? 'set' : 'not set — PHP NVD lookups limited to 5 requests/30s',
   missingRequired: tools.filter(t => t.scope === 'required' && !t.present).map(t => t.tool),
 });

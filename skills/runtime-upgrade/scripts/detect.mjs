@@ -3,7 +3,7 @@
 // No find(1), no jq, no python3, no mapfile, no paste. Runs on macOS, Linux, WSL.
 // usage: node detect.mjs [root]
 import { walk, readText, readJson, existsSync, join, resolve, rel, emit, die, readdirSync } from './lib/io.mjs';
-import { adapters, allManifests, adapterForManifest } from './adapters/index.mjs';
+import { adapters, matchesManifest, adapterForManifest } from './adapters/index.mjs';
 
 const ROOT = resolve(process.argv[2] || '.');
 if (!existsSync(ROOT)) die(`no such directory: ${ROOT}`);
@@ -13,7 +13,6 @@ const CI_GLOBS = [
   'Jenkinsfile', '.circleci/config.yml', 'buildspec.yml', 'buildspec.yaml',
   'buildspec-dev.yaml', 'buildspec-prod.yaml', 'staging-buildspec.yaml',
 ];
-const CI_RE = /(?:node|php)[-_]?version:?\s*["']?([0-9][0-9.xX]*)|image:\s*((?:node|php|bun|deno):[0-9][^\s"']*)/gi;
 const FROM_RE = /^[ \t]*FROM[ \t]+(?:--\S+[ \t]+)*(\S+)/gim;
 
 /** Every runtime image referenced by any FROM line, normalised to name:tag. */
@@ -29,14 +28,26 @@ function dockerImages(dir) {
       const img = m[1];
       // strip registry/namespace: public.ecr.aws/docker/library/node:20 -> node:20
       const short = img.split('/').pop();
-      if (/^(node|php|bun|deno|composer)[:@]/i.test(short)) out.push(short);
+      if (/^(node|php|python|pypy|ruby|jruby|golang|go|rust|eclipse-temurin|amazoncorretto|openjdk|ibm-semeru|graalvm|sapmachine|bun|deno|composer)[:@]/i.test(short)) out.push(short);
+      // mcr.microsoft.com/dotnet/sdk:8.0 — the useful part is two segments deep
+      else if (/dotnet\/(sdk|runtime|aspnet)[:@]/i.test(img)) out.push(img.split('/').slice(-2).join('/'));
     }
   }
   return [...new Set(out)];
 }
 
-function ciText(dir) {
-  const found = [];
+/**
+ * CI version declarations, scoped to ONE adapter.
+ * Reading every `*-version:` key and attributing it to whichever adapter is
+ * scanning the directory makes a Node project inherit a `python-version` from
+ * the same workflow file. Each adapter supplies its own key pattern.
+ *
+ * Returns { text, versions[] }. More than one distinct version means a TEST
+ * MATRIX, which is deliberate and must not be reported as drift.
+ */
+function ciInfo(dir, adapter) {
+  const versions = [];
+  const keyRe = adapter.ciKey;
   for (const g of CI_GLOBS) {
     const p = join(dir, g);
     if (!existsSync(p)) continue;
@@ -45,14 +56,28 @@ function ciText(dir) {
     for (const f of files) {
       const t = readText(f);
       if (!t) continue;
-      for (const m of t.matchAll(CI_RE)) found.push(m[1] || m[2]);
+      for (const line of t.split('\n')) {
+        // skip templated values: `python-version: ${{ matrix.python }}`
+        if (/\$\{\{/.test(line)) continue;
+        if (keyRe && keyRe.test(line)) {
+          const m = line.match(/:\s*["']?([0-9][0-9.xX]*)/);
+          if (m) versions.push(m[1]);
+        }
+        const im = line.match(/image:\s*["']?(\S+)/);
+        if (im) {
+          const short = im[1].split('/').pop();
+          const re = new RegExp(adapter.imageRe.source, 'i');
+          if (re.test(short)) { const v = short.match(/[:@]v?([0-9][^\s"']*)/); if (v) versions.push(v[1]); }
+        }
+      }
     }
   }
-  return [...new Set(found)].slice(0, 4).join(' | ');
+  const uniq = [...new Set(versions)];
+  return { text: uniq.slice(0, 4).join(' | '), versions: uniq, matrix: uniq.length > 1 };
 }
 
 // ---------- locate manifests + dockerfiles ----------
-const manifestPaths = walk(ROOT, { match: n => allManifests.has(n) });
+const manifestPaths = walk(ROOT, { match: matchesManifest });
 const dockerPaths = walk(ROOT, { match: n => n === 'Dockerfile' || n.startsWith('Dockerfile.') });
 
 // ---------- classify repo shape ----------
@@ -88,10 +113,16 @@ for (const p of manifestPaths) {
   const adapter = adapterForManifest(filename);
   if (!adapter) continue;
   const dir = p.slice(0, -(filename.length + 1)) || ROOT;
+  // one target per (dir, adapter): Java has pom.xml AND build.gradle,
+  // .NET has global.json AND *.csproj, Python has several manifests
+  if (seenDirs.has(dir + '::' + adapter.id)) continue;
   const imgs = dockerImages(dir);
-  const ci = ciText(dir);
+  const ci = ciInfo(dir, adapter);
   try {
-    targets.push(adapter.scan({ dir, root: ROOT, dockerImages: imgs, ciText: ci }));
+    const tgt = adapter.scan({ dir, root: ROOT, dockerImages: imgs, ciText: ci.matrix ? '' : ci.text });
+    // a CI test matrix is intentional breadth, not disagreement
+    if (ci.matrix) { tgt.ciMatrix = ci.versions; tgt.declared.ci = ci.text + '  (test matrix)'; }
+    targets.push(tgt);
     seenDirs.add(dir + '::' + adapter.id);
   } catch (e) {
     targets.push({ lang: adapter.id, dir: rel(ROOT, dir), error: String(e.message || e) });
@@ -110,7 +141,7 @@ for (const df of dockerPaths) {
     const majors = [...new Set(mine.map(s => (s.match(/[:@]v?(\d+)/) || [])[1]).filter(Boolean))];
     targets.push({
       lang: a.id, name: dir.split('/').pop(), dir: rel(ROOT, dir), manifest: '',
-      declared: { dockerfile: mine.join(' | '), ci: ciText(dir) },
+      declared: { dockerfile: mine.join(' | '), ci: ciInfo(dir, a).text },
       lockfile: '', declaredMajors: majors.join(','), drift: majors.length > 1,
       deps: 0, devDeps: 0, containerOnly: true,
     });

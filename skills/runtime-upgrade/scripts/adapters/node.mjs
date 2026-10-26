@@ -12,6 +12,7 @@ export const cveSource = {
   url: 'https://raw.githubusercontent.com/nodejs/security-wg/main/vuln/core/index.json',
   note: 'nodejs/security-wg — curated, semver-ranged, authoritative',
 };
+export const ciKey = /\b(?:node|nodejs)[-_]?version/i;
 export const imageRe = /\b(node|bun|deno)[:@]([^\s"']+)/gi;
 
 export function matchRuntimeCve(db, version) {

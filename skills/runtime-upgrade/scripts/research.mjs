@@ -12,7 +12,9 @@ if (!A) die(`unsupported language: ${langArg}. known: ${Object.keys(byId).join('
 
 const today = new Date().toISOString().slice(0, 10);
 const isNode = A.id === 'node';
-const majorOf = isNode ? rangeMajor : rangeMajorMinor;
+// Node/Java/.NET use integer majors; the rest use MAJOR.MINOR cycles
+const intMajor = ['node', 'java', 'dotnet'].includes(A.id);
+const majorOf = intMajor ? rangeMajor : rangeMajorMinor;
 const curMajor = majorOf(current);
 
 // ---------- EOL: endoflife.date, identical shape for all 485 products ----------
@@ -39,23 +41,33 @@ const tgtMajor = majorOf(target);
 const cur = find(curMajor), tgt = find(tgtMajor);
 
 // ---------- runtime CVEs ----------
+// Three shapes exist. Only the first two can gate:
+//   static-db  node  -> nodejs/security-wg, severity-rated, gate on high/critical
+//   osv        go    -> OSV `stdlib`, version-ranged but NO severity, gate on total
+//   none       rest  -> advisory only; the adapter says why in gateNote
 let currentCve = { total: 0, counts: {}, blocking: 0, cves: [], source: A.cveSource.note };
 let targetCve = { ...currentCve, cves: [] };
 let cveError = null;
+const gateMetric = A.gateMetric || (A.gateCapable ? 'blocking' : null);
 
-if (A.gateCapable && A.matchRuntimeCve) {
+if (A.matchRuntimeCve && A.cveSource.url) {                 // static database (node)
   const db = await fetchJson(A.cveSource.url);
-  if (!db.data) {
-    cveError = db.error || 'CVE database unavailable';
-  } else {
+  if (!db.data) cveError = db.error || 'CVE database unavailable';
+  else {
     const probe = /\d+\.\d+\.\d+/.test(current) ? current : (cur.latest || current);
     currentCve = summarise(A.matchRuntimeCve(db.data, probe), probe);
     if (target) targetCve = summarise(A.matchRuntimeCve(db.data, target), target);
     if (db.stale) cveError = 'using stale cached CVE database: ' + (db.error || '');
   }
-} else {
+} else if (typeof A.runtimeCves === 'function') {           // OSV-backed (go)
+  const probe = /\d+\.\d+/.test(current) ? (cur.latest || current) : current;
+  const a = await A.runtimeCves(probe);
+  currentCve = summarise(a.hits, probe);
+  if (target) { const b = await A.runtimeCves(target); targetCve = summarise(b.hits, target); }
+  if (a.error) cveError = a.error;
+} else {                                                    // no curated source
   cveError = A.gateNote || 'no curated runtime CVE database for this runtime';
-  if (process.env.RU_NVD === '1' && !OFFLINE) {
+  if (A.id === 'php' && process.env.RU_NVD === '1' && !OFFLINE) {
     const v = cur.latest || current;
     const key = process.env.NVD_API_KEY;
     const r = await fetchJson(
@@ -114,9 +126,13 @@ emit({
   cveDelta: {
     blockingRemoved: (currentCve.blocking || 0) - (targetCve.blocking || 0),
     totalRemoved: (currentCve.total || 0) - (targetCve.total || 0),
+    gateMetric,
+    gateValueCurrent: gateMetric ? (gateMetric === 'total' ? currentCve.total : currentCve.blocking) : null,
+    gateValueTarget: gateMetric ? (gateMetric === 'total' ? targetCve.total : targetCve.blocking) : null,
   },
   runtimeCveSource: A.cveSource.note,
   gateCapable: A.gateCapable,
-  gateNote: A.gateCapable ? null : A.gateNote,
+  gateMetric,
+  gateNote: A.gateNote || null,
   warnings: [cveError, eolRes.stale ? 'EOL data served from stale cache' : null].filter(Boolean),
 });
