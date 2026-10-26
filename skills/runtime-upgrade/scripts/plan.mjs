@@ -19,7 +19,26 @@ const argv = process.argv.slice(2);
 const flag = n => { const i = argv.indexOf('--' + n); return i >= 0 ? argv[i + 1] : null; };
 const DIR = resolve(argv.find(a => !a.startsWith('--')) || '.');
 if (!existsSync(DIR)) die(`no such directory: ${DIR}`);
-const WANT_TARGET = flag('target');
+/**
+ * --target names ONE version, but a repo can hold several runtimes. Handing a
+ * Kotlin version to a Java target produced "java 8 -> 2.4.0" and a cycle count
+ * of 0. A target applies only to the language it belongs to; every other
+ * language resolves its own.
+ *
+ * Accepts either `--target 24.22.1` (single language) or
+ * `--target node=24.22.1,java=25` (explicit per language).
+ */
+const RAW_TARGET = flag('target');
+const TARGET_BY_LANG = {};
+let SINGLE_TARGET = null;
+if (RAW_TARGET) {
+  if (RAW_TARGET.includes('=')) {
+    for (const pair of RAW_TARGET.split(',')) {
+      const [l, v] = pair.split('=').map(x => x.trim());
+      if (l && v) TARGET_BY_LANG[l] = v;
+    }
+  } else SINGLE_TARGET = RAW_TARGET;
+}
 const WANT_LANG = flag('lang');
 const POLICY = flag('policy') === 'report' ? 'report' : 'gate';
 const FORMAT = flag('format') === 'md' ? 'md' : 'json';
@@ -45,6 +64,14 @@ if (ONLY) targets = targets.filter(t => ONLY.some(o => t.dir.includes(o) || (t.n
 const undeclared = targets.filter(t => !t.declaredMajors);
 targets = targets.filter(t => t.declaredMajors);
 
+const langsInScope = [...new Set(targets.map(t => t.lang))];
+if (SINGLE_TARGET && langsInScope.length > 1 && !WANT_LANG) {
+  process.stderr.write(
+    `note: --target ${SINGLE_TARGET} applies to one language, but ${langsInScope.length} were found `
+    + `(${langsInScope.join(', ')}). Each resolves its own target. Use --lang <l>, or `
+    + `--target ${langsInScope.map(l => l + '=<version>').join(',')} to be explicit.\n`);
+}
+
 const plans = [];
 for (const t of targets) {
   const A = byId[t.lang];
@@ -53,10 +80,13 @@ for (const t of targets) {
   const current = pickCurrent(t);
 
   // ── research ──
+  // only pass a target that belongs to THIS language
+  const explicit = TARGET_BY_LANG[t.lang]
+    || (SINGLE_TARGET && (WANT_LANG === t.lang || langsInScope.length === 1) ? SINGLE_TARGET : null);
   const res = runJson(process.execPath,
-    [S('research.mjs'), t.lang, current, ...(WANT_TARGET ? [WANT_TARGET] : [])]);
+    [S('research.mjs'), t.lang, current, ...(explicit ? [explicit] : [])]);
   const r = res.data;
-  const target = r?.target?.version || WANT_TARGET || null;
+  const target = r?.target?.version || explicit || null;
   if (!target) { plans.push({ dir: t.dir, lang: t.lang, error: 'could not resolve a target version' }); continue; }
 
   // ── assess ──
@@ -316,6 +346,8 @@ function risk({ t, blockers, behaviour, a, advBlocking, crossed, edition, lang, 
 // ───────────── sequencing across targets ─────────────
 const ordered = [...plans].filter(p => !p.error).sort((a, b) =>
   (a.estimatePoints - b.estimatePoints) || (a.blockers.length - b.blockers.length));
+// the repo ROOT is the headline target; a sub-package must not outrank it
+plans.sort((a, b) => (a.dir === '.' ? -1 : 0) - (b.dir === '.' ? -1 : 0));
 const sequencing = ordered.length > 1 ? {
   order: ordered.map(p => p.dir),
   pilot: ordered[0]?.dir,

@@ -5,8 +5,20 @@ import { join, existsSync, readText, readdirSync } from './io.mjs';
 
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/**
+ * Old distro variants that cannot host a current runtime. Node 24+ musl builds
+ * require Alpine >= 3.20; Debian buster/stretch are long EOL.
+ */
+const SUFFIX_MAP = {
+  '-alpine3.17': '-alpine3.22', '-alpine3.18': '-alpine3.22',
+  '-alpine3.19': '-alpine3.22', '-alpine3.20': '-alpine3.22',
+  '-buster': '-bookworm', '-stretch': '-bookworm', '-bullseye': '-bookworm',
+  '-buster-slim': '-bookworm-slim', '-bullseye-slim': '-bookworm-slim',
+};
+export const mapSuffix = sfx => SUFFIX_MAP[sfx] ?? sfx;
+
 /** Replace the version inside a Docker FROM line, preserving registry + suffix. */
-function dockerRewrite(text, imageNames, target, suffixMap = {}) {
+function dockerRewrite(text, imageNames, target, suffixMap = SUFFIX_MAP) {
   const re = new RegExp(`(^[ \\t]*FROM[ \\t]+(?:--\\S+[ \\t]+)*\\S*?(?:${imageNames.join('|')})[:@])([^\\s]+)`, 'gim');
   return text.replace(re, (m, head, tag) => {
     // keep the variant suffix: 20.11.1-alpine3.19 -> 24.22.1-alpine3.22
@@ -71,11 +83,13 @@ export function planCiEdits(lang, dir, target) {
     after = after.replace(
       new RegExp(`(^\\s*${key}[-_]?version\\s*:\\s*["']?)(?!\\$\\{\\{)([0-9][0-9.xX]*)(["']?)`, 'gmi'),
       (m, head, _v, tail) => head + target + tail);
-    // container images
+    // container images — the variant suffix must move too. Node 24 needs
+    // glibc >=2.28, and its musl builds need Alpine >=3.20, so leaving
+    // "-alpine3.19" behind produces a CI image that cannot run the runtime.
     for (const img of images) {
       after = after.replace(
         new RegExp(`((?:image|container)\\s*:\\s*["']?\\S*?${img.replace('/', '\\/')}[:@])([^\\s"']+)`, 'gi'),
-        (m, head, tag) => head + target + tag.replace(/^v?[\d.]+/, ''));
+        (m, head, tag) => head + target + mapSuffix(tag.replace(/^v?[\d.]+/, '')));
     }
     if (after !== before) edits.push({ file: f.slice(dir.length + 1), path: f, rule: 'CI runtime version', before, after });
   }
@@ -145,7 +159,7 @@ export const PIN_RULES = {
     { file: '.node-version', rule: '.node-version', edit: () => `${target}\n` },
     { file: '.tool-versions', rule: '.tool-versions', edit: t => t.replace(/^nodejs\s+\S+/mi, `nodejs ${target}`) },
     { file: 'Dockerfile', rule: 'Dockerfile FROM',
-      edit: t => dockerRewrite(t, ['node'], target, { '-alpine3.19': '-alpine3.22', '-alpine3.20': '-alpine3.22' }) },
+      edit: t => dockerRewrite(t, ['node'], target, SUFFIX_MAP) },
   ],
   php: (target) => [
     { file: 'composer.json', rule: 'require.php',

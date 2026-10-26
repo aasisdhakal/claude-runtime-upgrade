@@ -10,10 +10,10 @@ import { RULES, rulesFor, inheritedCatalogue } from '../scripts/lib/breaking.mjs
 import { adapters, byId, adaptersForManifest } from '../scripts/adapters/index.mjs';
 import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
 import { PIN_RULES, planPinEdits, unified, planCiEdits, planConfigEdits, ciMatrixAdvice,
-         planAddPin, ADD_PIN_RULES } from '../scripts/lib/edits.mjs';
+         planAddPin, ADD_PIN_RULES, mapSuffix } from '../scripts/lib/edits.mjs';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -57,9 +57,18 @@ function detect(root) {
   if (!r.data) throw new Error('detect.mjs produced no JSON: ' + (r.stderr || r.parseError || '').slice(0, 300));
   return r.data;
 }
-const withFixture = (name, fn) => { const r = build(name); try { return fn(r); } finally { destroy(r); } };
+function withFixture(name, fn) { const r = build(name); try { return fn(r); } finally { destroy(r); } }
 
 // ───────────────────────── semver ─────────────────────────
+t('meta: test runners are hoisted function declarations', () => {
+  // a `const` arrow does not hoist, so a test written above its runner fails
+  // with a confusing TDZ error. This has happened three times.
+  const src = readFileSync(join(HERE, 'run.mjs'), 'utf8');
+  const bad = [...src.matchAll(/^const (plan|scan|guard|guardRaw|pr|remediate|withFixture)\s*=/gm)]
+    .map(m => m[1]);
+  ok(bad.length === 0, `these runners must be function declarations: ${bad.join(', ')}`);
+});
+
 console.log('\nsemver');
 t('caret range', () => { ok(satisfies('22.23.5', '^22.23.2'), 'in'); ok(!satisfies('23.0.0', '^22.23.2'), 'out'); });
 t('x-range major', () => { ok(satisfies('24.9.1', '24.x'), 'in'); ok(!satisfies('25.0.0', '24.x'), 'out'); });
@@ -481,8 +490,8 @@ function gitRepo(fn) {
     return fn(r);
   } finally { rmSync(r, { recursive: true, force: true }); }
 }
-const guard = (...a) => runJson(process.execPath, [S('guard.mjs'), ...a]);
-const guardRaw = (...a) => run(process.execPath, [S('guard.mjs'), ...a]);
+function guard(...a) { return runJson(process.execPath, [S('guard.mjs'), ...a]); }
+function guardRaw(...a) { return run(process.execPath, [S('guard.mjs'), ...a]); }
 
 t('guard: refuses to commit on a protected branch', () => gitRepo(r => {
   const v = guardRaw('commit', r, '-m', 'sneaky');
@@ -599,7 +608,7 @@ t('guard: refuses on a non-git directory', () => {
 
 // ───────────────────────── remediation ─────────────────────────
 console.log('\nremediation');
-const remediate = (...a) => runJson(process.execPath, [S('remediate.mjs'), ...a]);
+function remediate(...a) { return runJson(process.execPath, [S('remediate.mjs'), ...a]); }
 
 t('remediate: dry-run writes nothing', () => withFixture('single-node', r => {
   const before = readFileSync(join(r, 'package.json'), 'utf8');
@@ -677,7 +686,7 @@ t('remediate: unified diff round-trips', () => {
 
 // ───────────────────────── source scanning ─────────────────────────
 console.log('\nsource breaking-change scan');
-const scan = (...a) => runJson(process.execPath, [S('scan.mjs'), ...a]);
+function scan(...a) { return runJson(process.execPath, [S('scan.mjs'), ...a]); }
 
 t('scan: finds the severity classes inside the window', () => withFixture('breaking-src', r => {
   const v = scan('node', r, '20.11.1', '26.12.1');
@@ -826,7 +835,7 @@ t('rules: each new language catalogue actually matches its own syntax', () => {
 
 // ───────────── pull requests ─────────────
 console.log('\npull requests — user picks the tool');
-const pr = (...a) => runJson(process.execPath, [S('pr.mjs'), ...a]);
+function pr(...a) { return runJson(process.execPath, [S('pr.mjs'), ...a]); }
 t('pr: detect lists every tool and never decides', () => gitRepo(r => {
   const v = pr('detect', r);
   ok(v.data, 'produced JSON');
@@ -1003,7 +1012,7 @@ t('addpin: every language can add a pin', () => {
 
 // ───────────────────────── the plan ─────────────────────────
 console.log('\nplan synthesis');
-const plan = (...a) => runJson(process.execPath, [S('plan.mjs'), ...a]);
+function plan(...a) { return runJson(process.execPath, [S('plan.mjs'), ...a]); }
 
 t('plan: emits ordered steps with exit conditions', () => withFixture('breaking-src', r => {
   const v = plan(r, '--target', '26.12.1', '--policy', 'gate');
@@ -1049,6 +1058,70 @@ t('plan: markdown renders without placeholders', () => withFixture('breaking-src
   ok(!/undefined|\$SK|\[object Object\]/.test(v.stdout), 'no unexpanded placeholders');
   ok(/### Rollback/.test(v.stdout) && /### Test strategy/.test(v.stdout), 'carries every section');
 }));
+
+
+// ───────── multi-language and container-variant correctness ─────────
+console.log('\nmulti-language targets');
+t('multilang: an ambiguous target is applied to NO language', () => withFixture('polyglot', r => {
+  // handing a Kotlin version to a Java target produced "java 8 -> 2.4.0".
+  // With several languages and one bare --target, the safe reading is that it
+  // belongs to none of them: each resolves its own.
+  const v = plan(r, '--target', '24.22.1');
+  ok(v.data, 'produced JSON');
+  for (const p of v.data.plans)
+    ok(p.target !== '24.22.1' || p.lang === 'node',
+       `${p.lang} must not inherit another language's target (got ${p.target})`);
+  const go = v.data.plans.find(p => p.lang === 'go');
+  ok(go && /^1\./.test(go.target), `go resolved its own target: ${go?.target}`);
+}));
+t('multilang: --target applies when the language is unambiguous', () => withFixture('polyglot', r => {
+  const v = plan(r, '--lang', 'node', '--target', '24.22.1');
+  const node = v.data.plans.find(p => p.lang === 'node');
+  eq(node.target, '24.22.1', 'one language in scope: the target applies');
+}));
+t('multilang: per-language targets can be given explicitly', () => withFixture('polyglot', r => {
+  const v = plan(r, '--target', 'node=24.22.1,go=1.24.0');
+  eq(v.data.plans.find(p => p.lang === 'node').target, '24.22.1', 'node');
+  eq(v.data.plans.find(p => p.lang === 'go').target, '1.24.0', 'go');
+  const php = v.data.plans.find(p => p.lang === 'php');
+  ok(php && php.target !== '24.22.1' && php.target !== '1.24.0', 'php resolves its own');
+}));
+t('multilang: the repo root is the headline target', () => withFixture('mixed-single', r => {
+  // mixed-single has BOTH node and php at the root
+  const v = plan(r);
+  const dirs = v.data.plans.map(p => p.dir);
+  eq(dirs[0], '.', `root must sort first, got ${dirs.join(',')}`);
+}));
+t('multilang: an ambiguous single target is flagged, not silently applied', () => withFixture('polyglot', r => {
+  const v = run(process.execPath, [S('plan.mjs'), r, '--target', '24.22.1']);
+  ok(/applies to one language/.test(v.stderr), 'the ambiguity is reported on stderr');
+}));
+
+console.log('\ncontainer variant suffixes');
+t('suffix: an Alpine too old for the runtime is moved forward', () => {
+  // Node 24 musl builds need Alpine >= 3.20; leaving -alpine3.19 yields an
+  // image that cannot run the runtime it claims to pin
+  eq(mapSuffix('-alpine3.19'), '-alpine3.22');
+  eq(mapSuffix('-alpine3.20'), '-alpine3.22');
+  eq(mapSuffix('-bullseye'), '-bookworm');
+  eq(mapSuffix('-alpine3.22'), '-alpine3.22', 'a current variant is left alone');
+  eq(mapSuffix('-slim'), '-slim', 'an unknown variant is preserved verbatim');
+});
+t('suffix: CI container images get the same mapping as Dockerfiles', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-sfx-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x"}');
+    mkdirSync(join(r, '.github', 'workflows'), { recursive: true });
+    writeFileSync(join(r, '.github/workflows/ci.yml'),
+      'jobs:\n  b:\n    container:\n      image: node:20.11.1-alpine3.19\n');
+    writeFileSync(join(r, 'Dockerfile'), 'FROM node:20.11.1-alpine3.19\n');
+    const ci = planCiEdits('node', r, '24.22.1');
+    const df = PIN_RULES.node('24.22.1').find(x => x.file === 'Dockerfile')
+      .edit('FROM node:20.11.1-alpine3.19\n');
+    ok(/alpine3\.22/.test(ci[0].after), `CI: ${ci[0].after.trim()}`);
+    ok(/alpine3\.22/.test(df), `Dockerfile: ${df.trim()}`);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
 
 // ───────────────────────── doctor ─────────────────────────
 console.log('\ndoctor');
