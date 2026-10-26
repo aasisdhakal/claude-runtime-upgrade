@@ -6,9 +6,11 @@ import { runJson, run } from '../scripts/lib/sh.mjs';
 import { fetchJson } from '../scripts/lib/io.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
 import { adapters, byId } from '../scripts/adapters/index.mjs';
+import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -383,6 +385,125 @@ t('drift is caught as a failing gate', () => withFixture('drift', r => {
   const g = v.data.gates.find(x => x.name === 'version drift');
   eq(g.status, 'fail', 'drift must fail its gate');
 }));
+
+console.log('\nframework awareness');
+t('fw: tracked frameworks are detected per ecosystem', () => withFixture('frameworks', r => {
+  const d = detect(r);
+  const node = d.targets.find(t => t.lang === 'node');
+  const php = d.targets.find(t => t.lang === 'php');
+  const prods = (node.frameworks || []).map(f => f.product).sort();
+  eq(prods, ['nextjs', 'react'], 'node frameworks');
+  eq((php.frameworks || []).map(f => f.product), ['laravel'], 'php framework');
+}));
+t('fw: untracked frameworks are named, never guessed at', () => withFixture('frameworks', r => {
+  const d = detect(r);
+  const node = d.targets.find(t => t.lang === 'node');
+  const labels = (node.frameworksUntracked || []).map(f => f.label);
+  ok(labels.includes('NestJS'), 'NestJS has no endoflife.date feed and must be listed as untracked');
+  ok(!(node.frameworks || []).some(f => /nest/i.test(f.product)), 'and must NOT appear as tracked');
+}));
+t('fw: map never points two deps at a product that is not tracked upstream', () => {
+  const products = new Set(Object.values(FRAMEWORK_MAP).flatMap(m => Object.values(m)));
+  for (const p of products) ok(/^[a-z0-9-]+$/.test(p), `${p} must be an endoflife.date slug`);
+  const untracked = new Set(Object.keys(UNTRACKED));
+  for (const m of Object.values(FRAMEWORK_MAP))
+    for (const dep of Object.keys(m)) ok(!untracked.has(dep), `${dep} cannot be both tracked and untracked`);
+});
+await ta('fw: resolves EOL status for a known-dead framework', async () => {
+  const res = await frameworkEol([{ dep: 'laravel/framework', product: 'laravel', declared: '^7.0' }]);
+  if (res[0].error) return 'skip';
+  eq(res[0].cycle, '7', 'cycle');
+  eq(res[0].isEol, true, 'Laravel 7 is long EOL');
+  ok(res[0].newestSupported && Number(res[0].newestSupported.cycle) > 7, 'a supported successor is named');
+});
+
+// ───────────────────────── write-mode guardrails ─────────────────────────
+console.log('\nwrite-mode guardrails');
+function gitRepo(fn) {
+  const r = mkdtempSync(join(tmpdir(), 'ru-guard-'));
+  try {
+    run('git', ['init', '-q'], { cwd: r });
+    run('git', ['config', 'user.email', 't@t'], { cwd: r });
+    run('git', ['config', 'user.name', 'T'], { cwd: r });
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=20"}}');
+    writeFileSync(join(r, 'package-lock.json'), '{"lockfileVersion":3}');
+    run('git', ['add', '-A'], { cwd: r });
+    run('git', ['commit', '-qm', 'init'], { cwd: r });
+    return fn(r);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+}
+const guard = (...a) => runJson(process.execPath, [S('guard.mjs'), ...a]);
+const guardRaw = (...a) => run(process.execPath, [S('guard.mjs'), ...a]);
+
+t('guard: refuses to commit on a protected branch', () => gitRepo(r => {
+  const v = guardRaw('commit', r, '-m', 'sneaky');
+  ok(v.status !== 0, 'must exit non-zero');
+  ok(/protected branch/.test(v.stderr + v.stdout), 'must say why');
+}));
+t('guard: preflight blocks on main and exits 1', () => gitRepo(r => {
+  const v = guardRaw('preflight', r);
+  eq(v.status, 1, 'exit code');
+  const j = JSON.parse(v.stdout);
+  eq(j.verdict, 'blocked');
+  ok(j.checks.some(c => !c.ok && /protected/.test(c.rule)), 'names the protected-branch rule');
+}));
+t('guard: creates a runtime/* branch and then permits writes', () => gitRepo(r => {
+  const b = guard('branch', r, 'node', '24.22.1');
+  eq(b.data.branch, 'runtime/node-24.22.1');
+  eq(b.data.created, true);
+  const p = guard('preflight', r);
+  eq(p.data.verdict, 'safe-to-write', 'clean runtime branch is writable');
+}));
+t('guard: refuses a manifest change without its lockfile', () => gitRepo(r => {
+  guard('branch', r, 'node', '24.22.1');
+  writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=24.22.1 <25"}}');
+  const v = guard('commit', r, '-m', 'bump');
+  eq(v.data.verdict, 'refused');
+  ok(v.data.blocked.some(b => /without its lockfile/.test(b)), 'names the pairing rule');
+  const staged = run('git', ['diff', '--cached', '--name-only'], { cwd: r }).stdout.trim();
+  eq(staged, '', 'index must be reset after a refusal');
+}));
+t('guard: commits when manifest and lockfile move together', () => gitRepo(r => {
+  guard('branch', r, 'node', '24.22.1');
+  writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=24.22.1 <25"}}');
+  writeFileSync(join(r, 'package-lock.json'), '{"lockfileVersion":3,"u":1}');
+  const v = guard('commit', r, '-m', 'bump engines', '--phase', 'runtime');
+  eq(v.data.verdict, 'committed');
+  ok(v.data.files.includes('package.json') && v.data.files.includes('package-lock.json'), 'both files');
+}));
+t('guard: blocks secrets before they reach a commit', () => gitRepo(r => {
+  guard('branch', r, 'node', '24.22.1');
+  writeFileSync(join(r, 'cfg.js'), 'const k = "AKIAIOSFODNN7EXAMPLE";\nconst t = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";\n');
+  writeFileSync(join(r, 'id_rsa'), '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\n-----END RSA PRIVATE KEY-----\n');
+  const v = guard('commit', r, '-m', 'add config');
+  eq(v.data.verdict, 'refused');
+  ok(v.data.blocked.some(b => /AWS access key/.test(b)), 'AWS key');
+  ok(v.data.blocked.some(b => /GitHub personal access token/.test(b)), 'GitHub token');
+  ok(v.data.blocked.some(b => /private key block/.test(b)), 'private key');
+  const n = run('git', ['log', '--oneline'], { cwd: r }).stdout.trim().split('\n').length;
+  eq(n, 1, 'no commit was created');
+}));
+t('guard: refuses to branch from a dirty tree', () => gitRepo(r => {
+  writeFileSync(join(r, 'package.json'), '{"name":"dirty"}');
+  const v = guardRaw('branch', r, 'node', '24.22.1');
+  ok(v.status !== 0, 'must refuse');
+  ok(/dirty/.test(v.stderr + v.stdout), 'must say why');
+}));
+t('guard: never contains a push or force code path', () => {
+  const src = readFileSync(S('guard.mjs'), 'utf8');
+  const code = src.split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+  ok(!/['"]push['"]/.test(code), 'no push argument anywhere');
+  ok(!/--force|forceWithLease/.test(code), 'no force flag anywhere');
+  ok(!/remote/.test(code), 'no remote manipulation');
+});
+t('guard: refuses on a non-git directory', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-nogit-'));
+  try {
+    const v = guardRaw('preflight', r);
+    ok(v.status !== 0, 'must refuse');
+    ok(/not a git repository/.test(v.stderr), 'must say why');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
 
 // ───────────────────────── doctor ─────────────────────────
 console.log('\ndoctor');

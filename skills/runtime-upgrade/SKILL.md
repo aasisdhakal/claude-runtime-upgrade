@@ -1,6 +1,6 @@
 ---
 name: runtime-upgrade
-description: Upgrade a language runtime (Node.js or PHP) across any repo shape — single, monorepo, polyrepo, mixed-language, or container-only. Covers discovery, EOL/CVE research, blocker assessment, code upgrade, and the test/rollout workflow. Use when asked to upgrade, bump, or modernise a Node or PHP version, to check what runtime a project is on, to audit runtime EOL/CVE exposure, or to plan a version migration.
+description: Upgrade a language runtime — Node.js, PHP, Go, Python, Ruby, Rust, Java or .NET — across any repo shape (single, monorepo, polyrepo, mixed-language, container-only). Covers discovery, EOL and CVE research, framework EOL, blocker assessment, guarded code changes, and verification gates. Use when asked to upgrade, bump or modernise a language/runtime version, to check what runtime a project is on, to audit runtime or framework EOL/CVE exposure, or to plan a version migration.
 ---
 
 # Runtime upgrade (Node.js · PHP · Go · Python · Ruby · Rust · Java · .NET)
@@ -38,6 +38,19 @@ Carry the answer as `CVE_POLICY=gate|report` through every later phase.
 - **Plan and write** — apply changes. Then: work on a branch (`git switch -c runtime/<lang>-<target>`), commit per phase, never commit a lockfile without its manifest.
 
 Carry as `MODE=plan|write`. Under `plan`, every phase is read-only — emit diffs with `diff -u`, never apply them.
+
+**Under `write`, route every change through `guard.mjs`. Do not run `git` yourself.**
+```bash
+node $SK/scripts/guard.mjs preflight <dir>                   # safe to write? exits 1 if not
+node $SK/scripts/guard.mjs branch    <dir> node 24.22.1      # creates runtime/node-24.22.1
+node $SK/scripts/guard.mjs commit    <dir> -m "msg" --phase runtime
+```
+Guard **enforces** what this skill promises, rather than trusting the model to remember it:
+- refuses to commit on `main`/`master`/`develop`/`prod`/`release`, or on any branch not matching `runtime/*`
+- refuses to branch from a dirty tree
+- refuses a manifest change without its lockfile (and vice versa), resetting the index so nothing is left staged
+- scans the staged diff for private keys, AWS/GitHub/Slack tokens and hardcoded credentials, and refuses
+- **contains no push, force, or remote code path at all** — publishing a branch is always a human action
 
 Also ask, when it is not obvious: **which target version** (otherwise `research.mjs` picks the newest non-EOL LTS), and **which targets** when discovery finds more than ~6.
 
@@ -88,6 +101,15 @@ Then apply judgement the scripts cannot:
 - Walk `direct_dep_engines` against the target floor. A dep whose floor exceeds the target blocks it; a dep whose *newest compatible* release requires a different major of something else is a **coupling** — find those before estimating.
 - Separate **runtime** work from **framework** work. Split framework majors into their own ticket unless a dependency's peer/engines range genuinely couples them — and prove the coupling by reading the peer ranges, don't assume it.
 - For PHP, read `blocking_packages` (`composer prohibits`) and the extension list. Every compiled extension needs recompiling for a new **minor**; PHP has no N-API.
+
+## Framework EOL — often the real blocker
+
+```bash
+node $SK/scripts/frameworks.mjs <dir>
+```
+The runtime is frequently the smaller half of the work. endoflife.date tracks **41 frameworks** (Laravel, Symfony, Django, Rails, Spring Boot, Next.js, Angular, React, Vue, Drupal, WordPress…). Anything it does not track — **NestJS, FastAPI, Flask, Quarkus, Ember, Tailwind** — is reported under `untracked`. Say it has no upstream feed; never imply a date exists.
+
+Run this during Phase 3. A framework that is years EOL changes the plan more than the runtime does.
 
 ## Phase 4 — REMEDIATE
 

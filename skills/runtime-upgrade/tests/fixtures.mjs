@@ -105,6 +105,11 @@ export const FIXTURES = {
     w(r, '.github/workflows/ci.yml',
       'jobs:\n  b:\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: ${{ matrix.node }}\n');
   },
+  'frameworks': r => {
+    w(r, 'package.json', { name: 'fw-node', engines: { node: '>=20' },
+      dependencies: { next: '^14.0.0', react: '^18.2.0', '@nestjs/core': '^10.0.0' } });
+    w(r, 'composer.json', { name: 'acme/fw-php', require: { php: '^8.1', 'laravel/framework': '^10.0' } });
+  },
   'polyglot': r => {
     // one repo, four runtimes — the shape nobody plans for
     w(r, 'api/go.mod', 'module acme/api\n\ngo 1.22\n');

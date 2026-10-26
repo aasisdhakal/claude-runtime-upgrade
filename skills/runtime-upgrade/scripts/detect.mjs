@@ -4,6 +4,7 @@
 // usage: node detect.mjs [root]
 import { walk, readText, readJson, existsSync, join, resolve, rel, emit, die, readdirSync } from './lib/io.mjs';
 import { adapters, matchesManifest, adapterForManifest } from './adapters/index.mjs';
+import { detectFrameworks } from './lib/frameworks.mjs';
 
 const ROOT = resolve(process.argv[2] || '.');
 if (!existsSync(ROOT)) die(`no such directory: ${ROOT}`);
@@ -76,6 +77,37 @@ function ciInfo(dir, adapter) {
   return { text: uniq.slice(0, 4).join(' | '), versions: uniq, matrix: uniq.length > 1 };
 }
 
+/** Dependency map for framework detection, per ecosystem. */
+function manifestDeps(dir, lang) {
+  if (lang === 'node') {
+    const p = readJson(join(dir, 'package.json')) || {};
+    return { ...p.dependencies, ...p.devDependencies };
+  }
+  if (lang === 'php') {
+    const c = readJson(join(dir, 'composer.json')) || {};
+    return { ...c.require, ...c['require-dev'] };
+  }
+  if (lang === 'python') {
+    const t = (readText(join(dir, 'requirements.txt')) || '') + '\n' + (readText(join(dir, 'pyproject.toml')) || '');
+    const out = {};
+    for (const m of t.matchAll(/^\s*["']?([A-Za-z][\w.-]*)["']?\s*[>=~^]{1,2}\s*["']?([\d.]+)/gm)) out[m[1]] = m[2];
+    return out;
+  }
+  if (lang === 'ruby') {
+    const g = readText(join(dir, 'Gemfile')) || '';
+    const out = {};
+    for (const m of g.matchAll(/^\s*gem\s+["']([^"']+)["'](?:\s*,\s*["']([^"']+)["'])?/gm)) out[m[1]] = m[2] || '*';
+    return out;
+  }
+  if (lang === 'java') {
+    const pom = readText(join(dir, 'pom.xml')) || '';
+    const out = {};
+    for (const m of pom.matchAll(/<artifactId>\s*([^<\s]+)\s*<\/artifactId>\s*(?:<version>\s*([^<\s]+))?/g)) out[m[1]] = m[2] || '*';
+    return out;
+  }
+  return {};
+}
+
 // ---------- locate manifests + dockerfiles ----------
 const manifestPaths = walk(ROOT, { match: matchesManifest });
 const dockerPaths = walk(ROOT, { match: n => n === 'Dockerfile' || n.startsWith('Dockerfile.') });
@@ -120,6 +152,10 @@ for (const p of manifestPaths) {
   const ci = ciInfo(dir, adapter);
   try {
     const tgt = adapter.scan({ dir, root: ROOT, dockerImages: imgs, ciText: ci.matrix ? '' : ci.text });
+    // frameworks are often the real blocker, not the runtime
+    const fw = detectFrameworks(adapter.id, manifestDeps(dir, adapter.id));
+    if (fw.found.length) tgt.frameworks = fw.found;
+    if (fw.untracked.length) tgt.frameworksUntracked = fw.untracked;
     // a CI test matrix is intentional breadth, not disagreement
     if (ci.matrix) { tgt.ciMatrix = ci.versions; tgt.declared.ci = ci.text + '  (test matrix)'; }
     targets.push(tgt);

@@ -2,7 +2,7 @@
 
 A Claude Code skill that takes a repo of unknown shape from *"what runtime are we even on?"* to a verified upgrade plan — with EOL dates, real CVE counts, and a blocker list that separates genuine problems from noise.
 
-Supports **Node.js** and **PHP** today. The architecture makes adding a language one file.
+Supports **Node.js, PHP, Go, Python, Ruby, Rust, Java and .NET**. Adding another is one file.
 
 ```bash
 /plugin marketplace add OWNER/claude-runtime-upgrade
@@ -56,12 +56,40 @@ All six are detected and handled differently:
 
 ## Language support
 
-| Language | EOL data | Dependency CVEs | Runtime CVEs | Hard gate? |
+| Language | Dependency auditor | Runtime CVE source | Hard gate | Metric |
 |---|---|---|---|---|
-| **Node.js** | endoflife.date | npm/pnpm/yarn audit + OSV | `nodejs/security-wg` — curated, semver-ranged | ✅ **yes** |
-| **PHP** | endoflife.date | `composer audit` + OSV | NVD CPE only — historical, noisy | ❌ **no** |
+| **Node.js** | npm/pnpm/yarn audit | `nodejs/security-wg` — curated, severity-rated | ✅ | high/critical |
+| **Go** | `govulncheck` | OSV `stdlib` — version-ranged, **no severity** | ✅ | **total** |
+| **PHP** | `composer audit` | NVD CPE only | ❌ | — |
+| **Python** | `pip-audit` | none unified | ❌ | — |
+| **Ruby** | `bundler-audit` | none unified | ❌ | — |
+| **Rust** | `cargo audit` | none (RustSec covers crates) | ❌ | — |
+| **Java** | OWASP dep-check | per-JDK-distribution | ❌ | — |
+| **.NET** | `dotnet list package --vulnerable` | Microsoft SUG | ❌ | — |
 
-**The asymmetry is deliberate and surfaced, not hidden.** Node is the only major runtime with a curated, semver-ranged CVE database. PHP's NVD data answers "CVEs ever filed against this product", not "unpatched at this version" — so it cannot support a numeric gate. `research.mjs` returns `gateCapable: false` for PHP and the skill is instructed never to imply a gate it can't enforce. Under `gate` policy, PHP falls back to gating on EOL status and `composer audit`.
+All eight share the EOL layer (endoflife.date, 485 products) and the dependency-CVE layer (OSV.dev, 10+ ecosystems).
+
+**The asymmetry is surfaced, never hidden.** Only Node and Go have a curated, version-ranged runtime CVE database. Go's carries **no severity at all** — 0 of 82 records at go1.22 — so Go gates on *total* unpatched stdlib advisories while Node gates on high/critical. `research.mjs` returns `gateCapable` and `gateMetric` per language, every non-gating adapter must explain why in `gateNote`, and there is a test enforcing it.
+
+**Java note:** endoflife.date has no `java` product — the JDK is tracked per distribution. Set `RU_JAVA_DISTRO` (`amazon-corretto`, `oracle-jdk`, `graalvm-ce`, …) or the EOL dates will be wrong.
+
+## Framework EOL
+
+```bash
+node skills/runtime-upgrade/scripts/frameworks.mjs <dir>
+```
+The runtime is often the smaller half. endoflife.date tracks 41 frameworks; anything it doesn't (NestJS, FastAPI, Flask, Quarkus, Ember, Tailwind) is reported as `untracked` rather than guessed at.
+
+## Write mode is enforced, not requested
+
+`guard.mjs` is what makes `SECURITY.md` true:
+
+```bash
+node skills/runtime-upgrade/scripts/guard.mjs preflight <dir>
+node skills/runtime-upgrade/scripts/guard.mjs branch    <dir> node 24.22.1
+node skills/runtime-upgrade/scripts/guard.mjs commit    <dir> -m "msg" --phase runtime
+```
+Refuses to commit on a protected branch, refuses any branch outside `runtime/*`, refuses to branch from a dirty tree, refuses a manifest change without its lockfile, and scans the staged diff for private keys and AWS/GitHub/Slack tokens. **There is no push, force, or remote code path in the file** — a test asserts it.
 
 ## Install
 
@@ -125,9 +153,11 @@ Six phases, `3n + 2` agents, pipelined per target with an adversarial **Challeng
 node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
-34 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
+74 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
 
 CI runs the suite on **ubuntu + macOS × Node 18/20/22/24**, plus an offline job, plus a weekly cron to catch upstream feed changes.
+
+The semver matcher is **differential-tested against npm `semver`** on 143 real `engines` ranges harvested from 1162 `package.json` files, plus 40,000 generated fuzz comparisons — 100% agreement on both. Those tests skip cleanly when `semver` is unavailable, so the zero-dependency guarantee holds.
 
 ## Contributing a language
 
@@ -147,7 +177,7 @@ export function scan({ dir, root, dockerImages, ciText }) { /* ... */ }
 
 Register it in `adapters/index.mjs`, add a fixture, add assertions. See `CONTRIBUTING.md`.
 
-**Known-good next targets:** Go (near-zero ABI work), then Ruby, .NET, Java, Python (highest demand, hardest ABI story — manylinux wheels, `cp3XX` tags, free-threaded builds).
+**Next targets:** Deno, Bun, Elixir, Kotlin, Scala, Perl — all already tracked by endoflife.date and OSV, so each is one adapter file.
 
 ## License
 
