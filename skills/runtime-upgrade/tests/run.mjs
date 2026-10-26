@@ -11,10 +11,10 @@ import { RULES, rulesFor, inheritedCatalogue } from '../scripts/lib/breaking.mjs
 import { adapters, byId, adaptersForManifest } from '../scripts/adapters/index.mjs';
 import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
 import { PIN_RULES, planPinEdits, unified, planCiEdits, planConfigEdits, ciMatrixAdvice,
-         planAddPin, ADD_PIN_RULES, mapSuffix } from '../scripts/lib/edits.mjs';
+         planAddPin, ADD_PIN_RULES, mapSuffix, ruleKind } from '../scripts/lib/edits.mjs';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -613,14 +613,14 @@ function remediate(...a) { return runJson(process.execPath, [S('remediate.mjs'),
 
 t('remediate: dry-run writes nothing', () => withFixture('single-node', r => {
   const before = readFileSync(join(r, 'package.json'), 'utf8');
-  const v = remediate('node', r, '24.22.1', '--deps', 'none');
+  const v = remediate('node', r, '24.22.1', '--deps', 'none', '--raise-floor');
   ok(v.data, 'produced JSON');
   eq(v.data.mode, 'dry-run');
   ok(v.data.runtimePins.count >= 3, `expected >=3 pins, got ${v.data.runtimePins.count}`);
   eq(readFileSync(join(r, 'package.json'), 'utf8'), before, 'file must be byte-identical');
 }));
 t('remediate: rewrites every pin location for node', () => withFixture('single-node', r => {
-  const v = remediate('node', r, '24.22.1', '--deps', 'none');
+  const v = remediate('node', r, '24.22.1', '--deps', 'none', '--raise-floor');
   const files = v.data.runtimePins.files.join(' ');
   ok(/package\.json/.test(files), 'engines'); ok(/\.nvmrc/.test(files), 'nvmrc'); ok(/Dockerfile/.test(files), 'Dockerfile');
   const docker = v.data.runtimePins.diffs.find(d => d.file === 'Dockerfile').diff;
@@ -663,11 +663,11 @@ t('remediate: --apply writes pins on a guarded branch', () => {
     run('git', ['add', '-A'], { cwd: r });
     run('git', ['commit', '-qm', 'init'], { cwd: r });
     runJson(process.execPath, [S('guard.mjs'), 'branch', r, 'node', '24.22.1']);
-    const v = remediate('node', r, '24.22.1', '--deps', 'none', '--apply');
+    const v = remediate('node', r, '24.22.1', '--deps', 'none', '--apply', '--raise-floor');
     eq(v.data.mode, 'apply');
     ok(!v.data.refused, 'must not refuse on a runtime/* branch');
     eq(readFileSync(join(r, '.nvmrc'), 'utf8').trim(), 'v24.22.1', 'nvmrc rewritten');
-    ok(/">=24\.22\.1 <25"/.test(readFileSync(join(r, 'package.json'), 'utf8')), 'engines rewritten');
+    ok(/">=24\.22"/.test(readFileSync(join(r, 'package.json'), 'utf8')), 'engines floor raised');
   } finally { rmSync(r, { recursive: true, force: true }); }
 });
 t('remediate: dotnet container tag uses MAJOR.MINOR, not the full SDK build', () => {
@@ -832,6 +832,143 @@ t('rules: each new language catalogue actually matches its own syntax', () => {
     ok(rs.some(r => new RegExp(r.re.source, r.re.flags.replace('g', '')).test(code)),
        `${lang}: no rule matched its own sample "${src}"`);
   }
+});
+
+// ───────────── floors are not pins (judge findings) ─────────────
+// An adversarial judge ran the tool against 10 real repos. Its headline finding:
+// the write stage rewrote consumer-facing FLOORS as if they were pins, making
+// semver-breaking support-contract changes to four published libraries and
+// breaking each one's own CI matrix. These lock that shut.
+console.log('\nfloors are not pins');
+t('floor: a consumer-facing minimum is NOT rewritten by default', () => withFixture('single-node', r => {
+  const v = remediate('node', r, '24.22.1', '--deps', 'none');
+  const files = v.data.runtimePins.files.join(' ');
+  ok(!/engines\.node/.test(files), `engines.node must not be written by default: ${files}`);
+  ok(v.data.runtimePins.declinedFloors.some(f => /engines\.node/.test(f.rule)), 'and it must be reported as declined');
+  ok(v.data.runtimePins.declinedFloors[0].why.length > 60, 'with a real reason');
+}));
+t('floor: pins ARE still written by default', () => withFixture('single-node', r => {
+  const v = remediate('node', r, '24.22.1', '--deps', 'none');
+  const files = v.data.runtimePins.files.join(' ');
+  ok(/\.nvmrc/.test(files), `.nvmrc is a pin and must still move: ${files}`);
+  ok(/Dockerfile/.test(files), 'and so is a Dockerfile tag');
+}));
+t('floor: --raise-floor opts in explicitly', () => withFixture('single-node', r => {
+  const v = remediate('node', r, '24.22.1', '--deps', 'none', '--raise-floor');
+  ok(v.data.runtimePins.files.join(' ').includes('package.json'), 'the floor moves when asked');
+  eq(v.data.runtimePins.raiseFloor, true);
+}));
+t('floor: engines.node NEVER gains an upper cap', () => {
+  // prettier got ">=26.12.1 <27" — refusing every future Node forever
+  const rule = PIN_RULES.node('26.12.1').find(x => x.rule === 'engines.node');
+  const out = rule.edit('{"engines":{"node":">=22"}}');
+  ok(!/</.test(out.replace(/[{}":,]/g, '')), `no upper bound: ${out}`);
+  ok(/>=26\.12/.test(out), out);
+  ok(!/26\.12\.1/.test(out), 'a floor is major.minor, not a patch pin');
+});
+t('floor: every library-facing rule is classified as a floor', () => {
+  for (const rule of ['engines.node', 'require.php', 'requires-python',
+                      'gemspec required_ruby_version', 'rust-version (MSRV)', 'go directive'])
+    eq(ruleKind(rule), 'floor', rule);
+  for (const rule of ['.nvmrc', '.python-version', '.ruby-version', 'Dockerfile FROM'])
+    eq(ruleKind(rule), 'pin', rule);
+});
+
+console.log('\n.NET target frameworks');
+t('tfm: net46 is .NET Framework 4.6, not version 46', () => {
+  const a = byId.dotnet;
+  const r = mkdtempSync(join(tmpdir(), 'ru-tfm-'));
+  try {
+    writeFileSync(join(r, 'x.csproj'), '<Project><PropertyGroup><TargetFrameworks>net46;net10.0</TargetFrameworks></PropertyGroup></Project>');
+    const o = a.scan({ dir: r, root: r, dockerImages: [], ciText: '' });
+    ok(o.declaredMajors.split(',').includes('4.6'), `net46 -> 4.6, got [${o.declaredMajors}]`);
+    ok(!o.declaredMajors.split(',').includes('46'), 'never 46');
+    ok(o.netFrameworkTfms.includes('net46'), 'and it is flagged as .NET Framework');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('tfm: a conditional TargetFrameworks element is read', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-tfm2-'));
+  try {
+    // Newtonsoft.Json's flagship project uses this form and was missed entirely
+    writeFileSync(join(r, 'x.csproj'),
+      '<Project><PropertyGroup>\n<TargetFrameworks Condition="\'$(LibraryFrameworks)\'==\'\'">net10.0;net8.0;netstandard2.0</TargetFrameworks>\n</PropertyGroup></Project>');
+    const o = byId.dotnet.scan({ dir: r, root: r, dockerImages: [], ciText: '' });
+    ok(o.declaredMajors.split(',').includes('10'), `got [${o.declaredMajors}]`);
+    ok(!/\$\(/.test(o.declared.targetFramework), 'MSBuild variables are not treated as versions');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+console.log('\ntarget selection sanity');
+await ta('target: never proposes a version supported for LESS time', async () => {
+  if (!reach.data) return 'skip';
+  // Java 27 is non-LTS (EOL 2027-04); Java 17 runs to 2029-10. "Upgrading"
+  // there shortens the support window by 2.5 years.
+  const r = runJson(process.execPath, [S('research.mjs'), 'java', '17']);
+  ok(r.data, 'produced JSON');
+  eq(r.data.target.supportedLongerThanCurrent, true,
+     `${r.data.current.eol} -> ${r.data.target.eol}`);
+  ok(r.data.target.eol > r.data.current.eol, 'the target must outlive the current');
+});
+await ta('target: an integer-major runtime gets a plain major', async () => {
+  if (!reach.data) return 'skip';
+  const r = runJson(process.execPath, [S('research.mjs'), 'java', '17']);
+  ok(/^\d+$/.test(r.data.target.version), `a JDK distribution build string leaked: ${r.data.target.version}`);
+});
+
+console.log('\ndiscovery noise and scope');
+t('noise: fixtures and .github trees are separated, not counted as work', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-noise-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=20"}}');
+    for (const sub of ['test/bundler/esbuild', '.github/codeql/tests/x', '.devcontainer']) {
+      mkdirSync(join(r, sub), { recursive: true });
+      writeFileSync(join(r, sub, 'package.json'), '{"name":"fixture"}');
+    }
+    const d = runJson(process.execPath, [S('detect.mjs'), r]);
+    eq(d.data.targetCount, 1, 'only the real package counts');
+    ok(d.data.ancillaryTargets.length >= 3, `fixtures reported separately: ${d.data.ancillaryTargets.length}`);
+    ok(d.data.ancillaryNote && /not deployables/.test(d.data.ancillaryNote), 'and explained');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('noise: a CI matrix written as a list is read', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-mx-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x"}');
+    mkdirSync(join(r, '.github', 'workflows'), { recursive: true });
+    // the list form is the most common matrix spelling and was invisible
+    writeFileSync(join(r, '.github/workflows/ci.yml'),
+      'jobs:\n  t:\n    strategy:\n      matrix:\n        node-version: [24, 26]\n');
+    const d = runJson(process.execPath, [S('detect.mjs'), r]);
+    const t2 = d.data.targets.find(x => x.lang === 'node');
+    ok(t2.ciMatrix && t2.ciMatrix.includes('24') && t2.ciMatrix.includes('26'),
+       `matrix list not read: ${JSON.stringify(t2.ciMatrix)}`);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('noise: a plan with nothing actionable explains itself', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-empty-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x"}');     // no engines anywhere
+    const v = runJson(process.execPath, [S('plan.mjs'), r]);
+    eq(v.data.plans.length, 0);
+    ok(v.data.nothingActionable, 'an empty plan must say why');
+    ok(v.data.nothingActionable.guidance.length > 40, 'with guidance');
+    ok(v.data.nothingActionable.targetsFound >= 1, 'and admit it DID find targets');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('scope: no pin is invented where sub-packages already declare one', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-ws-'));
+  try {
+    run('git', ['init', '-q'], { cwd: r });
+    // a Rust workspace root has no [package] and so declares no rust-version;
+    // creating rust-toolchain.toml there overrides every member
+    writeFileSync(join(r, 'Cargo.toml'), '[workspace]\nmembers = ["a"]\n');
+    mkdirSync(join(r, 'a'), { recursive: true });
+    writeFileSync(join(r, 'a', 'Cargo.toml'), '[package]\nname = "a"\nrust-version = "1.85"\n');
+    const v = runJson(process.execPath, [S('remediate.mjs'), 'rust', r, '1.99', '--deps', 'none']);
+    eq(v.data.runtimePins.count, 0, 'nothing invented at the root');
+    ok(v.data.runtimePins.declaredElsewhere?.length, 'and it names where the runtime IS declared');
+    ok(!existsSync(join(r, 'rust-toolchain.toml')), 'no toolchain file created');
+  } finally { rmSync(r, { recursive: true, force: true }); }
 });
 
 // ───────────── source autofix ─────────────
@@ -1102,7 +1239,7 @@ t('addpin: adds engines.node without disturbing the rest of package.json', () =>
     ok(e && !e.created, 'edits the existing manifest');
     const o = JSON.parse(e.after);
     eq(o.name, 'x'); eq(o.scripts.test, 't');
-    ok(/^>=24\.22\.1/.test(o.engines.node), o.engines.node);
+    ok(/^>=24\.22$/.test(o.engines.node), `a floor, with no upper cap: ${o.engines.node}`);
   } finally { rmSync(r, { recursive: true, force: true }); }
 });
 t('addpin: never fires when a pin already exists', () => {
@@ -1343,6 +1480,21 @@ t('tracker: PR tool and issue tool are independent choices', () => {
 
 // ───────────────────────── doctor ─────────────────────────
 console.log('\ndoctor');
+t('doctor: every forge and tracker CLI is reported', () => {
+  // doctor had a hardcoded tool list, so the seven forge/tracker CLIs added
+  // later were invisible. It now derives them from the provider registries.
+  const d = runJson(process.execPath, [S('doctor.mjs')]);
+  const known = new Set(d.data.tools.map(t => t.tool));
+  for (const p of [...PR_PROVIDERS, ...ISSUE_PROVIDERS])
+    if (p.bin && p.bin !== 'git') ok(known.has(p.bin), `${p.bin} is not reported by doctor`);
+});
+t('doctor: there is always a usable route with no CLI', () => {
+  const d = runJson(process.execPath, [S('doctor.mjs')]);
+  ok(d.data.alwaysAvailable.pullRequest.length >= 2, 'at least push and patch');
+  ok(d.data.alwaysAvailable.issues.length >= 2, 'at least csv and markdown');
+  ok(d.data.pullRequestRoutes.some(r => r.usable), 'some PR route is usable right now');
+  ok(d.data.issueRoutes.some(r => r.usable), 'some issue route is usable right now');
+});
 t('reports tools and what degrades', () => {
   const d = runJson(process.execPath, [S('doctor.mjs')]);
   ok(d.data, 'doctor produced JSON');

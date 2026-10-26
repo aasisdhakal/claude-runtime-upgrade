@@ -6,6 +6,40 @@ import { join, existsSync, readText, readdirSync } from './io.mjs';
 const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
+ * Every pin rule is either a PIN or a FLOOR.
+ *
+ *   PIN    what this checkout RUNS: .nvmrc, a Dockerfile tag, .tool-versions,
+ *          config.platform.php. Moving it affects only this repo.
+ *   FLOOR  the MINIMUM a consumer needs: engines.node, require.php,
+ *          requires-python, required_ruby_version, rust-version (MSRV), the go
+ *          directive. For a published library this is its SUPPORT CONTRACT.
+ *
+ * Raising a floor is a semver-breaking change to everyone downstream, and it
+ * breaks the repo's own CI matrix the moment CI still tests an older version.
+ * Against four real libraries this tool did exactly that: fastapi >=3.10 ->
+ * >=3.15, jekyll >= 2.7 -> >= 4.0, laravel ^8.3 -> ^8.5, prettier >=22 ->
+ * ">=26.12.1 <27". Every one broke that project's own test matrix.
+ *
+ * So floors are NOT written by default. `--raise-floor` opts in.
+ */
+export const RULE_KIND = {
+  // floors — a consumer-facing minimum
+  'engines.node': 'floor', 'add engines.node': 'floor',
+  'require.php': 'floor', 'add require.php': 'floor',
+  'requires-python': 'floor', 'python_requires': 'floor',
+  'gemspec required_ruby_version': 'floor',
+  'rust-version (MSRV)': 'floor',
+  'go directive': 'floor',
+  'maven.compiler.release': 'floor', 'gradle compatibility': 'floor',
+  'JavaLanguageVersion': 'floor', 'jvmToolchain': 'floor',
+  'elixir requirement': 'floor', 'minimum_otp_vsn': 'floor',
+  'Makefile.PL perl requirement': 'floor', 'requires perl': 'floor',
+  'kotlin plugin version': 'floor', 'scalaVersion': 'floor',
+  'deno.json deno field': 'floor', 'engines.bun': 'floor',
+};
+export function ruleKind(rule) { return RULE_KIND[rule] || 'pin'; }
+
+/**
  * Old distro variants that cannot host a current runtime. Node 24+ musl builds
  * require Alpine >= 3.20; Debian buster/stretch are long EOL.
  */
@@ -154,7 +188,9 @@ const maj = v => String(v).split('.')[0];                      // 27.0.1  -> 27
 export const PIN_RULES = {
   node: (target) => [
     { file: 'package.json', rule: 'engines.node',
-      edit: t => t.replace(/("engines"\s*:\s*\{[^}]*?"node"\s*:\s*")([^"]*)(")/s, `$1>=${target} <${Number(target.split('.')[0]) + 1}$3`) },
+      // an upper cap makes the package refuse every FUTURE runtime; prettier
+      // would have rejected Node 27 forever. A floor is a floor.
+      edit: t => t.replace(/("engines"\s*:\s*\{[^}]*?"node"\s*:\s*")([^"]*)(")/s, `$1>=${mm(target)}$3`) },
     { file: '.nvmrc', rule: '.nvmrc', edit: () => `v${target}\n` },
     { file: '.node-version', rule: '.node-version', edit: () => `${target}\n` },
     { file: '.tool-versions', rule: '.tool-versions', edit: t => t.replace(/^nodejs\s+\S+/mi, `nodejs ${target}`) },
@@ -300,11 +336,15 @@ export const PIN_RULES = {
     { file: '.perl-version', rule: '.perl-version', edit: () => `${t}\n` }],
 };
 
-/** Compute every pin edit for a target. Pure: reads files, writes nothing. */
-export function planPinEdits(lang, dir, target) {
+/**
+ * Compute every pin edit for a target. Pure: reads files, writes nothing.
+ * `raiseFloor` opts in to rewriting consumer-facing minimums; without it they
+ * are returned under `declinedFloors` with the reason.
+ */
+export function planPinEdits(lang, dir, target, { raiseFloor = false } = {}) {
   const rules = PIN_RULES[lang];
-  if (!rules) return { edits: [], unsupported: true };
-  const edits = [];
+  if (!rules) return { edits: [], declinedFloors: [], unsupported: true };
+  const edits = [], declinedFloors = [];
   for (const r of rules(target)) {
     let file = r.file;
     if (!file && r.glob) {
@@ -316,9 +356,19 @@ export function planPinEdits(lang, dir, target) {
     const before = readText(path);
     if (before == null) continue;
     const after = r.edit(before);
-    if (after !== before) edits.push({ file, path, rule: r.rule, before, after });
+    if (after === before) continue;
+    const kind = ruleKind(r.rule);
+    if (kind === 'floor' && !raiseFloor) {
+      declinedFloors.push({ file, rule: r.rule, kind,
+        would: (after.match(new RegExp('.*' + target.split('.')[0] + '.*')) || [''])[0].trim().slice(0, 90),
+        why: 'this is a consumer-facing MINIMUM, not what this checkout runs. Raising it is a '
+           + 'semver-breaking change to the support contract and usually breaks the repo\'s own '
+           + 'CI matrix. Pass --raise-floor if that is genuinely intended.' });
+      continue;
+    }
+    edits.push({ file, path, rule: r.rule, kind, before, after });
   }
-  return { edits, unsupported: false };
+  return { edits, declinedFloors, unsupported: false };
 }
 
 /** Minimal unified diff. No dependency, no shelling out to diff(1). */
@@ -359,7 +409,7 @@ export const ADD_PIN_RULES = {
     edit: x => {
       const o = JSON.parse(x);
       if (o.engines?.node) return x;
-      o.engines = { ...(o.engines || {}), node: `>=${t} <${Number(String(t).split('.')[0]) + 1}` };
+      o.engines = { ...(o.engines || {}), node: `>=${mm(t)}` };
       return JSON.stringify(o, null, detectIndent(x)) + (x.endsWith('\n') ? '\n' : '');
     } }),
   bun: (t) => ({ file: 'package.json', rule: 'add engines.bun', needs: 'package.json',

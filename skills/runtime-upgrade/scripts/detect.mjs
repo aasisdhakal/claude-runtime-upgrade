@@ -61,8 +61,20 @@ function ciInfo(dir, adapter) {
         // skip templated values: `python-version: ${{ matrix.python }}`
         if (/\$\{\{/.test(line)) continue;
         if (keyRe && keyRe.test(line)) {
-          const m = line.match(/:\s*["']?([0-9][0-9.xX]*)/);
-          if (m) versions.push(m[1]);
+          // `node-version: [24, 26]` is the most common matrix form and was
+          // invisible: the old pattern only read a single scalar after the
+          // colon, so fastify's real matrix (24, 26) was missed and a lone
+          // non-matrix job pinned at 20 was reported instead.
+          const list = line.match(/:\s*\[([^\]]+)\]/);
+          if (list) {
+            for (const v of list[1].split(',')) {
+              const n = v.trim().replace(/^["']|["']$/g, '');
+              if (/^[0-9][0-9.xX]*$/.test(n)) versions.push(n);
+            }
+          } else {
+            const m = line.match(/:\s*["']?([0-9][0-9.xX]*)/);
+            if (m) versions.push(m[1]);
+          }
         }
         const im = line.match(/image:\s*["']?(\S+)/);
         if (im) {
@@ -109,10 +121,13 @@ function manifestDeps(dir, lang) {
 }
 
 // ---------- locate manifests + dockerfiles ----------
-const NOISE = /(^|\/)(examples?|samples?|fixtures?|testdata|test-?data|benchmarks?|docs?|website|demo)(\/|$)/i;
-const manifestPaths = walk(ROOT, { match: matchesManifest })
-  // example and fixture trees are not deployables; they drown the real targets
-  .filter(p => !NOISE.test(rel(ROOT, p)));
+// Trees that are not deployables. Reported separately rather than dropped —
+// a fixture pinned to an EOL runtime is worth knowing about, it just is not
+// upgrade WORK and must not carry story points or be chosen as the pilot.
+const NOISE = /(^|\/)(examples?|samples?|fixtures?|testdata|test-?data|benchmarks?|docs?|website|demo|\.devcontainer|\.github|tests?)(\/|$)/i;
+const allManifestPaths = walk(ROOT, { match: matchesManifest });
+const manifestPaths = allManifestPaths.filter(p => !NOISE.test(rel(ROOT, p)));
+const ancillaryPaths = allManifestPaths.filter(p => NOISE.test(rel(ROOT, p)));
 const dockerPaths = walk(ROOT, { match: n => n === 'Dockerfile' || n.startsWith('Dockerfile.') });
 
 // ---------- classify repo shape ----------
@@ -156,6 +171,10 @@ for (const p of manifestPaths) {
   const ci = ciInfo(dir, adapter);
   try {
     const tgt = adapter.scan({ dir, root: ROOT, dockerImages: imgs, ciText: ci.matrix ? '' : ci.text });
+    // Several adapters can claim one filename: Bun also reads package.json,
+    // Java also reads build.gradle.kts. Only the adapter for which this is the
+    // PRIMARY manifest owns the directory on that basis alone.
+    tgt.primaryManifest = adapter.manifests[0] === filename;
     // frameworks are often the real blocker, not the runtime
     const fw = detectFrameworks(adapter.id, manifestDeps(dir, adapter.id));
     if (fw.found.length) tgt.frameworks = fw.found;
@@ -192,8 +211,16 @@ for (const df of dockerPaths) {
 
 // an adapter can match a shared manifest (build.gradle.kts) yet find no version
 // and no dependencies — that is a non-target, not a finding
-const meaningful = targets.filter(t => t.error || t.containerOnly || t.declaredMajors
-                                   || t.deps > 0 || t.devDeps > 0 || t.lockfile);
+// The ROOT manifest is the project itself — a package.json with a name but no
+// dependencies is still the thing being upgraded. Pruning it made a real repo
+// report zero targets.
+// The ROOT manifest is the project itself — a package.json with a name but no
+// dependencies is still the thing being upgraded, so it is never pruned. But
+// only for the adapter that OWNS that filename; a secondary claimant needs its
+// own evidence.
+const meaningful = targets.filter(t =>
+  (t.dir === '.' && t.primaryManifest) || t.error || t.containerOnly
+  || t.declaredMajors || t.deps > 0 || t.devDeps > 0 || t.lockfile);
 targets.length = 0; targets.push(...meaningful);
 
 // Shape is decided from RESOLVED targets, not from which adapters merely claim
@@ -222,6 +249,17 @@ emit({
   driftCount,
   undeclaredCount: undeclared,
   languages: [...new Set(targets.map(t => t.lang))],
+  ancillaryTargets: ancillaryPaths.map(p => rel(ROOT, p)),
+  ancillaryNote: ancillaryPaths.length
+    ? 'test fixtures, examples, docs and .devcontainer/.github trees. Worth knowing about, '
+    + 'but they are not deployables: no story points, never the pilot.'
+    : null,
+  allTargetsUndeclared: targets.length > 0 && targets.every(t => !t.declaredMajors),
+  undeclaredGuidance: targets.length > 0 && targets.every(t => !t.declaredMajors)
+    ? 'No target declares a runtime anywhere in its manifest or version files. That is itself '
+    + 'the finding: nothing pins the version, so CI and production can drift apart silently. '
+    + 'Check the CI field below for what is actually used, and add a pin.'
+    : null,
   shapeGuidance: {
     single: 'one target, straightforward',
     monorepo: 'upgrade the ROOT runtime pin once; each workspace gets its own compat pass. Do not file one ticket per package',

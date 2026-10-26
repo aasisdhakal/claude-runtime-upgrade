@@ -13,7 +13,7 @@
 import { resolve, join, existsSync, readText, emit, die } from './lib/io.mjs';
 import { have, run, runJson } from './lib/sh.mjs';
 import { byId } from './adapters/index.mjs';
-import { planPinEdits, planAddPin, unified } from './lib/edits.mjs';
+import { planPinEdits, planAddPin, unified, ruleKind } from './lib/edits.mjs';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -101,13 +101,34 @@ const DEP_RECIPES = {
 };
 
 // ---------------- step 1: runtime pins ----------------
-const { edits, unsupported } = planPinEdits(A.id, DIR, target);
+const RAISE_FLOOR = has('raise-floor');
+const { edits, declinedFloors, unsupported } = planPinEdits(A.id, DIR, target, { raiseFloor: RAISE_FLOOR });
 // A project that declares the runtime nowhere in its manifest has nothing to
 // rewrite — and is precisely the project that needs a pin. Add one.
 let addedPin = null;
 let alreadyCurrent = false;
+// A workspace root often declares nothing while its members all do. Creating a
+// toolchain pin there overrides every member and claims "the project declared
+// no runtime" — false, and for tokio it would have forced current stable on
+// every contributor.
+let declaredElsewhere = null;
+{
+  const det = runJson(process.execPath, [join(HERE, 'detect.mjs'), DIR]);
+  const others = (det.data?.targets || []).filter(t => t.lang === A.id && t.declaredMajors);
+  if (others.length) declaredElsewhere = others.map(t => `${t.dir} [${t.declaredMajors}]`);
+}
 if (!edits.length && !argv.includes('--no-add-pin')) {
-  addedPin = planAddPin(A.id, DIR, target);
+  if (declaredElsewhere) {
+    // nothing to add: the repo DOES declare this runtime, just not here
+    alreadyCurrent = false;
+  } else addedPin = planAddPin(A.id, DIR, target);
+  // creating engines.node / require.php is creating a floor, not a pin
+  if (addedPin && ruleKind(addedPin.rule) === 'floor' && !RAISE_FLOOR) {
+    declinedFloors.push({ file: addedPin.file, rule: addedPin.rule, kind: 'floor',
+      why: 'adding this would declare a consumer-facing minimum this project never claimed. '
+         + 'Pass --raise-floor if that is intended.' });
+    addedPin = null;
+  }
   if (addedPin) edits.push(addedPin);
   else {
     // no rewrite AND no pin to add: either the project is already on the target,
@@ -182,9 +203,13 @@ emit({
   mode: APPLY ? 'apply' : 'dry-run',
   unsupportedLanguage: unsupported || undefined,
   runtimePins: { count: edits.length, files: edits.map(e => `${e.file} (${e.rule})`), diffs: pinDiffs,
+                 declinedFloors: declinedFloors || [],
+                 raiseFloor: RAISE_FLOOR,
                  addedPin: addedPin ? { file: addedPin.file, created: addedPin.created,
                    why: 'the project declared no runtime in its manifest — nothing enforced the version' } : null,
+                 declaredElsewhere,
                  status: edits.length ? 'rewritten'
+                       : declaredElsewhere ? 'declined — this runtime is declared in sub-packages, not here'
                        : alreadyCurrent ? 'already-on-target'
                        : 'declined — an edit was possible but unsafe (see the language playbook)' },
   dependencies: deps,
@@ -195,5 +220,8 @@ emit({
        `commit via: node ${join(HERE, 'guard.mjs')} commit ${DIR} -m "<msg>" --phase ${flag('phase') || 'remediate'}`]
     : ['review the diffs above',
        're-run with --apply to write (guard preflight must pass first)',
-       `dependency mode is "${DEPS}" — use --deps latest only when you intend to cross majors`],
+       `dependency mode is "${DEPS}" — use --deps latest only when you intend to cross majors`,
+       ...(declinedFloors?.length
+         ? [`${declinedFloors.length} consumer-facing FLOOR(s) left alone — pass --raise-floor only if you mean to change the support contract`]
+         : [])],
 });

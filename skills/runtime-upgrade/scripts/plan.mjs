@@ -381,6 +381,18 @@ function sharedBlockers(ps) {
 
 const out = {
   root: DIR, shape: det.data.shape, policy: POLICY,
+  // emitting an empty plan for a repo that plainly has manifests reads as a
+  // crash. If nothing is actionable, say why and what to do.
+  nothingActionable: plans.length === 0 ? {
+    reason: det.data.allTargetsUndeclared
+      ? 'every target was found, but none declares a runtime version anywhere'
+      : 'no target declared a runtime version',
+    guidance: det.data.undeclaredGuidance
+      || 'add a version pin (engines, .nvmrc, .tool-versions or a Dockerfile tag) so something enforces it',
+    targetsFound: det.data.targetCount,
+    ciVersionsSeen: (det.data.targets || []).map(t => t.declared?.ci).filter(Boolean),
+    ancillaryTargets: det.data.ancillaryTargets || [],
+  } : undefined,
   generatedFor: targets.length + ' target(s)',
   undeclaredTargets: undeclared.map(t => `${t.lang}: ${t.dir}`),
   totalEstimatePoints: plans.reduce((n, p) => n + (p.estimatePoints || 0), 0),

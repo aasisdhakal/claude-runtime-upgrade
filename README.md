@@ -240,7 +240,7 @@ now a named regression test.
 node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
-165 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
+180 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
 
 CI runs the suite on **ubuntu + macOS × Node 18/20/22/24**, plus an offline job, plus a weekly cron to catch upstream feed changes.
 

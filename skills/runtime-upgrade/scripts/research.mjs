@@ -56,11 +56,29 @@ if (!target) {
   const best = pool.sort((a, b) => compare(String(a.cycle), String(b.cycle))).pop();
   target = best?.latest || '';
 }
-// amazon-corretto publishes latest as "27.0.1.0.10"; nobody targets that string.
-// For integer-major runtimes the usable target is the major itself.
-if (intMajor && /^\d+(\.\d+){3,}/.test(String(target))) target = String(target).split('.')[0];
-const tgtMajor = majorOf(target);
-const cur = find(curMajor), tgt = find(tgtMajor);
+let tgtMajor = majorOf(target);
+let cur = find(curMajor), tgt = find(tgtMajor);
+
+// A newer number is not automatically a better target. Java 27 is non-LTS and
+// loses support in 2027-04; Java 17 is supported to 2029-10. "Upgrading" there
+// SHORTENS the support window by 2.5 years. Only auto-selected targets are
+// corrected — an explicit --target is the user's call.
+let targetDowngradesSupport = false;
+if (!targetArg && cur.eol && tgt.eol && typeof cur.eol === 'string' && typeof tgt.eol === 'string'
+    && tgt.eol < cur.eol) {
+  const better = cycles
+    .filter(c => typeof c.eol === 'string' && c.eol > cur.eol && compare(String(c.cycle), curMajor) > 0)
+    .sort((a, b) => compare(String(a.cycle), String(b.cycle)))[0];
+  if (better) { target = better.latest; tgtMajor = majorOf(target); tgt = find(tgtMajor); }
+  else targetDowngradesSupport = true;
+}
+
+// amazon-corretto publishes latest as "21.0.13.0.10"; nobody targets that
+// string. Trim AFTER any correction above, or the correction reintroduces it.
+if (intMajor && /^\d+(\.\d+){3,}/.test(String(target))) {
+  target = String(target).split('.')[0];
+  tgtMajor = majorOf(target);
+}
 
 // ---------- runtime CVEs ----------
 // Three shapes exist. Only the first two can gate:
@@ -159,6 +177,11 @@ emit({
   },
   target: {
     version: target,
+    supportedLongerThanCurrent: !(cur.eol && tgt.eol && typeof cur.eol === 'string'
+      && typeof tgt.eol === 'string' && tgt.eol < cur.eol),
+    warning: targetDowngradesSupport
+      ? `every newer cycle is supported for LESS time than ${curMajor} — staying put may be correct`
+      : null,
     major: tgtMajor,
     lts: tgt.lts ?? null,
     supportEnds: typeof tgt.support === 'string' ? tgt.support : null,

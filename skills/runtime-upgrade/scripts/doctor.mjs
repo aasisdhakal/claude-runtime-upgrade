@@ -3,6 +3,7 @@
 import { have, run } from './lib/sh.mjs';
 import { fetchJson, CACHE_DIR, OFFLINE, emit } from './lib/io.mjs';
 import { adapters } from './adapters/index.mjs';
+import { PR_PROVIDERS, ISSUE_PROVIDERS } from './lib/providers.mjs';
 
 const TOOLS = [
   ['node',         'required', 'everything — this skill is Node-native'],
@@ -28,6 +29,15 @@ const TOOLS = [
   ['mvn',          'java',     'dependency tree and update reports'],
   ['dotnet',       'dotnet',   '`dotnet list package --vulnerable` and SDK resolution'],
 ];
+
+// Derived from the provider registries rather than hardcoded, so a new forge
+// or tracker cannot silently go unreported here.
+for (const p of PR_PROVIDERS)
+  if (p.bin && p.bin !== 'git' && !TOOLS.some(t => t[0] === p.bin))
+    TOOLS.push([p.bin, 'forge', `opening pull requests on ${p.label.replace(/ CLI$/, '')}`]);
+for (const p of ISSUE_PROVIDERS)
+  if (p.bin && !TOOLS.some(t => t[0] === p.bin))
+    TOOLS.push([p.bin, 'tracker', `filing tickets in ${p.label.replace(/ \(.*\)$/, '')}`]);
 
 const tools = TOOLS.map(([cmd, scope, why]) => {
   const present = have(cmd);
@@ -73,5 +83,15 @@ emit({
     };
   }),
   nvdApiKey: process.env.NVD_API_KEY ? 'set' : 'not set — PHP NVD lookups limited to 5 requests/30s',
+  // every route needs SOME way out, so report which ones are usable right now
+  pullRequestRoutes: PR_PROVIDERS.map(p => ({ id: p.id, label: p.label,
+    usable: !p.bin || p.bin === 'git' || have(p.bin), needs: p.bin && p.bin !== 'git' ? p.bin : null })),
+  issueRoutes: ISSUE_PROVIDERS.map(p => ({ id: p.id, label: p.label,
+    usable: !p.bin || have(p.bin), needs: p.bin || null })),
+  alwaysAvailable: {
+    pullRequest: PR_PROVIDERS.filter(p => !p.bin || p.bin === 'git').map(p => p.id),
+    issues: ISSUE_PROVIDERS.filter(p => !p.bin).map(p => p.id),
+    note: 'these need no CLI, so there is always a way to ship the work',
+  },
   missingRequired: tools.filter(t => t.scope === 'required' && !t.present).map(t => t.tool),
 });
