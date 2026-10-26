@@ -18,18 +18,25 @@ export function compare(a, b) {
 
 function satisfiesOne(ver, raw) {
   const t = String(raw).trim();
-  if (!t || t === '*' || t === 'x') return true;
+  if (!t || t === '*' || t === 'x' || t === 'X') return true;
   let m;
-  if ((m = t.match(/^\^\s*(\d+)\.(\d+)\.(\d+)/))) {
-    const lo = [+m[1], +m[2], +m[3]];
-    const hi = lo[0] > 0 ? [lo[0] + 1, 0, 0] : lo[1] > 0 ? [0, lo[1] + 1, 0] : [0, 0, lo[2] + 1];
+  // ^1.2.3 / ^1.2 / ^1 — partial versions are legal and common in engines fields
+  if ((m = t.match(/^\^\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/))) {
+    const lo = [+m[1], +(m[2] ?? 0), +(m[3] ?? 0)];
+    const hi = lo[0] > 0 ? [lo[0] + 1, 0, 0]
+             : m[2] === undefined ? [1, 0, 0]
+             : lo[1] > 0 ? [0, lo[1] + 1, 0]
+             : m[3] === undefined ? [0, 1, 0]
+             : [0, 0, lo[2] + 1];
     return cmp(ver, lo) >= 0 && cmp(ver, hi) < 0;
   }
-  if ((m = t.match(/^~\s*(\d+)\.(\d+)\.(\d+)/))) {
-    const lo = [+m[1], +m[2], +m[3]];
-    return cmp(ver, lo) >= 0 && cmp(ver, [lo[0], lo[1] + 1, 0]) < 0;
+  // ~1.2.3 / ~1.2 / ~1
+  if ((m = t.match(/^~\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?/))) {
+    const lo = [+m[1], +(m[2] ?? 0), +(m[3] ?? 0)];
+    const hi = m[2] === undefined ? [lo[0] + 1, 0, 0] : [lo[0], lo[1] + 1, 0];
+    return cmp(ver, lo) >= 0 && cmp(ver, hi) < 0;
   }
-  if ((m = t.match(/^(>=|<=|>|<|=)?\s*(\d+)(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?/))) {
+  if ((m = t.match(/^(>=|<=|>|<|=)?\s*v?(\d+)(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?/))) {
     const op = m[1] || '=';
     const wildMinor = m[3] === undefined || /^[xX*]$/.test(m[3]);
     const wildPatch = m[4] === undefined || /^[xX*]$/.test(m[4]);
@@ -45,12 +52,25 @@ function satisfiesOne(ver, raw) {
   return false;
 }
 
-/** "||" separates alternatives; whitespace within an alternative ANDs comparators. */
+// Tokenise comparator+version pairs. Splitting on whitespace is WRONG:
+// ">= 20" would become [">=", "20"] and the orphaned operator fails to parse,
+// so every range with a space after the operator silently evaluated to false.
+const COMPARATOR_RE = /(>=|<=|>|<|=|\^|~)?\s*(v?\d+(?:\.(?:\d+|[xX*]))?(?:\.(?:\d+|[xX*]))?)/g;
+
+/** "||" separates alternatives; comparators within an alternative are ANDed. */
 export function satisfies(version, range) {
   const ver = parse(version);
-  if (!ver || !range) return false;
+  if (!ver || range == null) return false;
   return String(range).split('||').some(alt => {
-    const parts = alt.trim().split(/\s+(?=[<>=^~]|\d)/).filter(Boolean);
+    const t = alt.trim();
+    if (!t || t === '*' || t === 'x' || t === 'X') return true;
+    // hyphen range: "1.2.3 - 2.3.4"
+    const hy = t.match(/^(v?\d[\w.*-]*)\s+-\s+(v?\d[\w.*-]*)$/);
+    if (hy) return satisfiesOne(ver, '>=' + hy[1]) && satisfiesOne(ver, '<=' + hy[2]);
+    const parts = [];
+    COMPARATOR_RE.lastIndex = 0;
+    let m;
+    while ((m = COMPARATOR_RE.exec(t)) !== null) parts.push((m[1] || '') + m[2]);
     return parts.length ? parts.every(p => satisfiesOne(ver, p)) : false;
   });
 }

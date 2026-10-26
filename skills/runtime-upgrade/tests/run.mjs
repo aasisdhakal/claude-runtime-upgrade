@@ -60,6 +60,43 @@ t('and-comparators', () => { ok(satisfies('18.5.0', '>=18.0.0 <19.0.0'), 'in'); 
 t('tilde range', () => { ok(satisfies('8.2.9', '~8.2.1'), 'in'); ok(!satisfies('8.3.0', '~8.2.1'), 'out'); });
 t('bare major equality', () => { ok(satisfies('20.11.1', '20'), 'in'); ok(!satisfies('21.0.0', '20'), 'out'); });
 t('v-prefix tolerated', () => ok(satisfies('v24.22.1', '24.x'), 'leading v'));
+t('REGRESSION: space between operator and version', () => {
+  // Found by running against a real production repo: ">= 20" was tokenised as [">=","20"],
+  // the orphaned operator failed to parse, and SIX packages were falsely
+  // reported as blocking the upgrade. Any range with a space must work.
+  ok(satisfies('24.22.1', '>= 20'), '>= 20 must match 24.22.1');
+  ok(satisfies('24.22.1', '> 18'), '> 18');
+  ok(satisfies('24.22.1', '>= 16.0.0'), '>= 16.0.0');
+  ok(satisfies('24.22.1', '<= 30'), '<= 30');
+  ok(satisfies('24.22.1', '>= 0.8.0'), '>= 0.8.0');
+  ok(!satisfies('24.22.1', '>= 25'), '>= 25 must NOT match');
+  ok(!satisfies('16.0.0', '>= 20'), 'lower version must not match >= 20');
+});
+t('spaced and unspaced forms agree', () => {
+  for (const [a, b] of [['>=20', '>= 20'], ['>18', '> 18'], ['<=30', '<= 30'], ['>=16.0.0', '>= 16.0.0']])
+    eq(satisfies('24.22.1', a), satisfies('24.22.1', b), `${a} vs ${b}`);
+});
+t('partial caret and tilde', () => {
+  ok(satisfies('24.22.1', '^24'), '^24'); ok(!satisfies('24.22.1', '^22'), '^22');
+  ok(satisfies('8.4.0', '^8.1'), '^8.1 allows 8.4'); ok(!satisfies('9.0.0', '^8.1'), '^8.1 stops at 9');
+  ok(satisfies('8.3.9', '~8.3'), '~8.3'); ok(!satisfies('8.4.0', '~8.3'), '~8.3 stops at 8.4');
+});
+t('hyphen range', () => {
+  ok(satisfies('20.5.0', '1.2.3 - 22.0.0'), 'inside');
+  ok(!satisfies('24.0.0', '1.2.3 - 22.0.0'), 'outside');
+});
+t('wildcard matches anything', () => { ok(satisfies('24.22.1', '*'), '*'); ok(satisfies('1.0.0', 'x'), 'x'); });
+t('real engines fields seen in the wild', () => {
+  const real = [
+    ['>= 20', true], ['>=20.0.0', true], ['>= 16.0.0', true], ['>= 12', true],
+    ['^20.19.0 || ^22.13.0 || >=24.11.0', true],
+    ['>=20.19.0 <22.0.0 || >=22.12.0 <23.0.0 || >=23.2.0', true],
+    ['^18.14.0 || ^20.0.0 || ^22.0.0 || >=24.0.0', true],
+    ['>=24.9.0', true], ['^14.15.0 || ^16.10.0 || >=18.0.0', true],
+    ['>= 25', false], ['^22.0.0', false],
+  ];
+  for (const [r, want] of real) eq(satisfies('24.22.1', r), want, `engines "${r}"`);
+});
 t('rangeMajor', () => { eq(rangeMajor('>= 20.x'), '20'); eq(rangeMajor('^18.2.0'), '18'); eq(rangeMajor(''), ''); });
 t('rangeMajorMinor', () => { eq(rangeMajorMinor('^8.1'), '8.1'); eq(rangeMajorMinor('>=7.4.0'), '7.4'); });
 t('compare orders cycles', () => { ok(compare('24', '8.5') > 0, '24>8.5'); ok(compare('8.5', '8.4') > 0, '8.5>8.4'); });
