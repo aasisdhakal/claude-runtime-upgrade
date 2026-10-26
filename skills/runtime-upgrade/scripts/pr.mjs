@@ -13,6 +13,7 @@
 //   patch  write a .patch file and change nothing remote
 import { resolve, join, existsSync, readJson, emit, die } from './lib/io.mjs';
 import { have, run } from './lib/sh.mjs';
+import { PR_PROVIDERS, hostOf, slugOf, compareUrl, availability, pickSuggestion } from './lib/providers.mjs';
 import { writeFileSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
@@ -27,23 +28,8 @@ const git = (...a) => run('git', a, { cwd: DIR, timeout: 60000 });
 
 function remoteInfo() {
   const url = git('remote', 'get-url', 'origin').stdout.trim();
-  if (!url) return { url: null, host: null, slug: null };
-  const m = url.match(/(?:git@|https?:\/\/)([^/:]+)[/:]([^/]+\/[^/]+?)(?:\.git)?$/);
-  return { url, host: m?.[1] || null, slug: m?.[2] || null };
+  return { url, host: hostOf(url), slug: slugOf(url) };
 }
-
-const TOOLS = [
-  { id: 'gh',    bin: 'gh',   label: 'GitHub CLI',        hosts: [/github\.com$/],
-    note: 'opens a real PR; needs `gh auth login`' },
-  { id: 'glab',  bin: 'glab', label: 'GitLab CLI',        hosts: [/gitlab/],
-    note: 'opens a merge request; needs `glab auth login`' },
-  { id: 'tea',   bin: 'tea',  label: 'Gitea/Forgejo CLI', hosts: [/gitea|forgejo|codeberg/],
-    note: 'opens a PR on Gitea-family hosts; needs `tea login add`' },
-  { id: 'push',  bin: 'git',  label: 'git push + compare URL', hosts: [/.*/],
-    note: 'pushes the branch and prints the URL to open the PR by hand — works on any host' },
-  { id: 'patch', bin: 'git',  label: 'patch file',        hosts: [/.*/],
-    note: 'writes a .patch and touches no remote at all — right for air-gapped or review-first flows' },
-];
 
 function detect() {
   const r = remoteInfo();
@@ -53,16 +39,8 @@ function detect() {
   const ahead = git('rev-list', '--count', `${base}..HEAD`).stdout.trim();
   return {
     dir: DIR, branch, base, commitsAhead: Number(ahead) || 0, remote: r,
-    available: TOOLS.map(t => ({
-      id: t.id, label: t.label, installed: have(t.bin),
-      suitsHost: r.host ? t.hosts.some(h => h.test(r.host)) : t.id === 'patch',
-      note: t.note,
-    })),
-    // a recommendation, never a decision
-    suggestion: (() => {
-      const fit = TOOLS.find(t => have(t.bin) && r.host && t.hosts.some(h => h.test(r.host)) && t.id !== 'push' && t.id !== 'patch');
-      return fit ? fit.id : (r.url ? 'push' : 'patch');
-    })(),
+    available: availability(PR_PROVIDERS, r.host),
+    suggestion: pickSuggestion(PR_PROVIDERS, r.host),
     choiceIsYours: 'Nothing is opened or pushed unless you pass --tool and --push. '
                  + 'Pick whichever of these fits your workflow; the plan and the diff are identical either way.',
   };
@@ -113,11 +91,18 @@ if (cmd === 'open') {
   const tool = flag('tool');
   const d = detect();
   if (!tool) {
-    emit({ ...d, error: 'no --tool given', howToChoose: TOOLS.map(t => `--tool ${t.id}  — ${t.label}: ${t.note}`) });
+    emit({ ...d, error: 'no --tool given',
+           howToChoose: PR_PROVIDERS.map(t => `--tool ${t.id}  — ${t.label}`
+             + (t.note ? `: ${t.note}` : t.auth ? ` (needs: ${t.auth})` : '')) });
     process.exit(2);
   }
-  const t = TOOLS.find(x => x.id === tool) || die(`unknown tool: ${tool}. known: ${TOOLS.map(x => x.id).join(', ')}`, 2);
-  if (!have(t.bin)) die(`${t.bin} is not installed — pick another --tool (see: pr.mjs detect ${DIR})`);
+  const t = PR_PROVIDERS.find(x => x.id === tool)
+    || die(`unknown tool: ${tool}. known: ${PR_PROVIDERS.map(x => x.id).join(', ')}`, 2);
+  // a DRY RUN must work without the binary: showing the command you would need
+  // is exactly the point. Only acting requires it.
+  if (t.bin && !have(t.bin) && has('push'))
+    die(`${t.bin} is not installed — pick another --tool (see: pr.mjs detect ${DIR})`
+        + (t.auth ? `\nif you do install it: ${t.auth}` : ''));
   if (!d.commitsAhead) die(`branch ${d.branch} has no commits ahead of ${d.base} — nothing to open a PR for`);
 
   const title = flag('title') || `Upgrade runtime on ${d.branch.replace(/^runtime\//, '')}`;
@@ -136,6 +121,9 @@ if (cmd === 'open') {
   if (!has('push')) {
     emit({ tool: t.id, branch: d.branch, base: d.base, wouldRun: describe(t, d, title),
            pushed: false, opened: false,
+           cliInstalled: t.bin ? have(t.bin) : true,
+           setup: t.bin && !have(t.bin) ? `install ${t.bin}, then: ${t.auth}` : null,
+           compareUrlIfYouPreferTheWebUi: compareUrl(d.remote.host, d.remote.slug, d.base, d.branch),
            note: 'dry run — re-run with --push to actually push the branch and open the request' });
     process.exit(0);
   }
@@ -144,19 +132,14 @@ if (cmd === 'open') {
   if (!pushed.ok) die(`git push failed: ${(pushed.stderr || pushed.stdout).trim().slice(0, 300)}`);
 
   if (t.id === 'push') {
-    const compare = d.remote.host && d.remote.slug
-      ? `https://${d.remote.host}/${d.remote.slug}/compare/${d.base}...${d.branch}`
-      : null;
+    const compare = compareUrl(d.remote.host, d.remote.slug, d.base, d.branch);
     emit({ tool: t.id, pushed: true, opened: false, branch: d.branch, compareUrl: compare,
            body: text, note: 'branch pushed; open the request yourself at the URL above' });
     process.exit(0);
   }
 
-  const args = t.id === 'gh'
-    ? ['pr', 'create', '--base', d.base, '--head', d.branch, '--title', title, '--body', text, ...(has('draft') ? ['--draft'] : [])]
-    : t.id === 'glab'
-    ? ['mr', 'create', '--target-branch', d.base, '--source-branch', d.branch, '--title', title, '--description', text, ...(has('draft') ? ['--draft'] : [])]
-    : ['pr', 'create', '--base', d.base, '--head', d.branch, '--title', title, '--description', text];
+  const args = t.args({ base: d.base, branch: d.branch, title, body: text,
+                        draft: has('draft'), repo: flag('repo'), workItems: flag('work-items') });
   const r = run(t.bin, args, { cwd: DIR, timeout: 180000 });
   emit({ tool: t.id, pushed: true, opened: r.ok, url: (r.stdout.match(/https?:\/\/\S+/) || [])[0] || null,
          output: (r.stdout || r.stderr).slice(0, 2000) });
@@ -164,10 +147,9 @@ if (cmd === 'open') {
 }
 
 function describe(t, d, title) {
-  if (t.id === 'push') return `git push -u origin ${d.branch}`;
-  if (t.id === 'gh')   return `git push -u origin ${d.branch} && gh pr create --base ${d.base} --title "${title}" --body <generated>`;
-  if (t.id === 'glab') return `git push -u origin ${d.branch} && glab mr create --target-branch ${d.base} --title "${title}"`;
-  return `git push -u origin ${d.branch} && tea pr create --base ${d.base} --title "${title}"`;
+  if (!t.args) return `git push -u origin ${d.branch}`;
+  const a = t.args({ base: d.base, branch: d.branch, title, body: '<generated>' });
+  return `git push -u origin ${d.branch} && ${t.bin} ${a.join(' ')}`;
 }
 
 die(`unknown command: ${cmd}`, 2);

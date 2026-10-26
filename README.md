@@ -126,18 +126,28 @@ node skills/runtime-upgrade/scripts/fix.mjs elixir ./repo 1.12 1.20 --apply
 
 `--list` is your decision point. `--only a,b` applies a subset. Dry run by default; `--apply` goes through the same guard as everything else.
 
-## Pull requests — your tool, your call
+## Pull requests — your forge, your call
 
 ```bash
-node skills/runtime-upgrade/scripts/pr.mjs detect ./repo    # what's available here?
-node skills/runtime-upgrade/scripts/pr.mjs open ./repo --tool gh --push
+node skills/runtime-upgrade/scripts/pr.mjs detect ./repo
+node skills/runtime-upgrade/scripts/pr.mjs open ./repo --tool az --push
 ```
 
-Five routes: **`gh`** (GitHub), **`glab`** (GitLab), **`tea`** (Gitea/Forgejo), **`push`** (push + compare URL, works anywhere), **`patch`** (a `.patch` file, no remote contacted).
+**GitHub** (`gh`) · **GitLab** (`glab`) · **Azure DevOps** (`az`, with `--work-items`) · **Bitbucket** (`bb`) · **Gitea/Forgejo** (`tea`) · **`push`** (compare URL, any host) · **`patch`** (no remote contacted).
 
-`detect` reports what's installed and what suits your remote, then emits a **suggestion — explicitly not a decision**. Without `--tool` it refuses and lists the options; without `--push` it's a dry run; there is no force-push path in the file.
+The remote is classified from its URL, and a self-hosted forge is reported verbatim rather than guessed at. `detect` says what is installed, what suits the host, and how to authenticate each — then suggests, **never decides**.
 
-The PR body comes from the plan: EOL status, CVE delta, cycles crossed, blockers with evidence, what was checked and found *not* to be a blocker, the verification ladder, and the rollback trigger.
+Without `--tool` it refuses. Without `--push` it is a dry run — and that dry run works even when the CLI is *not installed*, printing the command, the install step, and a web-UI fallback URL. There is no force-push path in the file.
+
+## Tickets — a separate choice
+
+```bash
+node skills/runtime-upgrade/scripts/issue.mjs create --plan plan.json --tool jira --apply
+```
+
+**Jira** (`jira-cli` or the Atlassian MCP connector) · **Azure Boards** · **GitHub Issues** · **GitLab Issues** · **Linear** · **Gitea** · **CSV** (Jira, Azure Boards, Linear and GitHub all import it) · **Markdown**.
+
+Code review and issue tracking are independent — teams review on GitHub and track in Jira, or ship from Azure Repos into Azure Boards. An epic plus one task per target is generated from the plan, carrying EOL status, CVE delta, blockers, steps, rollback and risk. An uninstalled CLI still prints what it would run plus the routes that need nothing, and a failure **stops rather than half-filing**.
 
 ## Write mode is enforced, not requested
 
@@ -230,7 +240,7 @@ now a named regression test.
 node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
-155 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
+165 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
 
 CI runs the suite on **ubuntu + macOS × Node 18/20/22/24**, plus an offline job, plus a weekly cron to catch upstream feed changes.
 

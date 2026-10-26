@@ -6,6 +6,7 @@ import { runJson, run } from '../scripts/lib/sh.mjs';
 import { fetchJson } from '../scripts/lib/io.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
 import { stripNonCode } from '../scripts/lib/strip.mjs';
+import { PR_PROVIDERS, ISSUE_PROVIDERS, hostOf, slugOf, compareUrl, pickSuggestion } from '../scripts/lib/providers.mjs';
 import { RULES, rulesFor, inheritedCatalogue } from '../scripts/lib/breaking.mjs';
 import { adapters, byId, adaptersForManifest } from '../scripts/adapters/index.mjs';
 import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
@@ -941,17 +942,21 @@ t('pr: detect lists every tool and never decides', () => gitRepo(r => {
   const v = pr('detect', r);
   ok(v.data, 'produced JSON');
   const ids = v.data.available.map(t => t.id).sort();
-  eq(ids, ['gh', 'glab', 'patch', 'push', 'tea'], 'all five routes offered');
+  eq(ids, ['az', 'bb', 'gh', 'glab', 'patch', 'push', 'tea'],
+     'GitHub, GitLab, Azure DevOps, Gitea and Bitbucket, plus two universal routes');
   ok(v.data.suggestion, 'a suggestion exists');
   ok(/not a decision|whichever/i.test(v.data.choiceIsYours), 'and it is framed as the user\'s choice');
-  for (const t2 of v.data.available) ok(t2.note && t2.note.length > 10, `${t2.id} explains itself`);
+  // each route either carries a note or says how to authenticate
+  for (const t2 of v.data.available)
+    ok((t2.note && t2.note.length > 10) || (t2.auth && t2.auth.length > 5),
+       `${t2.id} must explain itself or say how to authenticate`);
 }));
 t('pr: open without --tool refuses and explains the options', () => gitRepo(r => {
   const v = run(process.execPath, [S('pr.mjs'), 'open', r]);
   ok(v.status !== 0, 'must not proceed');
   const j = JSON.parse(v.stdout);
   eq(j.error, 'no --tool given');
-  eq(j.howToChoose.length, 5, 'all five explained');
+  eq(j.howToChoose.length, PR_PROVIDERS.length, 'every route explained');
 }));
 t('pr: open without --push changes nothing', () => gitRepo(r => {
   run('git', ['checkout', '-qb', 'runtime/node-24.22.1'], { cwd: r });
@@ -1222,6 +1227,118 @@ t('suffix: CI container images get the same mapping as Dockerfiles', () => {
     ok(/alpine3\.22/.test(ci[0].after), `CI: ${ci[0].after.trim()}`);
     ok(/alpine3\.22/.test(df), `Dockerfile: ${df.trim()}`);
   } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────── forges and issue trackers ─────────────
+console.log('\nforges and trackers');
+function issue(...a) { return runJson(process.execPath, [S('issue.mjs'), ...a]); }
+
+t('forge: every major host is identified from its remote URL', () => {
+  const cases = [
+    ['git@github.com:a/b.git', 'github'],
+    ['https://gitlab.com/a/b.git', 'gitlab'],
+    ['git@bitbucket.org:a/b.git', 'bitbucket'],
+    ['https://dev.azure.com/org/proj/_git/repo', 'azure'],
+    ['https://acme.visualstudio.com/proj/_git/repo', 'azure'],
+    ['https://codeberg.org/a/b.git', 'gitea'],
+    ['https://gitlab.internal.corp/a/b.git', 'gitlab'],
+  ];
+  for (const [url, want] of cases) eq(hostOf(url), want, url);
+  // a self-hosted forge we do not recognise is reported verbatim, not guessed
+  eq(hostOf('git@git.acme.internal:a/b.git'), 'git.acme.internal');
+  eq(hostOf(null), null);
+});
+t('forge: a compare URL is produced per forge', () => {
+  for (const host of ['github', 'gitlab', 'bitbucket', 'azure']) {
+    const u = compareUrl(host, 'a/b', 'main', 'runtime/node-24');
+    ok(u && u.startsWith('http'), `${host}: ${u}`);
+    ok(u.includes('runtime/node-24'), `${host} URL names the branch`);
+  }
+});
+t('forge: PR providers cover GitHub, GitLab, Azure, Gitea, Bitbucket + 2 universal', () => {
+  const ids = PR_PROVIDERS.map(p => p.id);
+  for (const want of ['gh', 'glab', 'az', 'tea', 'bb', 'push', 'patch']) ok(ids.includes(want), want);
+  // every CLI provider must know how to build its own arguments and say how to auth
+  for (const p of PR_PROVIDERS.filter(x => x.args)) {
+    ok(typeof p.args === 'function', `${p.id} args`);
+    ok(p.auth, `${p.id} must say how to authenticate`);
+    const a = p.args({ base: 'main', branch: 'b', title: 't', body: 'd' });
+    ok(Array.isArray(a) && a.length > 3, `${p.id} builds args`);
+  }
+});
+t('forge: a suggestion is never null — there is always a route', () => {
+  for (const host of ['github', 'gitlab', 'azure', 'bitbucket', 'gitea', 'git.acme.internal', null])
+    ok(pickSuggestion(PR_PROVIDERS, host), `no suggestion for ${host}`);
+});
+t('tracker: providers cover Jira, Azure Boards, GitHub, GitLab, Linear, Gitea + CLI-less', () => {
+  const ids = ISSUE_PROVIDERS.map(p => p.id);
+  for (const want of ['jira', 'jira-mcp', 'az-boards', 'gh-issue', 'glab-issue', 'linear', 'tea-issue', 'csv', 'markdown'])
+    ok(ids.includes(want), want);
+  for (const p of ISSUE_PROVIDERS.filter(x => x.args)) {
+    const a = p.args({ title: 't', body: 'b', type: 'Task', labels: ['x'] });
+    ok(Array.isArray(a) && a.includes('t'), `${p.id} passes the title through`);
+  }
+});
+t('tracker: csv and markdown need no CLI and contact nothing', () => {
+  for (const id of ['csv', 'markdown', 'jira-mcp']) {
+    const p = ISSUE_PROVIDERS.find(x => x.id === id);
+    eq(p.bin, null, `${id} must need no binary`);
+  }
+});
+t('tracker: create without --tool refuses and lists every option', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-iss-'));
+  try {
+    writeFileSync(join(r, 'plan.json'), JSON.stringify({ totalEstimatePoints: 5, plans: [
+      { dir: '.', name: 'svc', lang: 'node', current: '20.11.1', target: '24.22.1',
+        verdict: 'proceed', estimatePoints: 5, risk: { level: 'low', signals: [] },
+        eol: { isEol: true, date: '2026-04-30', targetEol: '2028-04-30' },
+        cve: { gateCapable: true, currentBlocking: 12, targetBlocking: 0, removed: 12 },
+        steps: [{ n: 1, title: 'x', why: 'y', exit: 'z' }] }] }));
+    const v = run(process.execPath, [S('issue.mjs'), 'create', '--plan', join(r, 'plan.json')]);
+    ok(v.status !== 0, 'must not proceed');
+    const j = JSON.parse(v.stdout);
+    eq(j.error, 'no --tool given');
+    eq(j.howToChoose.length, ISSUE_PROVIDERS.length, 'every tracker is explained');
+    eq(j.ticketsReady, 2, 'an epic plus one task');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('tracker: csv output is valid and carries the epic + each target', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-iss2-'));
+  try {
+    writeFileSync(join(r, 'plan.json'), JSON.stringify({ totalEstimatePoints: 9, plans: [
+      { dir: 'a', name: 'a', lang: 'node', current: '20', target: '24', verdict: 'proceed',
+        estimatePoints: 4, risk: { level: 'high', signals: ['x'] }, steps: [] },
+      { dir: 'b', name: 'b', lang: 'php', current: '8.1', target: '8.4', verdict: 'proceed',
+        estimatePoints: 5, risk: { level: 'low', signals: [] }, steps: [] }] }));
+    const out = join(r, 'out.csv');
+    const v = issue('create', r, '--plan', join(r, 'plan.json'), '--tool', 'csv', '--out', out);
+    eq(v.data.filed, false, 'csv files nothing remotely');
+    const text = readFileSync(out, 'utf8');
+    const Q = String.fromCharCode(34);
+    let quotes = 0; for (const c of text) if (c === Q) quotes++;
+    eq(quotes % 2, 0, 'quotes are balanced');
+    ok(/Epic/.test(text) && /node 20 -> 24/.test(text) && /php 8\.1 -> 8\.4/.test(text), 'all rows present');
+    ok(/high-risk/.test(text), 'risk is carried into labels');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('tracker: an uninstalled CLI still shows the command and the alternatives', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-iss3-'));
+  try {
+    writeFileSync(join(r, 'plan.json'), JSON.stringify({ plans: [
+      { dir: '.', name: 's', lang: 'node', current: '20', target: '24', verdict: 'proceed',
+        estimatePoints: 3, risk: { level: 'low', signals: [] }, steps: [] }] }));
+    const v = issue('create', r, '--plan', join(r, 'plan.json'), '--tool', 'linear');
+    eq(v.data.filed, false);
+    ok(v.data.setup && /install linear/.test(v.data.setup), 'says how to install');
+    ok(v.data.alternatives.includes('--tool csv'), 'offers a route that needs nothing');
+    ok(v.data.wouldRun.length >= 2, 'shows the commands it would run');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('tracker: PR tool and issue tool are independent choices', () => {
+  // reviewing on GitHub while tracking in Jira is normal
+  const prIds = new Set(PR_PROVIDERS.map(p => p.id));
+  const issueIds = new Set(ISSUE_PROVIDERS.map(p => p.id));
+  eq([...prIds].filter(x => issueIds.has(x)), [], 'the two registries share no ids');
 });
 
 // ───────────────────────── doctor ─────────────────────────

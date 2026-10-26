@@ -228,25 +228,45 @@ node $SK/scripts/pr.mjs body   <dir> --plan plan.json     # render the descripti
 node $SK/scripts/pr.mjs open   <dir> --tool <t> [--push]  # act
 ```
 
-**Five routes. Ask the user which one; never choose for them.**
-
-| `--tool` | What it does |
+| `--tool` | |
 |---|---|
-| `gh` | opens a GitHub PR |
-| `glab` | opens a GitLab merge request |
-| `tea` | opens a PR on Gitea/Forgejo/Codeberg |
-| `push` | pushes the branch and prints the compare URL — works on any host |
-| `patch` | writes a `.patch` plus the description and **contacts no remote at all** |
+| `gh` | GitHub pull request |
+| `glab` | GitLab merge request |
+| `az` | **Azure DevOps** pull request (`az repos pr create`, supports `--work-items`) |
+| `bb` | Bitbucket pull request |
+| `tea` | Gitea / Forgejo / Codeberg |
+| `push` | push the branch, print the compare URL — **works on any host** |
+| `patch` | a `.patch` plus the description; **contacts no remote** |
 
-`pr.mjs detect` reports which tools are installed, which suit the remote, and what each needs. It emits a `suggestion` — explicitly labelled as a suggestion, not a decision.
+`detect` reports what is installed, what suits the remote, and how to authenticate each. The remote is classified from its URL — github, gitlab, bitbucket, azure (`dev.azure.com` and `*.visualstudio.com`), gitea — and a **self-hosted forge is reported verbatim rather than guessed at**.
 
 Safety, enforced in code:
-- **without `--tool` it refuses** and lists the five options
-- **without `--push` it is a dry run** — it prints the exact command it would run and changes nothing
-- **there is no force-push path in the file**; a test asserts it
-- it refuses a branch with no commits ahead of the base
+- **without `--tool` it refuses** and lists every route
+- **without `--push` it is a dry run** — and the dry run works even when the CLI is *not installed*, printing the exact command, the install/auth step, and a web-UI compare URL
+- **there is no force-push path**; a test asserts it
+- a `suggestion` is always offered and **never null** — there is always some route
 
-The PR body is generated from the plan: EOL status, the CVE delta, cycles crossed, blockers with evidence, what was checked and found *not* to be a blocker, the verification ladder, and the rollback trigger.
+## Phase 4c — FILE THE TICKETS (a separate choice)
+
+```bash
+node $SK/scripts/issue.mjs detect [dir]
+node $SK/scripts/issue.mjs render --plan plan.json --format md|csv|json
+node $SK/scripts/issue.mjs create --plan plan.json --tool <t> [--apply]
+```
+
+| `--tool` | |
+|---|---|
+| `jira` | Jira via `jira-cli` |
+| `jira-mcp` | Jira via the **Atlassian connector** — no CLI; the assistant calls `createJiraIssue` |
+| `az-boards` | **Azure Boards** work items (`az boards work-item create`) |
+| `gh-issue` · `glab-issue` · `tea-issue` | GitHub / GitLab / Gitea issues |
+| `linear` | Linear CLI |
+| `csv` | bulk import — Jira, Azure Boards, Linear and GitHub all accept it |
+| `markdown` | one file per ticket; review before anything is filed |
+
+**Code review and issue tracking are separate choices.** Plenty of teams review on GitHub and track in Jira, or ship from Azure Repos into Azure Boards — so the two registries are independent and share no ids.
+
+An epic plus one task per target is generated from the plan, carrying the EOL status, CVE delta, blockers, steps, rollback and risk. Nothing is filed without `--tool` and `--apply`; an uninstalled CLI still prints the command it would run plus the routes that need nothing. On a failure it **stops rather than half-filing**.
 
 ## Phase 5 — VERIFY
 
