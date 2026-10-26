@@ -5,10 +5,29 @@ import { fetchJson, emit, die, OFFLINE } from './lib/io.mjs';
 import { byId } from './adapters/index.mjs';
 import { rangeMajor, rangeMajorMinor, compare } from './lib/semver.mjs';
 
-const [, , langArg, current, targetArg] = process.argv;
-if (!langArg || !current) die('usage: research.mjs <lang> <current-version> [target-version]', 2);
-const A = byId[langArg];
-if (!A) die(`unsupported language: ${langArg}. known: ${Object.keys(byId).join(', ')}`, 2);
+const argv = process.argv.slice(2);
+const [langArg, current, targetArg] = argv.filter(a => !a.startsWith('--'));
+if (!langArg || !current) die('usage: research.mjs <lang|product> <current-version> [target] [--product <endoflife-slug>]', 2);
+
+/**
+ * Any of the 485 products endoflife.date tracks can be researched, adapter or
+ * not. With an adapter you also get runtime-CVE gating and discovery; without
+ * one you still get EOL, support windows and a target recommendation.
+ */
+const pi = argv.indexOf('--product');
+const explicitProduct = pi >= 0 ? argv[pi + 1] : null;
+let A = byId[langArg];
+if (!A) {
+  const product = explicitProduct || langArg;
+  A = {
+    id: langArg, label: langArg, eolProduct: product, osvEcosystem: null,
+    gateCapable: false, generic: true,
+    gateNote: `No adapter exists for "${langArg}". EOL and support windows come from `
+            + `endoflife.date/${product}; there is no runtime CVE gating, no discovery and no `
+            + `remediation for it. Add an adapter under scripts/adapters/ to get those.`,
+    cveSource: { url: null, note: 'none — generic endoflife.date lookup only' },
+  };
+}
 
 const today = new Date().toISOString().slice(0, 10);
 const isNode = A.id === 'node';
@@ -131,6 +150,8 @@ emit({
     gateValueTarget: gateMetric ? (gateMetric === 'total' ? targetCve.total : targetCve.blocking) : null,
   },
   runtimeCveSource: A.cveSource.note,
+  adapter: A.generic ? null : A.id,
+  generic: !!A.generic,
   gateCapable: A.gateCapable,
   gateMetric,
   gateNote: A.gateNote || null,

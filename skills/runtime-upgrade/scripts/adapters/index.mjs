@@ -19,17 +19,25 @@ import * as ruby from './ruby.mjs';
 import * as rust from './rust.mjs';
 import * as java from './java.mjs';
 import * as dotnet from './dotnet.mjs';
+import { deno, bun, elixir, erlang, kotlin, scala, perl } from './_generated.mjs';
 
-export const adapters = [node, php, go, python, ruby, rust, java, dotnet];
+export const adapters = [node, php, go, python, ruby, rust, java, dotnet,
+                         deno, bun, elixir, erlang, kotlin, scala, perl];
 export const byId = Object.fromEntries(adapters.map(a => [a.id, a]));
 export const allManifests = new Set(adapters.flatMap(a => a.manifests));
 
 export function matchesManifest(filename) {
   return adapters.some(a => a.manifests.includes(filename) || (a.manifestMatch && a.manifestMatch(filename)));
 }
-export function adapterForManifest(filename) {
-  // exact manifest names win over pattern matches (global.json before *.csproj)
-  return adapters.find(a => a.manifests.includes(filename))
-      || adapters.find(a => a.manifestMatch && a.manifestMatch(filename))
-      || null;
+/**
+ * ALL adapters that claim a filename, not just the first.
+ * A Kotlin-on-JVM project has both a Kotlin version and a JVM target; a repo
+ * with package.json + bun.lock is both Node and Bun. Returning one adapter
+ * silently loses the other — which is how Kotlin got reported as Java.
+ */
+export function adaptersForManifest(filename) {
+  const exact = adapters.filter(a => a.manifests.includes(filename));
+  const pattern = adapters.filter(a => a.manifestMatch && a.manifestMatch(filename) && !exact.includes(a));
+  return [...exact, ...pattern];
 }
+export function adapterForManifest(filename) { return adaptersForManifest(filename)[0] || null; }

@@ -5,8 +5,9 @@ import { build, destroy, FIXTURES } from './fixtures.mjs';
 import { runJson, run } from '../scripts/lib/sh.mjs';
 import { fetchJson } from '../scripts/lib/io.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
-import { adapters, byId } from '../scripts/adapters/index.mjs';
+import { adapters, byId, adaptersForManifest } from '../scripts/adapters/index.mjs';
 import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
+import { PIN_RULES, planPinEdits, unified } from '../scripts/lib/edits.mjs';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -166,14 +167,20 @@ t('X-range bounds follow npm semantics', () => {
 // ───────────────────────── adapters ─────────────────────────
 console.log('\nadapters');
 t('registry exposes all supported languages', () =>
-  eq(adapters.map(a => a.id).sort(), ['dotnet','go','java','node','php','python','ruby','rust']));
+  eq(adapters.map(a => a.id).sort(),
+     ['bun','deno','dotnet','elixir','erlang','go','java','kotlin','node','perl','php','python','ruby','rust','scala']));
 t('node is gate-capable, php is not', () => { ok(byId.node.gateCapable === true, 'node'); ok(byId.php.gateCapable === false, 'php'); });
-t('no two adapters claim the same manifest filename', () => {
-  const seen = new Map();
-  for (const a of adapters) for (const m of a.manifests) {
-    ok(!seen.has(m), `${m} claimed by both ${seen.get(m)} and ${a.id}`);
-    seen.set(m, a.id);
-  }
+t('shared manifests resolve to EVERY claiming adapter', () => {
+  // build.gradle.kts is both a Java and a Kotlin manifest. Returning one
+  // adapter silently loses the other — that is how Kotlin got reported as Java.
+  const kts = adaptersForManifest('build.gradle.kts').map(a => a.id).sort();
+  ok(kts.includes('java') && kts.includes('kotlin'), `build.gradle.kts -> ${kts.join(',')}`);
+  eq(adaptersForManifest('go.mod').map(a => a.id), ['go'], 'unshared manifests resolve to one');
+  eq(adaptersForManifest('nonsense.txt'), [], 'unknown filenames resolve to none');
+});
+t('a different axis never counts as drift', () => {
+  // Kotlin's JVM toolchain and Scala's cross-build matrix are separate axes.
+  for (const id of ['kotlin', 'scala', 'elixir']) ok(byId[id], `${id} registered`);
 });
 t('every adapter has a distinct id and an imageRe', () => {
   eq(new Set(adapters.map(a => a.id)).size, adapters.length, 'ids unique');
@@ -363,6 +370,21 @@ await ta('target auto-selection avoids EOL cycles', async () => {
   ok(r.data.target.eol > today, `auto-selected target ${r.data.target.version} must not be EOL`);
   eq(r.data.target.autoSelected, true);
 });
+await ta('generic: any endoflife.date product works without an adapter', async () => {
+  if (!reach.data) return 'skip';
+  const r = runJson(process.execPath, [S('research.mjs'), 'postgresql', '14']);
+  ok(r.data, 'produced JSON');
+  eq(r.data.generic, true, 'flagged as generic');
+  eq(r.data.adapter, null, 'no adapter claimed');
+  eq(r.data.gateCapable, false, 'generic lookups never gate');
+  ok(r.data.gateNote && /No adapter exists/.test(r.data.gateNote), 'explains the limitation');
+  ok(r.data.target.version, 'still recommends a target');
+});
+await ta('generic: an adapter always wins over the generic path', async () => {
+  if (!reach.data) return 'skip';
+  const r = runJson(process.execPath, [S('research.mjs'), 'node', '20.11.1']);
+  eq(r.data.generic, false); eq(r.data.adapter, 'node'); eq(r.data.gateCapable, true);
+});
 await ta('offline mode never calls out', async () => {
   const r = runJson(process.execPath, [S('research.mjs'), 'node', '20.11.1'], { env: { RU_OFFLINE: '1' } });
   if (!r.data) return 'skip';
@@ -503,6 +525,84 @@ t('guard: refuses on a non-git directory', () => {
     ok(v.status !== 0, 'must refuse');
     ok(/not a git repository/.test(v.stderr), 'must say why');
   } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────────────────── remediation ─────────────────────────
+console.log('\nremediation');
+const remediate = (...a) => runJson(process.execPath, [S('remediate.mjs'), ...a]);
+
+t('remediate: dry-run writes nothing', () => withFixture('single-node', r => {
+  const before = readFileSync(join(r, 'package.json'), 'utf8');
+  const v = remediate('node', r, '24.22.1', '--deps', 'none');
+  ok(v.data, 'produced JSON');
+  eq(v.data.mode, 'dry-run');
+  ok(v.data.runtimePins.count >= 3, `expected >=3 pins, got ${v.data.runtimePins.count}`);
+  eq(readFileSync(join(r, 'package.json'), 'utf8'), before, 'file must be byte-identical');
+}));
+t('remediate: rewrites every pin location for node', () => withFixture('single-node', r => {
+  const v = remediate('node', r, '24.22.1', '--deps', 'none');
+  const files = v.data.runtimePins.files.join(' ');
+  ok(/package\.json/.test(files), 'engines'); ok(/\.nvmrc/.test(files), 'nvmrc'); ok(/Dockerfile/.test(files), 'Dockerfile');
+  const docker = v.data.runtimePins.diffs.find(d => d.file === 'Dockerfile').diff;
+  ok(/\+FROM node:24\.22\.1-alpine3\.22/.test(docker), 'alpine 3.19 must map forward to 3.22');
+}));
+t('remediate: every language has pin rules', () => {
+  for (const a of adapters) ok(PIN_RULES[a.id], `${a.id} has no pin rules`);
+});
+t('remediate: pin rules are pure functions of the target', () => {
+  // the same input must always produce the same edit — no hidden state
+  for (const id of ['node', 'php', 'go', 'python']) {
+    const a = PIN_RULES[id]('9.9.9'), b = PIN_RULES[id]('9.9.9');
+    eq(a.map(r => r.rule), b.map(r => r.rule), `${id} rule set is stable`);
+  }
+});
+t('remediate: refuses --apply when guard preflight fails', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-rem-'));
+  try {
+    run('git', ['init', '-q'], { cwd: r });
+    run('git', ['config', 'user.email', 't@t'], { cwd: r });
+    run('git', ['config', 'user.name', 'T'], { cwd: r });
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=18"}}');
+    writeFileSync(join(r, '.nvmrc'), 'v18.20.0\n');
+    run('git', ['add', '-A'], { cwd: r });
+    run('git', ['commit', '-qm', 'init'], { cwd: r });
+    const before = readFileSync(join(r, '.nvmrc'), 'utf8');
+    const v = remediate('node', r, '24.22.1', '--deps', 'none', '--apply');   // still on master
+    eq(v.data.refused, true, 'must refuse on a protected branch');
+    eq(readFileSync(join(r, '.nvmrc'), 'utf8'), before, 'a refusal must not write');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('remediate: --apply writes pins on a guarded branch', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-rem2-'));
+  try {
+    run('git', ['init', '-q'], { cwd: r });
+    run('git', ['config', 'user.email', 't@t'], { cwd: r });
+    run('git', ['config', 'user.name', 'T'], { cwd: r });
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">= 18.x"}}');
+    writeFileSync(join(r, '.nvmrc'), 'v18.20.0\n');
+    run('git', ['add', '-A'], { cwd: r });
+    run('git', ['commit', '-qm', 'init'], { cwd: r });
+    runJson(process.execPath, [S('guard.mjs'), 'branch', r, 'node', '24.22.1']);
+    const v = remediate('node', r, '24.22.1', '--deps', 'none', '--apply');
+    eq(v.data.mode, 'apply');
+    ok(!v.data.refused, 'must not refuse on a runtime/* branch');
+    eq(readFileSync(join(r, '.nvmrc'), 'utf8').trim(), 'v24.22.1', 'nvmrc rewritten');
+    ok(/">=24\.22\.1 <25"/.test(readFileSync(join(r, 'package.json'), 'utf8')), 'engines rewritten');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('remediate: dotnet container tag uses MAJOR.MINOR, not the full SDK build', () => {
+  const rules = PIN_RULES.dotnet('9.0.100');
+  const docker = rules.find(r => r.rule === 'Dockerfile FROM');
+  const out = docker.edit('FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build\n');
+  ok(/dotnet\/sdk:9\.0\b/.test(out) && !/9\.0\.100/.test(out), `got: ${out.trim()}`);
+  const gj = rules.find(r => r.rule === 'sdk.version');
+  ok(/9\.0\.100/.test(gj.edit('{"sdk":{"version":"6.0.418"}}')), 'global.json keeps the full build');
+});
+t('remediate: unified diff round-trips', () => {
+  const before = 'a\nb\nc\n', after = 'a\nB\nc\n';
+  const d = unified('f.txt', before, after);
+  ok(/^--- a\/f\.txt/m.test(d) && /^\+\+\+ b\/f\.txt/m.test(d), 'headers');
+  ok(/^-b$/m.test(d) && /^\+B$/m.test(d), 'the changed line appears on both sides');
 });
 
 // ───────────────────────── doctor ─────────────────────────

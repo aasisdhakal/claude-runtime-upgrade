@@ -3,7 +3,7 @@
 // No find(1), no jq, no python3, no mapfile, no paste. Runs on macOS, Linux, WSL.
 // usage: node detect.mjs [root]
 import { walk, readText, readJson, existsSync, join, resolve, rel, emit, die, readdirSync } from './lib/io.mjs';
-import { adapters, matchesManifest, adapterForManifest } from './adapters/index.mjs';
+import { adapters, matchesManifest, adaptersForManifest } from './adapters/index.mjs';
 import { detectFrameworks } from './lib/frameworks.mjs';
 
 const ROOT = resolve(process.argv[2] || '.');
@@ -142,9 +142,8 @@ const targets = [];
 const seenDirs = new Set();
 for (const p of manifestPaths) {
   const filename = p.split('/').pop();
-  const adapter = adapterForManifest(filename);
-  if (!adapter) continue;
   const dir = p.slice(0, -(filename.length + 1)) || ROOT;
+  for (const adapter of adaptersForManifest(filename)) {
   // one target per (dir, adapter): Java has pom.xml AND build.gradle,
   // .NET has global.json AND *.csproj, Python has several manifests
   if (seenDirs.has(dir + '::' + adapter.id)) continue;
@@ -162,6 +161,7 @@ for (const p of manifestPaths) {
     seenDirs.add(dir + '::' + adapter.id);
   } catch (e) {
     targets.push({ lang: adapter.id, dir: rel(ROOT, dir), error: String(e.message || e) });
+  }
   }
 }
 
@@ -184,6 +184,12 @@ for (const df of dockerPaths) {
     seenDirs.add(dir + '::' + a.id);
   }
 }
+
+// an adapter can match a shared manifest (build.gradle.kts) yet find no version
+// and no dependencies — that is a non-target, not a finding
+const meaningful = targets.filter(t => t.error || t.containerOnly || t.declaredMajors
+                                   || t.deps > 0 || t.devDeps > 0 || t.lockfile);
+targets.length = 0; targets.push(...meaningful);
 
 const driftCount = targets.filter(t => t.drift).length;
 const undeclared = targets.filter(t => !t.declaredMajors).length;

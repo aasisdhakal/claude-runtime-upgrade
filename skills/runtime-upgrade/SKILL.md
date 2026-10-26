@@ -1,6 +1,6 @@
 ---
 name: runtime-upgrade
-description: Upgrade a language runtime — Node.js, PHP, Go, Python, Ruby, Rust, Java or .NET — across any repo shape (single, monorepo, polyrepo, mixed-language, container-only). Covers discovery, EOL and CVE research, framework EOL, blocker assessment, guarded code changes, and verification gates. Use when asked to upgrade, bump or modernise a language/runtime version, to check what runtime a project is on, to audit runtime or framework EOL/CVE exposure, or to plan a version migration.
+description: Upgrade a language runtime — Node.js, PHP, Go, Python, Ruby, Rust, Java, .NET, Deno, Bun, Elixir, Erlang, Kotlin, Scala or Perl — across any repo shape (single, monorepo, polyrepo, mixed-language, container-only). Covers discovery, EOL and CVE research, framework EOL, blocker assessment, rewriting runtime pins, upgrading all dependency packages, guarded commits, and verification gates. Also researches any of the 485 products endoflife.date tracks. Use when asked to upgrade, bump or modernise a language/runtime version, to check what runtime a project is on, to audit runtime or framework EOL/CVE exposure, or to plan a version migration.
 ---
 
 # Runtime upgrade (Node.js · PHP · Go · Python · Ruby · Rust · Java · .NET)
@@ -117,6 +117,18 @@ Run this during Phase 3. A framework that is years EOL changes the plan more tha
 - Node: set `engines.node` to the target → `eslint-plugin-n` then reports every forbidden API
 - PHP: set `require.php` → Rector will not apply target-version rules until you do
 
+```bash
+node $SK/scripts/remediate.mjs <lang> <dir> <target> [--deps minor|latest|patch|none] [--apply]
+```
+`remediate.mjs` does both halves of the job — it rewrites every runtime pin (manifest, version file, Dockerfile `FROM`, `.tool-versions`, CI) **and** upgrades the dependency packages with that ecosystem's own tool.
+
+- **Dry-run is the default.** It emits unified diffs and writes nothing.
+- **`--deps minor`** (default) stays inside declared semver ranges — it will NOT move an exact pin like `"ms": "2.1.2"`.
+- **`--deps latest`** crosses majors and rewrites the manifest ranges themselves. This is what "upgrade all the dependency packages" actually needs, and it is the riskier mode — never the default.
+- **`--apply` runs `guard.mjs preflight` first and refuses to write if it fails**, so changes cannot land on a protected branch.
+
+After applying: re-run `assess.mjs` (the dependency tree changed), run the suite with deprecations made fatal, then commit through `guard.mjs commit`.
+
 Then follow the per-language playbook:
 - `references/nodejs.md` — ABI ladder, N-API, AsyncContextFrame, eslint-plugin-n
 - `references/php.md` — bootstrap, Zend ABI, Rector, `composer prohibits`
@@ -174,3 +186,10 @@ Reports Node version, platform, which tools are present, **what degrades without
 | `RU_NVD=1` | enable the PHP NVD CPE lookup (advisory only) |
 | `NVD_API_KEY` | raises NVD from 5 to 50 requests per 30s |
 | `RU_JAVA_DISTRO` | which JDK distribution to resolve EOL against (default `amazon-corretto`) — **set this or Java EOL dates will be wrong** |
+
+## Languages
+
+Full adapters (discovery · EOL · dependency advisories · pin rewriting · dependency upgrade):
+**Node.js · PHP · Go · Python · Ruby · Rust · Java · .NET · Deno · Bun · Elixir · Erlang/OTP · Kotlin · Scala · Perl**
+
+Beyond those, `research.mjs <product> <version>` works for **any of the 485 products endoflife.date tracks** — PostgreSQL, Redis, nginx, Kubernetes, Terraform, Ubuntu and so on. You get EOL windows and a target recommendation; you do not get discovery, CVE gating or remediation. The output sets `generic: true` and says so. An unknown product fails cleanly rather than inventing a date.

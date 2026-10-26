@@ -2,7 +2,7 @@
 
 A Claude Code skill that takes a repo of unknown shape from *"what runtime are we even on?"* to a verified upgrade plan — with EOL dates, real CVE counts, and a blocker list that separates genuine problems from noise.
 
-Supports **Node.js, PHP, Go, Python, Ruby, Rust, Java and .NET**. Adding another is one file.
+Supports **15 languages** with full adapters, and researches **any of the 485 products endoflife.date tracks**.
 
 ```bash
 /plugin marketplace add OWNER/claude-runtime-upgrade
@@ -36,8 +36,22 @@ Five gated phases, each with a machine-checkable exit condition.
 | **Discover** | `detect.mjs` | repo shape, every runtime target, **version drift as a defect** |
 | **Research** | `research.mjs` | EOL/support windows, unpatched runtime CVEs at current *and* target |
 | **Assess** | `assess.mjs` | dependency advisories, native/ABI blockers, dependency floors |
-| **Remediate** | *(guided)* | per-language playbook in `references/` |
+| **Remediate** | `remediate.mjs` | **rewrites every runtime pin AND upgrades all dependency packages** |
 | **Verify** | `verify.mjs` | gates that exit non-zero on failure |
+
+Plus `frameworks.mjs` (framework EOL), `guard.mjs` (enforced write mode) and `doctor.mjs`.
+
+### Remediation actually upgrades things
+
+```bash
+node skills/runtime-upgrade/scripts/remediate.mjs node ./repo 24.22.1 --deps latest --apply
+```
+Rewrites `engines`, `.nvmrc`, `.tool-versions`, every Dockerfile `FROM` (preserving the variant suffix — `20.11.1-alpine3.19` becomes `24.22.1-alpine3.22`), then upgrades dependency packages with that ecosystem's own tool and regenerates the lockfile.
+
+- **Dry-run by default** — emits unified diffs, writes nothing
+- **`--deps minor`** stays inside declared ranges; it will *not* move an exact pin like `"ms": "2.1.2"`
+- **`--deps latest`** crosses majors and rewrites the manifest ranges themselves
+- **`--apply` runs guard preflight first and refuses if it fails** — changes cannot land on a protected branch
 
 Plus `doctor.mjs` — tells you what's installed and **what degrades without each tool**.
 
@@ -66,6 +80,12 @@ All six are detected and handled differently:
 | **Rust** | `cargo audit` | none (RustSec covers crates) | ❌ | — |
 | **Java** | OWASP dep-check | per-JDK-distribution | ❌ | — |
 | **.NET** | `dotnet list package --vulnerable` | Microsoft SUG | ❌ | — |
+| **Deno** · **Bun** | `deno outdated` · `bun outdated` | none unified | ❌ | — |
+| **Elixir** · **Erlang** | `mix hex.outdated` · `rebar3` | none unified | ❌ | — |
+| **Kotlin** · **Scala** | Gradle/sbt update plugins | none unified | ❌ | — |
+| **Perl** | `carton` | none unified | ❌ | — |
+
+**Beyond these 15:** `research.mjs <product> <version>` works for any endoflife.date product — PostgreSQL, Redis, nginx, Kubernetes, Terraform, Ubuntu. You get EOL windows and a target; not discovery, gating or remediation. Output sets `generic: true` and says so.
 
 All eight share the EOL layer (endoflife.date, 485 products) and the dependency-CVE layer (OSV.dev, 10+ ecosystems).
 
@@ -153,7 +173,7 @@ Six phases, `3n + 2` agents, pipelined per target with an adversarial **Challeng
 node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
-74 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
+85 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
 
 CI runs the suite on **ubuntu + macOS × Node 18/20/22/24**, plus an offline job, plus a weekly cron to catch upstream feed changes.
 
