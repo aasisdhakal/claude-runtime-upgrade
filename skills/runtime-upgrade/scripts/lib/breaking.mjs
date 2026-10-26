@@ -73,7 +73,59 @@ export const RULES = {
     R('8.0', /\bBinaryFormatter\b/,                       'removed',  'BinaryFormatter is removed in .NET 9', 'use System.Text.Json or MessagePack'),
     R('8.0', /\bWebRequest\.Create\s*\(/,                 'runtime',  'WebRequest is obsolete', 'use HttpClient'),
   ],
-  rust: [], elixir: [], erlang: [], kotlin: [], scala: [], perl: [], deno: [], bun: [],
+  rust: [
+    R('1.39.0', /\bstd::mem::uninitialized\s*(::<|\()/,   'runtime',  'mem::uninitialized is deprecated and is UB for most types', 'use MaybeUninit'),
+    R('1.39.0', /\bstd::mem::zeroed\s*(::<|\()/,          'runtime',  'mem::zeroed is unsound for types without a valid zero', 'use MaybeUninit'),
+    R('1.39.0', /\btry!\s*\(/,                            'removed',  'the try! macro was removed in the 2018 edition', 'use the ? operator'),
+    R('1.52.0', /#\[derive\([^)]*\bPartialEq\b[^)]*\)\][\s\S]{0,80}?impl\s+Eq\b/, 'runtime',
+      'deriving PartialEq alongside a manual Eq is now linted', 'derive both or implement both'),
+    R('1.82.0', /\bextern\s+crate\s+/,                    'runtime',  'extern crate is unnecessary since the 2018 edition', 'delete it; use path-based imports'),
+  ],
+  elixir: [
+    R('1.13.0', /\bMix\.Config\b/,                        'removed',  'Mix.Config was replaced by Config', 'use Config (available since 1.9)'),
+    R('1.14.0', /\buse\s+Bitwise\b/,                      'runtime',  'use Bitwise is deprecated', 'import Bitwise'),
+    R('1.15.0', /\bLogger\.warn\s*\(/,                    'runtime',  'Logger.warn/2 is deprecated — Erlang :logger uses "warning"', 'use Logger.warning/2'),
+    R('1.17.0', /(?<![\w?!])'[^'\n]{1,80}'(?![\w])/,      'runtime',  "single-quoted charlists are deprecated", 'use ~c"..."'),
+  ],
+  erlang: [
+    R('18', /\berlang:now\s*\(\s*\)|(?<!\w)now\s*\(\s*\)/, 'runtime', 'erlang:now/0 is deprecated', 'use erlang:system_time/1 or erlang:monotonic_time/0'),
+    R('20', /\brandom:(?:seed|uniform)\s*\(/,             'removed',  'the random module was removed in OTP 20', 'use the rand module'),
+    R('23', /\bhttp_uri:(?:parse|encode|decode)\s*\(/,    'runtime',  'http_uri is deprecated', 'use uri_string'),
+    R('24', /\bcrypto:(?:block_encrypt|block_decrypt|stream_init|next_iv)\s*\(/, 'removed',
+      'the old crypto block/stream API was removed in OTP 24', 'use crypto:crypto_one_time/4,5 or crypto_init/4'),
+  ],
+  kotlin: [
+    R('1.4.0', /\b@?kotlin\.Experimental\b|@Experimental\b/, 'removed', 'kotlin.Experimental was replaced by RequiresOptIn', 'use @RequiresOptIn / @OptIn'),
+    R('1.6.0', /@JvmDefault\b/,                           'removed',  '@JvmDefault was removed', 'use -Xjvm-default=all'),
+    R('1.9.0', /\benumValues\s*<|\benumValues\s*\(/,      'runtime',  'enumValues is deprecated', 'use enumEntries (Kotlin 1.9+)'),
+    R('2.0.0', /\bkotlin\.jvm\.JvmDefaultWithoutCompatibility\b/, 'runtime', 'JVM default handling changed under K2', 'review -Xjvm-default settings'),
+  ],
+  scala: [
+    // Scala 3 is an EDITION boundary; these are the dropped constructs
+    R('3.0.0', /(?<![\w"'])'[A-Za-z_]\w*(?![\w'"])/,      'removed',  "symbol literals ('foo) were dropped in Scala 3", 'use Symbol("foo")'),
+    R('3.0.0', /\bdef\s+\w+\s*\([^)]*\)\s*\{/,            'removed',  'procedure syntax (def f() { }) was dropped in Scala 3', 'write def f(): Unit = { }'),
+    R('3.0.0', /\bdo\s*\{[\s\S]{0,400}?\}\s*while\s*\(/,  'removed',  'do...while was dropped in Scala 3', 'use while ({ ...; cond }) ()'),
+    R('3.0.0', /<\/?[a-zA-Z][^>]*>\s*(?:\{|$)/m,          'runtime',  'XML literals are being dropped', 'use XML string interpolation'),
+  ],
+  perl: [
+    R('5.30', /\$\[/,                                     'removed',  '$[ (array base) was removed in 5.30', 'arrays always start at 0'),
+    R('5.42', /(?<![=!~])~~(?!~)/,                        'behaviour','smartmatch (~~) is disabled in the 5.42 feature bundle onward',
+      "enable it with `use feature 'smartmatch'` or rewrite the comparison explicitly"),
+    R('5.42', /(?<!\w)(?:given|when)\s*\(/,               'behaviour','given/when are disabled in the 5.42 feature bundle onward',
+      'rewrite as if/elsif, or opt in explicitly'),
+  ],
+  deno: [
+    R('2.0', /\bDeno\.run\s*\(/,                          'removed',  'Deno.run was removed in Deno 2', 'use new Deno.Command()'),
+    R('2.0', /(?<![\w.])window\./,                        'removed',  'the window global was removed in Deno 2', 'use globalThis'),
+    R('2.0', /\bDeno\.(?:readAll|writeAll|iter|copy)\s*\(/, 'removed','these Deno I/O helpers moved to the Standard Library in Deno 2', 'import them from jsr:@std/io'),
+    R('2.0', /\bDeno\.(?:Buffer|Reader|Writer|Seeker)\b/, 'removed',  'the Deno.Buffer/Reader/Writer/Seeker interfaces were removed in Deno 2', 'use Web Streams or @std/io'),
+    R('2.0', /\bDeno\.(?:resources|metrics|close)\s*\(/,  'removed',  'resource-id APIs were removed in Deno 2', 'use the resource\'s own .close(); metrics has no replacement'),
+    R('2.0', /\bDeno\.customInspect\b/,                   'removed',  'Deno.customInspect was removed in Deno 2', 'use Symbol.for("Deno.customInspect")'),
+  ],
+  // Bun implements the Node API surface, so Node's removals apply to Bun code
+  // too. There is no separate catalogue of Bun-specific removals worth
+  // asserting yet — saying so beats inventing rules.
+  bun: [],
 };
 
 /** Source file globs worth scanning, per language. */
@@ -85,7 +137,13 @@ export const SOURCE_EXT = {
 };
 
 /** Rules that fire when moving from `from` to `to` — nothing outside the window. */
+/** Languages whose code is also subject to another catalogue. */
+const INHERITS = { bun: 'node', deno: 'node' };
+
 export function rulesFor(lang, from, to) {
+  // Bun and Deno run Node APIs, so Node's removals apply to their code too.
+  // Those are reported against the Node version they target, not the runtime's
+  // own version, so they are surfaced separately by scan.mjs.
   return (RULES[lang] || []).filter(r =>
     (!from || compare(r.introducedIn, from) > 0) && (!to || compare(r.introducedIn, to) <= 0));
 }
@@ -96,6 +154,8 @@ export function rulesFor(lang, from, to) {
  * to cover every aspect should say they exist, because they are what the NEXT
  * upgrade will turn into failures.
  */
+export function inheritedCatalogue(lang) { return INHERITS[lang] || null; }
+
 export function preExistingRules(lang, from) {
   if (!from) return [];
   return (RULES[lang] || []).filter(r => compare(r.introducedIn, from) <= 0);

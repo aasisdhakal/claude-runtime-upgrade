@@ -5,6 +5,8 @@ import { build, destroy, FIXTURES } from './fixtures.mjs';
 import { runJson, run } from '../scripts/lib/sh.mjs';
 import { fetchJson } from '../scripts/lib/io.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
+import { stripNonCode } from '../scripts/lib/strip.mjs';
+import { RULES, rulesFor, inheritedCatalogue } from '../scripts/lib/breaking.mjs';
 import { adapters, byId, adaptersForManifest } from '../scripts/adapters/index.mjs';
 import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
 import { PIN_RULES, planPinEdits, unified, planCiEdits, planConfigEdits, ciMatrixAdvice,
@@ -713,10 +715,161 @@ t('scan: clean files produce no findings', () => withFixture('single-node', r =>
   eq(v.data.findings, 0, 'nothing to find in a fixture with no source');
 }));
 t('scan: says "not catalogued" rather than "nothing breaks"', () => withFixture('single-rust', r => {
-  const v = scan('rust', r, '1.70', '1.85');
-  eq(v.data.rulesApplied, 0);
+  // every language now has a catalogue, so the honest-note path is reached when
+  // the WINDOW contains no rules — a narrow upgrade, not an unknown language
+  const v = scan('rust', r, '1.98', '1.99');
+  eq(v.data.windowRules, 0, 'no rule falls inside this window');
   ok(/not catalogued|NOT "nothing breaks"/i.test(v.data.note || ''), 'must not imply safety');
 }));
+t('scan: a wide window DOES apply the rust catalogue', () => withFixture('single-rust', r => {
+  const v = scan('rust', r, '1.20', '1.99');
+  ok(v.data.windowRules >= 4, `expected the rust catalogue to apply, got ${v.data.windowRules}`);
+}));
+
+// ───────────── comment/string stripping (the false-positive fix) ─────────────
+console.log('\ncode-only matching');
+t('strip: comments cannot produce findings', () => {
+  // every one of these was a real false positive against a real repo
+  const cases = [
+    ['scala',  "/** `Const`'s second parameter */\nval x = 1\n",           /'s/],
+    ['java',   "/** Disables JDK's {@code sun.misc.Unsafe}. */\nint x;\n", /sun\.misc\.Unsafe/],
+    ['elixir', "# the 'fetch_' prefix\nx = 1\n",                            /'fetch_'/],
+    ['python', '# uses imp and distutils\nx = 1\n',                         /distutils/],
+    ['go',     '// io/ioutil is mentioned here\nvar x int\n',               /ioutil/],
+    ['rust',   '// try! is mentioned\nlet x = 1;\n',                        /try!/],
+  ];
+  for (const [lang, src, re] of cases) {
+    const out = stripNonCode(src, lang);
+    ok(!re.test(out), `${lang}: comment content survived stripping -> ${JSON.stringify(out)}`);
+  }
+});
+t('strip: real code is never blanked', () => {
+  ok(/crypto\.createCipher/.test(stripNonCode('crypto.createCipher("aes", k);\n', 'node')), 'node call survives');
+  ok(/Deno\.run/.test(stripNonCode('const p = Deno.run({cmd});\n', 'deno')), 'deno call survives');
+  ok(/SecurityManager/.test(stripNonCode('SecurityManager s = null;\n', 'java')), 'java type survives');
+});
+t('strip: line numbers are preserved exactly', () => {
+  const src = '// comment line one\n// comment line two\ncrypto.createCipher(x);\n';
+  const out = stripNonCode(src, 'node');
+  eq(out.split('\n').length, src.split('\n').length, 'line count unchanged');
+  eq(out.split('\n')[2], src.split('\n')[2], 'the code line is byte-identical');
+});
+t('strip: elixir keeps single-quoted charlists, blanks double-quoted strings', () => {
+  // the charlist IS the thing being detected, so it must survive
+  const out = stripNonCode(`x = 'charlist'\ny = "a string with 'quotes'"\n`, 'elixir');
+  ok(/'charlist'/.test(out), 'charlist survives');
+  ok(!/a string/.test(out), 'double-quoted string is blanked');
+});
+t('strip: perl POD blocks are blanked', () => {
+  const out = stripNonCode('=head1 NAME\n\nuses ~~ in prose\n\n=cut\nmy $x = 1;\n', 'perl');
+  ok(!/in prose/.test(out), 'POD content blanked');
+  ok(/my \$x = 1;/.test(out), 'code survives');
+});
+t('strip: triple-quoted blocks are handled before single quotes', () => {
+  const out = stripNonCode('x = """\ndistutils\n"""\ny = 1\n', 'python');
+  ok(!/distutils/.test(out), 'docstring blanked');
+  ok(/y = 1/.test(out), 'code survives');
+});
+t('strip: scanner finds code hits but not comment hits', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-strip-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"s","engines":{"node":">=20"}}');
+    writeFileSync(join(r, 'a.js'), '// crypto.createCipher is mentioned here\nconst ok = 1;\n');
+    writeFileSync(join(r, 'b.js'), 'const c = crypto.createCipher("aes", k);\n');
+    const v = runJson(process.execPath, [S('scan.mjs'), 'node', r, '20.11.1', '26.12.1']);
+    const files = v.data.details.map(d => d.file);
+    ok(files.includes('b.js'), 'real usage found');
+    ok(!files.includes('a.js'), 'comment mention NOT reported');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+// ───────────── language coverage ─────────────
+console.log('\nbreaking-change catalogue');
+t('rules: every language has a catalogue or an explicit inheritance', () => {
+  for (const a of adapters) {
+    const own = (RULES[a.id] || []).length;
+    const inherits = inheritedCatalogue(a.id);
+    ok(own > 0 || inherits, `${a.id} has neither rules nor an inherited catalogue`);
+  }
+});
+t('rules: bun inherits the node catalogue', () => {
+  eq(inheritedCatalogue('bun'), 'node');
+  ok(rulesFor('node', null, null).length > 0, 'and node has rules to inherit');
+});
+t('rules: every rule has a severity, a description and a fix', () => {
+  for (const [lang, rs] of Object.entries(RULES))
+    for (const r of rs) {
+      ok(['removed', 'runtime', 'behaviour'].includes(r.severity), `${lang}: bad severity ${r.severity}`);
+      ok(r.what && r.what.length > 10, `${lang}: ${r.what} is not a description`);
+      ok(r.fix && r.fix.length > 5, `${lang}: rule "${r.what}" has no fix`);
+      ok(r.re instanceof RegExp, `${lang}: ${r.what} has no pattern`);
+    }
+});
+t('rules: each new language catalogue actually matches its own syntax', () => {
+  const samples = {
+    deno:   ['const p = Deno.run({cmd: ["ls"]});', 6],
+    elixir: ['Logger.warn("x")', 2],
+    erlang: ['random:uniform(10).', 2],
+    rust:   ['let x = std::mem::uninitialized::<u8>();', 5],
+    kotlin: ['val v = enumValues<Foo>()', 3],
+    scala:  ['def f() { println(1) }', 4],
+    perl:   ['my $r = $a ~~ $b;', 2],
+  };
+  for (const [lang, [src, expectRules]] of Object.entries(samples)) {
+    const rs = rulesFor(lang, null, null);
+    ok(rs.length >= expectRules, `${lang}: only ${rs.length} rules`);
+    const code = stripNonCode(src, lang);
+    ok(rs.some(r => new RegExp(r.re.source, r.re.flags.replace('g', '')).test(code)),
+       `${lang}: no rule matched its own sample "${src}"`);
+  }
+});
+
+// ───────────── pull requests ─────────────
+console.log('\npull requests — user picks the tool');
+const pr = (...a) => runJson(process.execPath, [S('pr.mjs'), ...a]);
+t('pr: detect lists every tool and never decides', () => gitRepo(r => {
+  const v = pr('detect', r);
+  ok(v.data, 'produced JSON');
+  const ids = v.data.available.map(t => t.id).sort();
+  eq(ids, ['gh', 'glab', 'patch', 'push', 'tea'], 'all five routes offered');
+  ok(v.data.suggestion, 'a suggestion exists');
+  ok(/not a decision|whichever/i.test(v.data.choiceIsYours), 'and it is framed as the user\'s choice');
+  for (const t2 of v.data.available) ok(t2.note && t2.note.length > 10, `${t2.id} explains itself`);
+}));
+t('pr: open without --tool refuses and explains the options', () => gitRepo(r => {
+  const v = run(process.execPath, [S('pr.mjs'), 'open', r]);
+  ok(v.status !== 0, 'must not proceed');
+  const j = JSON.parse(v.stdout);
+  eq(j.error, 'no --tool given');
+  eq(j.howToChoose.length, 5, 'all five explained');
+}));
+t('pr: open without --push changes nothing', () => gitRepo(r => {
+  run('git', ['checkout', '-qb', 'runtime/node-24.22.1'], { cwd: r });
+  writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=24.22.1 <25"}}');
+  run('git', ['commit', '-aqm', 'pin'], { cwd: r });
+  const v = pr('open', r, '--tool', 'push');
+  eq(v.data.pushed, false, 'nothing pushed');
+  eq(v.data.opened, false, 'nothing opened');
+  ok(/dry run/.test(v.data.note), 'and it says so');
+}));
+t('pr: patch tool writes files and contacts no remote', () => gitRepo(r => {
+  run('git', ['checkout', '-qb', 'runtime/node-24.22.1'], { cwd: r });
+  writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=24.22.1 <25"}}');
+  run('git', ['commit', '-aqm', 'pin'], { cwd: r });
+  const v = pr('open', r, '--tool', 'patch', '--out', join(r, 'out.patch'));
+  eq(v.data.pushed, false);
+  ok(v.data.wrote.length === 2, 'patch + body written');
+  ok(readFileSync(join(r, 'out.patch'), 'utf8').includes('Subject:'), 'a real patch');
+}));
+t('pr: refuses to open a PR for a branch with no commits', () => gitRepo(r => {
+  run('git', ['checkout', '-qb', 'runtime/node-24.22.1'], { cwd: r });
+  const v = run(process.execPath, [S('pr.mjs'), 'open', r, '--tool', 'patch', '--push']);
+  ok(v.status !== 0 && /no commits ahead/.test(v.stderr), 'refuses an empty branch');
+}));
+t('pr: never contains a force-push path', () => {
+  const src = readFileSync(S('pr.mjs'), 'utf8').split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+  ok(!/--force|\+HEAD|forceWithLease/.test(src), 'no force push anywhere');
+});
 
 // ───────────────────────── CI and build config ─────────────────────────
 console.log('\nCI and build config rewriting');

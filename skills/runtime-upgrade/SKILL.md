@@ -155,7 +155,11 @@ Finds code the upgrade will break, with `file:line`. Three severity classes, and
 
 Rules fire only inside the upgrade window — scanning for Node 26 removals while going 20 → 22 is noise. `--include-existing` additionally reports deprecations that predate the current version: not caused by this upgrade, but exactly what the next one turns into failures.
 
-**If a language has no rules recorded, the output says "not catalogued here", not "nothing breaks".** Read the upstream release notes.
+**68 rules across all 15 languages.** Bun has no separate catalogue — it executes Node APIs, so it inherits Node's, and `inheritedFrom` says so in the output.
+
+**Matching is code-only.** Comments, docstrings and string literals are blanked before matching (byte-for-byte, so line numbers stay exact). Without that, Scala's symbol-literal rule matched the apostrophe in `` `Const`'s `` and Java's `sun.misc.Unsafe` rule matched a Javadoc paragraph — 35 of 35 findings across four real repos were prose.
+
+**If no rule falls inside the window, the output says "not catalogued here", not "nothing breaks".** Read the upstream release notes.
 
 ## Phase 4 — REMEDIATE
 
@@ -188,6 +192,34 @@ Rules that hold for both:
 - **One major at a time**, commit between each. Never stack two majors in one diff.
 - Regenerate the lockfile with the **new** runtime's package manager.
 - Under `MODE=plan`, emit diffs only.
+
+## Phase 4b — OPEN A PULL REQUEST (the user picks the tool)
+
+```bash
+node $SK/scripts/pr.mjs detect <dir>                      # what can this machine do?
+node $SK/scripts/pr.mjs body   <dir> --plan plan.json     # render the description
+node $SK/scripts/pr.mjs open   <dir> --tool <t> [--push]  # act
+```
+
+**Five routes. Ask the user which one; never choose for them.**
+
+| `--tool` | What it does |
+|---|---|
+| `gh` | opens a GitHub PR |
+| `glab` | opens a GitLab merge request |
+| `tea` | opens a PR on Gitea/Forgejo/Codeberg |
+| `push` | pushes the branch and prints the compare URL — works on any host |
+| `patch` | writes a `.patch` plus the description and **contacts no remote at all** |
+
+`pr.mjs detect` reports which tools are installed, which suit the remote, and what each needs. It emits a `suggestion` — explicitly labelled as a suggestion, not a decision.
+
+Safety, enforced in code:
+- **without `--tool` it refuses** and lists the five options
+- **without `--push` it is a dry run** — it prints the exact command it would run and changes nothing
+- **there is no force-push path in the file**; a test asserts it
+- it refuses a branch with no commits ahead of the base
+
+The PR body is generated from the plan: EOL status, the CVE delta, cycles crossed, blockers with evidence, what was checked and found *not* to be a blocker, the verification ladder, and the rollback trigger.
 
 ## Phase 5 — VERIFY
 

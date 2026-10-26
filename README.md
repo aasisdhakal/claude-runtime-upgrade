@@ -47,7 +47,7 @@ Six phases, each with a machine-checkable exit condition.
 | **Research** | `research.mjs` | EOL/support windows, unpatched runtime CVEs at current *and* target |
 | **Assess** | `assess.mjs` | dependency advisories, native/ABI blockers, dependency floors |
 | **Remediate** | `remediate.mjs` | **rewrites every runtime pin AND upgrades all dependency packages** |
-| **Scan** | `scan.mjs` | removed APIs, deprecations and **behaviour changes**, with file:line |
+| **Scan** | `scan.mjs` | **68 rules, all 15 languages** — removed APIs, deprecations and **behaviour changes**, with file:line |
 | **Verify** | `verify.mjs` | gates that exit non-zero on failure |
 
 All synthesised by **`plan.mjs`**.
@@ -112,6 +112,19 @@ All eight share the EOL layer (endoflife.date, 485 products) and the dependency-
 node skills/runtime-upgrade/scripts/frameworks.mjs <dir>
 ```
 The runtime is often the smaller half. endoflife.date tracks 41 frameworks; anything it doesn't (NestJS, FastAPI, Flask, Quarkus, Ember, Tailwind) is reported as `untracked` rather than guessed at.
+
+## Pull requests — your tool, your call
+
+```bash
+node skills/runtime-upgrade/scripts/pr.mjs detect ./repo    # what's available here?
+node skills/runtime-upgrade/scripts/pr.mjs open ./repo --tool gh --push
+```
+
+Five routes: **`gh`** (GitHub), **`glab`** (GitLab), **`tea`** (Gitea/Forgejo), **`push`** (push + compare URL, works anywhere), **`patch`** (a `.patch` file, no remote contacted).
+
+`detect` reports what's installed and what suits your remote, then emits a **suggestion — explicitly not a decision**. Without `--tool` it refuses and lists the options; without `--push` it's a dry run; there is no force-push path in the file.
+
+The PR body comes from the plan: EOL status, CVE delta, cycles crossed, blockers with evidence, what was checked and found *not* to be a blocker, the verification ladder, and the rollback trigger.
 
 ## Write mode is enforced, not requested
 
@@ -204,7 +217,7 @@ now a named regression test.
 node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
-121 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
+139 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git` directories, which git itself won't track, and generated fixtures can't drift from their assertions.
 
 CI runs the suite on **ubuntu + macOS × Node 18/20/22/24**, plus an offline job, plus a weekly cron to catch upstream feed changes.
 

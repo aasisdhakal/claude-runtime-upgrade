@@ -4,7 +4,8 @@
 // usage: node scan.mjs <lang> <dir> <from> <to> [--max N]
 import { walk, readText, resolve, existsSync, rel, emit, die } from './lib/io.mjs';
 import { byId } from './adapters/index.mjs';
-import { rulesFor, preExistingRules, SOURCE_EXT } from './lib/breaking.mjs';
+import { rulesFor, preExistingRules, inheritedCatalogue, SOURCE_EXT } from './lib/breaking.mjs';
+import { stripNonCode } from './lib/strip.mjs';
 
 const argv = process.argv.slice(2);
 const [langArg, dirArg, from, to] = argv.filter(a => !a.startsWith('--'));
@@ -17,8 +18,16 @@ if (!existsSync(DIR)) die(`no such directory: ${DIR}`);
 
 const INCLUDE_EXISTING = argv.includes('--include-existing');
 const windowRules = rulesFor(A.id, from, to);
+// Bun and Deno execute Node APIs, so Node's removals apply to their source too.
+// Those fire against the Node version the project targets, which we do not know
+// here, so apply the whole Node catalogue and label it.
+const inherit = inheritedCatalogue(A.id);
+const inheritedRules = inherit
+  ? rulesFor(inherit, null, null).map(r => ({ ...r, inheritedFrom: inherit }))
+  : [];
 const existingRules = INCLUDE_EXISTING ? preExistingRules(A.id, from) : [];
-const rules = [...windowRules, ...existingRules.map(r => ({ ...r, preExisting: true }))];
+const rules = [...windowRules, ...inheritedRules,
+               ...existingRules.map(r => ({ ...r, preExisting: true }))];
 const ext = SOURCE_EXT[A.id];
 if (!ext) die(`no source extensions known for ${A.id}`, 2);
 
@@ -28,10 +37,12 @@ let scanned = 0;
 
 for (const f of files) {
   if (findings.length >= MAX) break;
-  const text = readText(f);
-  if (text == null || text.length > 2_000_000) continue;
+  const raw = readText(f);
+  if (raw == null || raw.length > 2_000_000) continue;
   scanned++;
-  const lines = text.split('\n');
+  // match against code only; keep the original for the evidence line
+  const text = stripNonCode(raw, A.id);
+  const lines = raw.split('\n');
   for (const r of rules) {
     // fresh regex per file: a /g rule would carry lastIndex between files
     const re = new RegExp(r.re.source, r.re.flags.includes('g') ? r.re.flags : r.re.flags + 'g');
@@ -42,6 +53,7 @@ for (const f of files) {
         file: rel(DIR, f), line,
         severity: r.severity, introducedIn: r.introducedIn,
         preExisting: !!r.preExisting,
+        inheritedFrom: r.inheritedFrom || null,
         what: r.what, fix: r.fix,
         evidence: (lines[line - 1] || '').trim().slice(0, 140),
       });
@@ -59,6 +71,8 @@ emit({
   rulesApplied: rules.length,
   windowRules: windowRules.length,
   preExistingRules: existingRules.length,
+  inheritedRules: inheritedRules.length,
+  inheritedFrom: inherit,
   preExistingIncluded: INCLUDE_EXISTING,
   filesScanned: scanned,
   findings: findings.length,
