@@ -2,10 +2,23 @@
   "name": "runtime-upgrade",
   "version": "0.1.0",
   "description": "Upgrade a language runtime (Node.js or PHP) across any repo shape. Discovery, EOL/CVE research, blocker assessment, code upgrade, and verification gates.",
-  "author": { "name": "aasisdhakal" },
+  "author": {
+    "name": "Aashish Dhakal"
+  },
   "homepage": "https://github.com/OWNER/claude-runtime-upgrade",
   "repository": "https://github.com/OWNER/claude-runtime-upgrade",
   "license": "MIT",
-  "keywords": ["nodejs", "php", "upgrade", "eol", "cve", "security", "migration", "dependencies"],
-  "skills": ["./skills/runtime-upgrade"]
+  "keywords": [
+    "nodejs",
+    "php",
+    "upgrade",
+    "eol",
+    "cve",
+    "security",
+    "migration",
+    "dependencies"
+  ],
+  "skills": [
+    "./skills/runtime-upgrade"
+  ]
 }

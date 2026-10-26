@@ -2,3 +2,23 @@ node_modules/
 .DS_Store
 *.log
 .runtime-upgrade-cache/
+
+# --- added by open-source-ready: never let these reach a public repo ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa
+id_ed25519
+.netrc
+.npmrc
+secrets.json
+secrets.yaml
+credentials
+.terraform/
+*.tfstate
+*.tfstate.backup

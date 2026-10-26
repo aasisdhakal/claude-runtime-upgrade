@@ -1,0 +1,9 @@
+# Review routing. See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# 
+
+*                 @aasisdhakal
+
+# Anything that can change how code is built or shipped deserves a closer look:
+/.github/         @aasisdhakal
+/LICENSE          @aasisdhakal
+/SECURITY.md      @aasisdhakal
