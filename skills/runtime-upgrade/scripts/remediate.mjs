@@ -274,7 +274,18 @@ if (APPLY) {
                       'uv.lock', 'pdm.lock', 'Pipfile.lock', 'mix.lock', 'rebar.lock',
                       'packages.lock.json', 'deno.lock', 'cpanfile.snapshot'];
   const hadLock = LOCK_FILES.some(f => existsSync(join(DIR, f)));
-  if (LOCK && hadLock && recipe?.lockfile && have(recipe.tool)) {
+  // A lockfile regen is a DEPENDENCY operation. This block ignored both the
+  // refusal and `--deps none`, so a run that reported "Nothing was run" still
+  // executed `go mod tidy` on the vendored kubernetes tree (mutating go.sum and
+  // then attempting `go mod vendor`), and `bundle lock --update` on rails under
+  // `--deps none`. Regenerating a lockfile nobody asked to change is exactly
+  // the unrequested mutation the refusal exists to prevent.
+  const lockAllowed = DEPS !== 'none' && !deps.refused;
+  if (LOCK && hadLock && !lockAllowed) {
+    applied.lockfile = { skipped: deps.refused
+      ? 'the dependency upgrade was REFUSED — regenerating the lockfile would mutate resolution anyway'
+      : 'no dependency upgrade was requested (--deps none) — the lockfile is left exactly as it is' };
+  } else if (LOCK && hadLock && recipe?.lockfile && have(recipe.tool)) {
     const r = run(recipe.tool, recipe.lockfile, { cwd: DIR, timeout: 900000 });
     applied.lockfile = { command: [recipe.tool, ...recipe.lockfile].join(' '), ok: r.ok,
                          output: (r.stdout || r.stderr).slice(0, 3000) };

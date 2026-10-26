@@ -54,8 +54,18 @@ export const mapSuffix = sfx => SUFFIX_MAP[sfx] ?? sfx;
 
 /** Replace the version inside a Docker FROM line, preserving registry + suffix. */
 function dockerRewrite(text, imageNames, target, suffixMap = SUFFIX_MAP) {
-  const re = new RegExp(`(^[ \\t]*FROM[ \\t]+(?:--\\S+[ \\t]+)*\\S*?(?:${imageNames.join('|')})[:@])([^\\s]+)`, 'gim');
+  // The image NAME must match whole, not as a substring. Unanchored, `php`
+  // matched `dunglas/frankenphp:1.12.1-php8.3` and rewrote FrankenPHP's own
+  // version to a PHP one (`:8.4-php8.3`) while leaving the stale `-php8.3`
+  // suffix alone — an image that does not exist. The CI path was anchored for
+  // this; the Dockerfile path was not, and it is wired for node and go too.
+  const names = imageNames.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const re = new RegExp(
+    `(^[ \\t]*FROM[ \\t]+(?:--\\S+[ \\t]+)*(?:[\\w.-]+(?::\\d+)?\\/)*(?:${names})[:@])([^\\s]+)`, 'gim');
   return text.replace(re, (m, head, tag) => {
+    // A tag whose version is not at the START is a compound tag belonging to
+    // some other product's versioning scheme. Leave it to a human.
+    if (!/^v?\d/.test(tag)) return m;
     // keep the variant suffix: 20.11.1-alpine3.19 -> 24.22.1-alpine3.22
     const suffix = tag.replace(/^v?[\d.]+/, '');
     const mapped = suffixMap[suffix] ?? suffix;
@@ -213,8 +223,16 @@ export function planConfigEdits(lang, dir, target) {
     const major = Number(target.split('.')[0]);
     // tsconfig target should not lag the runtime by generations
     const tsTarget = major >= 24 ? 'ES2023' : major >= 22 ? 'ES2023' : 'ES2022';
+    // ESNext is AHEAD of any dated target; rewriting it to ES2023 DOWNGRADES
+    // the emitted JavaScript. Only a dated target that lags the runtime moves.
     push('tsconfig.json', `tsconfig target -> ${tsTarget}`,
-      t => t.replace(/("target"\s*:\s*")(ES\d+|es\d+|ESNext)(")/i, `$1${tsTarget}$3`));
+      t => t.replace(/("target"\s*:\s*")(ES\d+|es\d+|ESNext|esnext)(")/i, (m, head, cur, tail) => {
+        if (/esnext/i.test(cur)) return m;                   // already ahead
+        const curYear = Number(String(cur).replace(/\D/g, ''));
+        const newYear = Number(tsTarget.replace(/\D/g, ''));
+        if (!curYear || curYear >= newYear) return m;         // do not go backwards
+        return head + tsTarget + tail;
+      }));
     // engines are advisory in npm unless engine-strict is set
     push('.npmrc', 'engine-strict=true',
       t => /engine-strict/.test(t) ? t.replace(/engine-strict\s*=.*/i, 'engine-strict=true') : t.trimEnd() + '\nengine-strict=true\n');
@@ -247,7 +265,13 @@ export const PIN_RULES = {
       // new floor would sit above it. A disjunction cannot be rewritten at all.
       edit: t => t.replace(/("engines"\s*:\s*\{[^}]*?"node"\s*:\s*")([^"]*)(")/s,
         (m, head, v, tail) => isCompoundConstraint(v) ? m : head + `>=${mm(target)}` + tail) },
-    { file: '.nvmrc', rule: '.nvmrc', edit: () => `v${target}\n` },
+    { file: 'package.json', rule: 'volta.node',
+      // volta.node PINS the toolchain for every contributor using Volta. Left
+      // behind while engines and .nvmrc move, it IS the drift this tool reports.
+      edit: t => t.replace(/("volta"\s*:\s*\{[^}]*?"node"\s*:\s*")([^"]*)(")/s, `$1${target}$3`) },
+    // preserve the author's `v` prefix rather than imposing one
+    { file: '.nvmrc', rule: '.nvmrc',
+      edit: t => (/^\s*v/.test(t) ? `v${target}\n` : `${target}\n`) },
     { file: '.node-version', rule: '.node-version', edit: () => `${target}\n` },
     { file: '.tool-versions', rule: '.tool-versions', edit: t => t.replace(/^nodejs\s+\S+/mi, `nodejs ${target}`) },
     { file: 'Dockerfile', rule: 'Dockerfile FROM',

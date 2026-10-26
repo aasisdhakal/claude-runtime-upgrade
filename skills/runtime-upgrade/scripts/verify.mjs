@@ -5,6 +5,7 @@
 import { join, resolve, existsSync, readJson, fetchJson, emit, die } from './lib/io.mjs';
 import { have, run, runJson } from './lib/sh.mjs';
 import { byId } from './adapters/index.mjs';
+import { satisfies } from './lib/semver.mjs';
 
 const argv = process.argv.slice(2);
 const [langArg, dirArg, target] = argv;
@@ -69,10 +70,29 @@ const atTargetPrecision = v => {
 };
 const stalePins = allPins.filter(p => atTargetPrecision(p) !== String(wantMajor));
 const floorsAbove = allFloors.filter(f => cmpMajor(f, wantMajor) > 0);
+// A FLOOR can also carry a cap. detect exports plain majors, which loses the
+// shape: composer `^7.4` means ">=7.4 <8" and forbids 8.3, but "7.4" compared
+// against "8.3" read as an ordinary floor below the target and passed.
+// (The first attempt at this swallowed a ReferenceError in a try/catch because
+// `satisfies` was not imported — hence the explicit import above.)
+const breachedCaps = [];
+for (const t of mine)
+  for (const [field, value] of Object.entries(t.declared || {})) {
+    if (!value || typeof value !== 'string') continue;
+    if (!/[<^~]/.test(value)) continue;                 // no upper bound to breach
+    if (/\(test matrix\)/.test(value)) continue;        // deliberate breadth
+    if (!satisfies(target, value))
+      breachedCaps.push(`${t.dir === '.' ? '' : t.dir + ' '}${field} = "${value}"`);
+  }
+
 if (!allPins.length && !allFloors.length) add(SKIP, 'declared version matches target', 'nothing declares a version');
 else if (stalePins.length)
   add(FAIL, 'declared version matches target',
     `these PINS still name the old runtime: ${stalePins.join(', ')} (target ${wantMajor})`);
+else if (breachedCaps.length)
+  add(FAIL, 'declared version matches target',
+    `the target ${target} does NOT satisfy a constraint this project declares: `
+    + `${[...new Set(breachedCaps)].slice(0, 4).join('; ')} — something here was deliberately capped`);
 else if (floorsAbove.length)
   add(FAIL, 'declared version matches target',
     `a declared FLOOR is above the target: ${floorsAbove.join(', ')} > ${wantMajor} — the project requires more than you are shipping`);

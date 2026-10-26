@@ -9,6 +9,7 @@ import { resolve, existsSync, join, emit, die } from './lib/io.mjs';
 import { runJson, run, have } from './lib/sh.mjs';
 import { byId } from './adapters/index.mjs';
 import { satisfies } from './lib/semver.mjs';
+import { parseArgv } from './lib/io.mjs';
 import { planPinEdits, planCiEdits, planConfigEdits, ciMatrixAdvice } from './lib/edits.mjs';
 import { rulesFor } from './lib/breaking.mjs';
 import { fileURLToPath } from 'node:url';
@@ -18,7 +19,9 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const S = n => join(HERE, n);
 const argv = process.argv.slice(2);
 const flag = n => { const i = argv.indexOf('--' + n); return i >= 0 ? argv[i + 1] : null; };
-const DIR = resolve(argv.find(a => !a.startsWith('--')) || '.');
+// `plan.mjs --target 21 <dir>` resolved "21" as the directory
+const A_ = parseArgv(argv, ['target', 'only', 'policy', 'lang', 'format']);
+const DIR = resolve(A_.positional[0] || '.');
 if (!existsSync(DIR)) die(`no such directory: ${DIR}`);
 /**
  * --target names ONE version, but a repo can hold several runtimes. Handing a

@@ -2,16 +2,18 @@
 // Source-level breaking-change scan. Finds code that the upgrade will break,
 // with file:line evidence, BEFORE anything is changed.
 // usage: node scan.mjs <lang> <dir> <from> <to> [--max N]
-import { walk, walkGaps, readText, resolve, existsSync, rel, emit, die } from './lib/io.mjs';
+import { walk, walkGaps, readText, resolve, existsSync, rel, emit, die, parseArgv } from './lib/io.mjs';
 import { byId } from './adapters/index.mjs';
 import { rulesFor, preExistingRules, inheritedCatalogue, SOURCE_EXT } from './lib/breaking.mjs';
 import { stripNonCode, stripComments, keepInterpolatable } from './lib/strip.mjs';
 
 const argv = process.argv.slice(2);
-const [langArg, dirArg, from, to] = argv.filter(a => !a.startsWith('--'));
+// `--max 50` used to leak its value into the positionals, so `scan java <dir> 17
+// --max 50` scanned the window 17 -> "50" with no complaint
+const A_ = parseArgv(argv, ['max', 'only']);
+const [langArg, dirArg, from, to] = A_.positional;
 if (!langArg || !dirArg || !to) die('usage: scan.mjs <lang> <dir> <from> <to> [--max N]', 2);
-const MAXI = argv.indexOf('--max');
-const MAX = MAXI >= 0 ? Number(argv[MAXI + 1]) : 400;
+const MAX = A_.flag('max') != null ? Number(A_.flag('max')) : 400;
 const A = byId[langArg] || die(`unsupported language: ${langArg}`, 2);
 const DIR = resolve(dirArg);
 if (!existsSync(DIR)) die(`no such directory: ${DIR}`);

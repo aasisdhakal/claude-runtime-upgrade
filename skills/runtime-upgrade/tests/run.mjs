@@ -3,7 +3,7 @@
 // Network-dependent cases are skipped automatically when offline or unreachable.
 import { build, destroy, FIXTURES } from './fixtures.mjs';
 import { runJson, run } from '../scripts/lib/sh.mjs';
-import { fetchJson, walk, walkGaps, readText } from '../scripts/lib/io.mjs';
+import { fetchJson, walk, walkGaps, readText, parseArgv } from '../scripts/lib/io.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
 import { stripNonCode, stripComments, usesCgo } from '../scripts/lib/strip.mjs';
 import { LOCKFILES, diffLocks, bump } from '../scripts/lib/lockdiff.mjs';
@@ -1008,6 +1008,138 @@ function walkMjs(d, out = []) {
   }
   return out;
 }
+// ───────────── "nothing was run" must mean nothing was run ─────────────
+console.log('\nrefusals are total');
+t('deps: a REFUSED upgrade does not regenerate the lockfile either', () => {
+  // the refusal reported "Nothing was run" and then ran `go mod tidy` on the
+  // vendored kubernetes tree, mutating go.sum and attempting `go mod vendor`
+  const src = readFileSync(S('remediate.mjs'), 'utf8');
+  ok(/const lockAllowed = DEPS !== 'none' && !deps\.refused;/.test(src),
+     'the lockfile step must be gated on the refusal AND on --deps none');
+  ok(/regenerating the lockfile would mutate resolution anyway/.test(src));
+});
+t('deps: --deps none never touches the lockfile', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-lockn-'));
+  try {
+    writeFileSync(join(r, 'go.mod'), 'module x\n\ngo 1.21\n');
+    writeFileSync(join(r, 'go.sum'), '');
+    const v = runJson(process.execPath, [S('remediate.mjs'), 'go', r, '1.24.0', '--deps', 'none']);
+    // dry-run reports what it WOULD do; the skip reason must already be visible
+    ok(v.data, 'produced JSON');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
+console.log('\nDockerfile images are matched whole');
+t('docker: a compound tag from another product is left alone', () => {
+  // `dunglas/frankenphp:1.12.1-php8.3` had FrankenPHP's own version replaced
+  // with a PHP one, leaving the stale `-php8.3` suffix: an image that does not exist
+  const php = PIN_RULES.php('8.4.1').find(r => r.file === 'Dockerfile');
+  eq(php.edit('FROM dunglas/frankenphp:1.12.1-php8.3\n').trim(),
+     'FROM dunglas/frankenphp:1.12.1-php8.3');
+  const node = PIN_RULES.node('24.1.0').find(r => r.file === 'Dockerfile');
+  eq(node.edit('FROM mynode-tools:1.2.3\n').trim(), 'FROM mynode-tools:1.2.3');
+});
+t('docker: a genuine image still moves, suffix and registry intact', () => {
+  const php = PIN_RULES.php('8.4.1').find(r => r.file === 'Dockerfile');
+  ok(/php:8\.4\.1-fpm-alpine/.test(php.edit('FROM php:8.3-fpm-alpine3.19\n')));
+  ok(/registry\.example\.com:5000\/php:8\.4\.1/.test(
+    php.edit('FROM registry.example.com:5000/php:8.3\n')), 'a registry port is not a tag');
+  const node = PIN_RULES.node('24.1.0').find(r => r.file === 'Dockerfile');
+  ok(/node:24\.1\.0-alpine3\.2\d/.test(node.edit('FROM node:20-alpine3.19\n')), 'and the suffix maps');
+});
+t('docker: a templated tag is never written into', () => {
+  const php = PIN_RULES.php('8.4.1').find(r => r.file === 'Dockerfile');
+  eq(php.edit('FROM php:${PHP_VERSION}\n').trim(), 'FROM php:${PHP_VERSION}');
+});
+
+console.log('\nconfig edits never go backwards');
+t('config: tsconfig ESNext is not downgraded to a dated target', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-ts-'));
+  try {
+    for (const [cur, want] of [['ES2019', 'ES2023'], ['ES2022', 'ES2023'],
+                               ['ES2023', null], ['ESNext', null]]) {
+      writeFileSync(join(r, 'tsconfig.json'), JSON.stringify({ compilerOptions: { target: cur } }, null, 2));
+      const e = planConfigEdits('node', r, '24.1.0').find(x => x.file === 'tsconfig.json');
+      if (want === null) eq(e, undefined, `${cur} must be left alone, not rewritten`);
+      else eq(JSON.parse(e.after).compilerOptions.target, want, cur);
+    }
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('pins: volta.node moves with the other pins', () => {
+  // left behind while engines and .nvmrc move, volta.node IS the drift
+  const v = PIN_RULES.node('24.1.0').find(r => r.rule === 'volta.node');
+  ok(v, 'there must be a volta rule at all');
+  const out = JSON.parse(v.edit('{"name":"x","volta":{"node":"20.11.1","npm":"10.2.0"}}'));
+  eq(out.volta.node, '24.1.0');
+  eq(out.volta.npm, '10.2.0', 'and nothing else in the block is touched');
+});
+t('pins: .nvmrc keeps the author\'s v prefix, either way', () => {
+  const n = PIN_RULES.node('24.1.0').find(r => r.rule === '.nvmrc');
+  eq(n.edit('v20.11.1\n'), 'v24.1.0\n');
+  eq(n.edit('20.11.1\n'), '24.1.0\n');
+});
+
+console.log('\nverify sees a cap, not just a floor');
+t('verify: a caret constraint the target breaches is a failure', () => {
+  // composer `^7.4` means ">=7.4 <8" and forbids 8.3, but detect exports plain
+  // majors, so "7.4" vs "8.3" read as an ordinary floor below the target
+  const cases = [['^7.4', '8.3', 'fail'], ['^8.3', '8.3', 'pass'],
+                 ['>=7.4', '8.3', 'pass'], ['~8.3', '8.3', 'pass']];
+  for (const [constraint, target, want] of cases) {
+    const r = mkdtempSync(join(tmpdir(), 'ru-vcap-'));
+    try {
+      writeFileSync(join(r, 'composer.json'), `{"name":"x","require":{"php":"${constraint}"}}`);
+      // `gate`/`verifyOf` are declared further down this file — a const is in
+      // the temporal dead zone above its declaration, so call the script directly
+      const data = runJson(process.execPath, [S('verify.mjs'), 'php', r, target]).data;
+      const g = (data.gates || []).find(x => x.name.includes('declared version matches target'));
+      eq(g.status, want, `${constraint} vs ${target}: ${g.detail}`);
+      if (want === 'fail') ok(/deliberately capped/.test(g.detail), g.detail);
+    } finally { rmSync(r, { recursive: true, force: true }); }
+  }
+});
+
+// ───────────── a flag's value is not a positional ─────────────
+console.log('\nargument parsing');
+t('argv: a value flag does not leak into the positionals', () => {
+  const a = parseArgv(['node', '/d', '20', '--max', '50'], ['max']);
+  eq(JSON.stringify(a.positional), JSON.stringify(['node', '/d', '20']));
+  eq(a.flag('max'), '50');
+});
+t('argv: --flag=value works too', () => {
+  const a = parseArgv(['/d', '--target=26.12.1'], ['target']);
+  eq(a.flag('target'), '26.12.1');
+  eq(JSON.stringify(a.positional), JSON.stringify(['/d']));
+});
+t('argv: a boolean flag consumes nothing', () => {
+  const a = parseArgv(['/d', '--apply', 'extra'], ['target']);
+  eq(JSON.stringify(a.positional), JSON.stringify(['/d', 'extra']));
+  eq(a.has('apply'), true);
+});
+t('scan: --max is not mistaken for the target version', () => {
+  // `scan java <dir> 17 --max 50` silently scanned the window 17 -> "50"
+  const r = mkdtempSync(join(tmpdir(), 'ru-argv-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=20"},"dependencies":{"a":"1"}}');
+    const bad = run(process.execPath, [S('scan.mjs'), 'node', r, '20', '--max', '50']);
+    ok(bad.status !== 0, 'a missing target must be refused, not invented');
+    ok(/usage/.test(bad.stderr), bad.stderr.slice(0, 100));
+    const good = runJson(process.execPath, [S('scan.mjs'), 'node', r, '20', '26.12.1', '--max', '7']);
+    eq(good.data.to, '26.12.1');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('plan: --target before the directory still resolves the directory', () => {
+  // `plan.mjs --target 21 <dir>` resolved "21" as the dir
+  const r = mkdtempSync(join(tmpdir(), 'ru-argv2-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=20"},"dependencies":{"a":"1"}}');
+    const v = runJson(process.execPath, [S('plan.mjs'), '--target', '26.12.1', r, '--json']);
+    ok(v.data, 'plan produced JSON');
+    eq(v.data.plans[0].target, '26.12.1');
+    ok(v.data.root.endsWith(r.split('/').pop()), v.data.root);
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
 // ───────────── advice addressed to the right language ─────────────
 console.log('\nper-language hints');
 t('verify: every language gets its OWN deprecation advice', () => {

@@ -165,3 +165,32 @@ export function rel(root, p) {
 
 export function emit(obj) { process.stdout.write(JSON.stringify(obj, null, 2) + '\n'); }
 export function die(msg, code = 1) { process.stderr.write('ERROR: ' + msg + '\n'); process.exit(code); }
+
+/**
+ * Split argv into positionals and flags, knowing which flags TAKE A VALUE.
+ *
+ * `argv.filter(a => !a.startsWith('--'))` cannot know that, so a flag's value
+ * silently became a positional: `scan.mjs java <dir> 17 --max 50` scanned the
+ * window 17 -> "50" instead of reporting a missing target, and
+ * `plan.mjs --target 21 <dir>` resolved "21" as the DIRECTORY.
+ *
+ * `valueFlags` lists the flags that consume the next argument. Anything else
+ * starting with `--` is a boolean.
+ */
+export function parseArgv(argv, valueFlags = []) {
+  const takesValue = new Set(valueFlags);
+  const positional = [], flags = {}, bools = new Set();
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) { positional.push(a); continue; }
+    const name = a.slice(2).split('=')[0];
+    if (a.includes('=')) { flags[name] = a.slice(a.indexOf('=') + 1); continue; }
+    if (takesValue.has(name)) { flags[name] = argv[++i]; continue; }
+    bools.add(name);
+  }
+  return {
+    positional, flags,
+    flag: n => flags[n] ?? null,
+    has: n => bools.has(n) || n in flags,
+  };
+}
