@@ -10,7 +10,7 @@ noise, and a way to prove the dependencies still behave afterwards.
 
 ```bash
 /plugin marketplace add aasisdhakal/claude-runtime-upgrade
-/plugin install runtime-upgrade@runtime-upgrade
+/plugin install runtime-upgrade@aasisdhakal
 ```
 
 Needs **node, git and curl**. Nothing else is mandatory — `doctor.mjs` tells you what each

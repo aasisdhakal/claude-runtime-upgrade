@@ -1,5 +1,6 @@
 {
   "name": "runtime-upgrade",
+  "displayName": "Runtime Upgrade",
   "version": "0.1.0",
   "description": "Upgrade a language runtime — Node.js, PHP, Go, Python, Ruby, Rust, Java, .NET, Deno, Bun, Elixir, Erlang, Kotlin, Scala or Perl — across any repo shape. Discovery, EOL/CVE research, blocker assessment, source fixes, dependency upgrades with behaviour probes, and verification gates.",
   "author": {

@@ -1,5 +1,5 @@
 {
-  "name": "runtime-upgrade",
+  "name": "aasisdhakal",
   "description": "Runtime and language-version upgrades done properly: EOL and CVE research, blocker assessment, pin and CI rewriting, source fixes delegated to Rector/Ruff/OpenRewrite, and behaviour probes that prove upgraded dependencies still answer the same.",
   "owner": {
     "name": "aasisdhakal",
