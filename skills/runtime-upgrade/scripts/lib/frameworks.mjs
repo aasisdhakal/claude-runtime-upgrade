@@ -1,4 +1,4 @@
-// Framework EOL. The runtime is often NOT the real blocker — on a real production repo the
+// Framework EOL. The runtime is often NOT the real blocker — on one real repo the
 // Node bump was the smaller half and the framework major was the actual work.
 // endoflife.date tracks 41 of the frameworks people actually run, so checking
 // them costs one extra request against a feed we already use.
