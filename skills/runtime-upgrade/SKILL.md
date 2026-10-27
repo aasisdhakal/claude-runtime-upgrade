@@ -261,6 +261,61 @@ Creating a pin beside one adds a second, contradictory source of truth — see
 And a `rust-toolchain.toml` is only ever created at the repo **root**: in a subdirectory it is a
 rustup override that silently changes the toolchain for everyone who builds there.
 
+## Phase 4a — DELEGATE THE SOURCE REWRITE, THEN FIX WHAT IS LEFT
+
+**Do not hand-write what Rector already does.** For six languages a maintained engine
+rewrites source far better than any regex catalogue, and the rule catalogue here
+deliberately excludes everything they cover. `fix.mjs` reports the boundary in its
+`delegate` block; `doctor.mjs` reports which engines this machine can actually run.
+
+| Language | Engine | What it leaves you |
+|---|---|---|
+| PHP | **Rector** (145 rules, MIT) | pins, CI, composer resolution, extension breakage, and 5 deprecations it has no rule for |
+| Python | **Ruff** `UP` (MIT) | every stdlib REMOVAL — `UP035` runs off a hardcoded 8-module whitelist |
+| Java | **OpenRewrite** `UpgradeToJavaNN` (Apache-2.0) | `sun.misc.Unsafe`, Java 24 (no recipe exists), and **beware: it also rewrites pins** |
+| Go | **`go fix`** (Go ≥1.26 only) | `ioutil.ReadDir`/`Discard`, `maps.Keys`/`Values`, `rand.Seed` |
+| Node | **nodejs/userland-migrations** | everything past Node 24 — no v24→v26 recipe exists |
+| Scala | **`scalac -source:3.0-migration -rewrite`** | ~65% of it; type inference has zero automation |
+| Elixir | **`mix format --migrate`** (≥1.18) | anything needing a target version — it keys off the RUNNING Elixir |
+| Deno | **`deno lint --fix`** | all of Deno 1→2 except the `window` global (9 of 121 rules have fixes) |
+
+Ruby, Rust, .NET, Erlang, Kotlin and Perl have **no credible rewriter** — `doctor.mjs`
+carries the evidence for each. There the catalogue is the only coverage.
+
+**Never install an engine.** This skill is node + git + curl. An absent engine still
+yields the exact config and command to run elsewhere; the catalogue covers the rest.
+
+**Run the engine FIRST, then re-run `fix.mjs`** — the rules here are what it leaves behind.
+
+### Traps that make an engine silently do nothing
+
+These are observed failures, not theory. Each one produces a clean, empty result that
+reads as "nothing to migrate":
+
+- **Rector needs BOTH version knobs.** `withPhpSets()` chooses which rules load;
+  `withPhpVersion()` is a separate ceiling taken as `min(it, composer.json require.php,
+  PHP_VERSION_ID)`. With `require.php "^8.1"` and `withPhpSets(php84: true)`, every rule
+  above 8.1 was skipped without a word. A tool that rewrites source *before* moving pins
+  must set `withPhpVersion()`. The generated `rector.php` does.
+- **Rector's PHP sets include style rules.** The 8.1 set carries
+  `FunctionFirstClassCallableRector`, which rewrote `session_set_save_handler('o','c',…)`
+  into first-class callables — inconsistently, and fatally where those functions are not
+  defined. Prefer an explicit `withRules([...])` allowlist for BC-break work.
+- **A file using removed syntax aborts Rector's whole-set run** with `System error:
+  "Class … should be known at this point"` — PHPStan cannot scope a file it cannot parse.
+  The curly-offset rule in the catalogue exists to trigger an isolated `--only` pass first.
+- **`ruff check --diff` implies `--fix-only`**, so anything unfixable disappears —
+  `DTZ003`/`DTZ004` have no fix and vanish entirely. Always run a plain `ruff check` too.
+- **OpenRewrite silently no-ops without a build.** Its parser classpath comes from the
+  project's compile/test classpath; in a multi-module reactor those point at each module's
+  `target/classes`. Never built means empty, type attribution degrades, type-aware recipes
+  match nothing, and you get a clean patch and a false all-clear. `mvn -DskipTests install`
+  first. Dependency *resolution* is a hard gate; javac success is not required.
+- **`go fix` before Go 1.26 is the dormant 2012 version** — it exits 0 having done nothing.
+- **OpenRewrite also rewrites your pins** (`maven.compiler.*`, `setup-java`, SDKMAN,
+  CircleCI, Dockerfile Java versions). For Java that is the same job as Phase 4. Pick one;
+  do not run both unreviewed.
+
 ## Phase 4a — WRITE THE SOURCE FIXES
 
 ```bash

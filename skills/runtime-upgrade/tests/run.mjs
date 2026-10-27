@@ -4,6 +4,7 @@
 import { build, destroy, FIXTURES } from './fixtures.mjs';
 import { runJson, run } from '../scripts/lib/sh.mjs';
 import { fetchJson, walk, walkGaps, readText, parseArgv } from '../scripts/lib/io.mjs';
+import { ENGINES, NO_ENGINE, engineStatus } from '../scripts/lib/engines.mjs';
 import { satisfies, rangeMajor, rangeMajorMinor, compare } from '../scripts/lib/semver.mjs';
 import { stripNonCode, stripComments, usesCgo } from '../scripts/lib/strip.mjs';
 import { LOCKFILES, diffLocks, bump } from '../scripts/lib/lockdiff.mjs';
@@ -1099,6 +1100,113 @@ t('verify: a caret constraint the target breaches is a failure', () => {
       if (want === 'fail') ok(/deliberately capped/.test(g.detail), g.detail);
     } finally { rmSync(r, { recursive: true, force: true }); }
   }
+});
+
+// ───────────── delegate to the engine that already does it ─────────────
+console.log('\nrewrite-engine delegation');
+t('engines: every registered engine declares what it will NOT touch', () => {
+  // the point of the registry is the boundary, not the command
+  for (const [lang, e] of Object.entries(ENGINES)) {
+    ok(e.name && e.url && e.licence, `${lang}: missing identity`);
+    ok(Array.isArray(e.covers) && e.covers.length, `${lang}: declares no coverage`);
+    ok(Array.isArray(e.doesNotTouch) && e.doesNotTouch.length,
+       `${lang}: must state what stays our job`);
+    ok(e.install, `${lang}: must say how to get it`);
+  }
+});
+t('engines: no engine claims to move pins or run tests', () => {
+  // if one ever does, the orchestration layer has to stop doing it too
+  for (const [lang, e] of Object.entries(ENGINES)) {
+    if (e.overlapsOurPins) continue;              // OpenRewrite, declared and handled
+    const all = e.covers.join(' ').toLowerCase();
+    ok(!/\.nvmrc|requires-python|engines\.node|lockfile/.test(all),
+       `${lang} claims to move a pin — reconcile with planPinEdits`);
+  }
+});
+t('engines: OpenRewrite is flagged as overlapping our pin layer', () => {
+  // UpgradeToJavaNN rewrites maven.compiler.*, setup-java, SDKMAN, Dockerfile
+  // Java versions — the same files planPinEdits/planCiEdits touch
+  ok(ENGINES.java.overlapsOurPins, 'the Java overlap must be declared, not discovered');
+  ok(ENGINES.java.hazards.some(h => h.id === 'overlaps-our-pin-layer'));
+});
+t('engines: every hazard says WHY, not just what', () => {
+  for (const [lang, e] of Object.entries(ENGINES))
+    for (const h of e.hazards || []) {
+      ok(h.id && h.what && h.why, `${lang}/${h.id}: incomplete`);
+      ok(h.why.length > 60, `${lang}/${h.id}: the why must carry the observation`);
+    }
+});
+t('engines: a language with no engine explains itself', () => {
+  for (const [lang, why] of Object.entries(NO_ENGINE))
+    ok(why.length > 80, `${lang}: "nothing exists" needs evidence, not an assertion`);
+});
+t('engines: being on PATH is not the same as being usable', () => {
+  // `go fix` only migrates from Go 1.26; before that it is the dormant 2012
+  // version and reports success having done nothing
+  eq(ENGINES.go.minToolchain, '1.26');
+  const r = mkdtempSync(join(tmpdir(), 'ru-eng-'));
+  try {
+    writeFileSync(join(r, 'go.mod'), 'module x\n\ngo 1.21\n');
+    const st = engineStatus('go', r, '1.21', '1.27');
+    if (st.tooOld) eq(st.present, false, 'a too-old toolchain must not read as present');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('engines: Rector config sets BOTH version knobs', () => {
+  // withPhpSets alone silently no-ops every rule above composer.json's
+  // require.php — verified against a real Rector install
+  const cfg = ENGINES.php.config('8.1', '8.5.12');
+  ok(/withPhpVersion\(PhpVersion::PHP_85\)/.test(cfg), cfg);
+  ok(/withPhpSets\(php85: true\)/.test(cfg), cfg);
+  ok(/silently no-ops/.test(cfg), 'and the generated file must say why both are there');
+});
+t('engines: Ruff config selects DTZ, which is not a default', () => {
+  const cfg = ENGINES.python.config('3.11', '3.13');
+  ok(/target-version = "py313"/.test(cfg), cfg);
+  ok(/select = \["UP", "DTZ"\]/.test(cfg), 'DTZ is opt-in and utcnow is invisible without it');
+  ok(/invisible to/.test(cfg), 'and must warn that --diff hides the unfixable');
+});
+t('engines: a target with no recipe says so rather than inventing one', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-eng2-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"x"}');
+    eq(engineStatus('node', r, '22', '24').recipe, '@nodejs/v22-to-v24');
+    const none = engineStatus('node', r, '24', '26');
+    eq(none.recipe, null, 'there is no v24-to-v26 codemod');
+    ok(/catalogue is the only coverage/.test(none.note));
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('engines: java falls back to the nearest real recipe, and says so', () => {
+  // there is no UpgradeToJava24 — the composites jump 21 -> 25
+  const r = ENGINES.java.recipeFor('24');
+  eq(r.recipe, 'org.openrewrite.java.migrate.UpgradeToJava21');
+  eq(r.exact, false);
+  ok(/no UpgradeToJava24 recipe/.test(r.note), r.note);
+  eq(ENGINES.java.recipeFor('21').exact, true);
+});
+t('fix: the delegate block names the engine and the order to run it', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-del-'));
+  try {
+    writeFileSync(join(r, 'composer.json'), '{"name":"a/b","require":{"php":"^8.1"}}');
+    mkdirSync(join(r, 'src'), { recursive: true });
+    writeFileSync(join(r, 'src/a.php'), '<?php\n$x = strftime("%Y");\n');
+    const d = runJson(process.execPath, [S('fix.mjs'), 'php', r, '8.1', '8.5']).data.delegate;
+    eq(d.engine, 'Rector');
+    ok(d.run.dryRun.includes('--dry-run'), d.run.dryRun);
+    ok(/run the engine FIRST/.test(d.order));
+    ok(d.itWillNotTouch.some(x => /composer\.json/.test(x)), 'the boundary must be stated');
+    ok(d.hazards.length >= 3, 'and the known traps carried');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('fix: a language with no engine says the catalogue is the only coverage', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-del2-'));
+  try {
+    writeFileSync(join(r, 'Gemfile'), "ruby '3.1.0'\n");
+    writeFileSync(join(r, 'a.rb'), 'x = 5 =~ /y/\n');
+    const d = runJson(process.execPath, [S('fix.mjs'), 'ruby', r, '3.1', '3.4']).data.delegate;
+    eq(d.engine, null);
+    ok(/only coverage/.test(d.meaning));
+    ok(d.whyNone.length > 80, 'and the reason must be evidence');
+  } finally { rmSync(r, { recursive: true, force: true }); }
 });
 
 // ───────────── a flag's value is not a positional ─────────────

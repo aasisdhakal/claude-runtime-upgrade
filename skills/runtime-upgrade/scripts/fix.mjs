@@ -15,6 +15,7 @@ import { byId } from './adapters/index.mjs';
 import { rulesFor, SOURCE_EXT } from './lib/breaking.mjs';
 import { stripNonCode, stripComments } from './lib/strip.mjs';
 import { unified } from './lib/edits.mjs';
+import { engineStatus, ENGINES } from './lib/engines.mjs';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -109,6 +110,20 @@ if (has('apply') && changes.length) {
   applyResult = { filesWritten: changes.length, edits: changes.reduce((n, c) => n + c.edits.length, 0) };
 }
 
+function runCommands(lang, dir, target, e) {
+  const E = ENGINES[lang];
+  if (!E) return null;
+  const fmt = c => c ? [c[0], ...c[1]].join(' ') : null;
+  const arg = E.recipeFor ? (e.recipe || target) : target;
+  return {
+    dryRun: fmt(E.dryRun ? E.dryRun(dir, arg) : null),
+    apply:  fmt(E.apply  ? E.apply(dir, arg)  : null),
+    alsoRun: E.alsoRun ? fmt(E.alsoRun(dir)) : undefined,
+    patchAt: E.patchAt,
+    exitCodes: E.okExit,
+  };
+}
+
 emit({
   lang: A.id, dir: DIR, from: from || null, to,
   mode: has('apply') ? 'apply' : 'dry-run',
@@ -120,6 +135,30 @@ emit({
   changes: changes.map(c => ({ file: c.file, edits: c.edits,
     diff: unified(c.file, c.original, c.updated) })),
   applied: applyResult,
+  // What an EXISTING engine does for this language, so nobody hand-rolls a
+  // worse copy of it. The catalogue above deliberately excludes everything
+  // Rector / Ruff / OpenRewrite / go fix already rewrite properly.
+  delegate: (() => {
+    const e = engineStatus(A.id, DIR, from, to);
+    if (!e.engine) return { engine: null, whyNone: e.whyNone,
+      meaning: 'no maintained rewriter exists for this language — the rules above are the only coverage' };
+    return {
+      engine: e.engine, url: e.url, licence: e.licence,
+      present: e.present, foundAt: e.foundAt, installWith: e.installWith,
+      tooOld: e.tooOld,
+      itHandles: e.covers,
+      itWillNotTouch: e.doesNotTouch,
+      hazards: e.hazards,
+      needsBuildFirst: e.needsBuild || undefined,
+      maturity: e.maturity, coverageCeiling: e.coverage, companion: e.companion,
+      recipe: e.recipe, recipeIsExact: e.exact, recipeNote: e.note,
+      configFile: e.configFile, configAlreadyPresent: e.configExists,
+      config: e.config,
+      overlapsOurPinEdits: e.overlapsOurPins,
+      run: runCommands(A.id, DIR, to, e),
+      order: 'run the engine FIRST, then re-run this script — the rules here are what it leaves behind',
+    };
+  })(),
   nextSteps: has('apply')
     ? ['run the test suite — these are mechanical, not proven',
        `${manual.length} finding(s) still need a human: node ${join(HERE, 'fix.mjs')} ${A.id} ${DIR} ${from} ${to} --list`,

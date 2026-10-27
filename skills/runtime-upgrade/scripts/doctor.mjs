@@ -4,6 +4,7 @@ import { have, run } from './lib/sh.mjs';
 import { fetchJson, CACHE_DIR, OFFLINE, emit } from './lib/io.mjs';
 import { adapters } from './adapters/index.mjs';
 import { PR_PROVIDERS, ISSUE_PROVIDERS } from './lib/providers.mjs';
+import { ENGINES, NO_ENGINE } from './lib/engines.mjs';
 
 const TOOLS = [
   ['node',         'required', 'everything — this skill is Node-native'],
@@ -49,6 +50,15 @@ const tools = TOOLS.map(([cmd, scope, why]) => {
   return { tool: cmd, scope, present, version, degradesWithout: present ? null : why };
 });
 
+const cmpSemver = (a, b) => {
+  const A = String(a).split('.').map(Number), B = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(A.length, B.length); i++) {
+    const x = A[i] || 0, y = B[i] || 0;
+    if (x !== y) return x - y;
+  }
+  return 0;
+};
+
 const nodeMajor = Number(process.versions.node.split('.')[0]);
 const sources = [];
 for (const [name, url] of [
@@ -66,6 +76,37 @@ emit({
   cacheDir: CACHE_DIR,
   offline: OFFLINE,
   tools,
+  // Which EXISTING rewriter handles each language's source migration, and
+  // whether it is usable here. These are never installed — an absent engine
+  // still yields the exact command and config to run elsewhere.
+  rewriteEngines: {
+    note: 'the rule catalogue deliberately excludes what these already fix — see fix.mjs `delegate`',
+    available: Object.entries(ENGINES).map(([lang, e]) => {
+      const onPath = have(e.bin) || (e.altBin ? have(e.altBin) : false);
+      // Being on PATH is not the same as being USABLE. `go fix` only does the
+      // migration work from Go 1.26; before that it is the dormant 2012 version
+      // and reports success having done nothing.
+      let usable = onPath, tooOld = null;
+      if (onPath && e.minToolchain) {
+        const v = run(e.bin, ['version'], { timeout: 10000 });
+        const found = (String(v.stdout || '').match(/(\d+\.\d+(\.\d+)?)/) || [])[1];
+        if (found && cmpSemver(found, e.minToolchain) < 0) { usable = false; tooOld = `${e.bin} ${found} < ${e.minToolchain}`; }
+      }
+      return {
+        lang, engine: e.name, licence: e.licence, url: e.url,
+        present: usable,
+        onPath,
+        tooOld,
+        // a project-local install is only visible once we know the directory
+        mayBeProjectLocal: e.localBin || undefined,
+        installWith: usable ? undefined : e.install,
+        needsBuildFirst: !!e.needsBuild,
+        minToolchain: e.minToolchain,
+        degradesTo: 'the built-in rule catalogue, which covers what this engine does not',
+      };
+    }),
+    none: Object.entries(NO_ENGINE).map(([lang, why]) => ({ lang, why })),
+  },
   dataSources: sources,
   languages: adapters.map(a => {
     const probe = { node: 'node', php: 'php', go: 'go', python: 'python3',
