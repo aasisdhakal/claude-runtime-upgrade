@@ -1104,21 +1104,33 @@ t('verify: a caret constraint the target breaches is a failure', () => {
 
 // ───────────── the docs must not drift from the code ─────────────
 console.log('\ndocumented counts are real');
-t('docs: every rule count stated in SKILL.md matches the catalogue', () => {
-  // README and SKILL.md both claimed "68 rules across 15 languages" after the
-  // catalogue dropped to 60 across 14. A number in prose rots silently.
+// Every markdown file that makes a countable claim, not just SKILL.md — the
+// README is where the rot actually was ("68 rules", "180 tests", "Six phases",
+// and a "Next targets" list of six languages that had all already shipped).
+function docFiles() {
+  const out = [join(HERE, '..', 'SKILL.md')];
+  // the published README lives beside the skill in the plugin repo
+  for (const up of ['..', '../..', '../../..']) {
+    const r = join(HERE, up, 'README.md');
+    if (existsSync(r)) { out.push(r); break; }
+  }
+  return out.filter(existsSync);
+}
+t('docs: every rule count stated in prose matches the catalogue', () => {
   const all = Object.values(RULES).flat().length;
   const langs = Object.values(RULES).filter(v => v.length).length;
-  const src = readFileSync(join(HERE, '..', 'SKILL.md'), 'utf8');
-  for (const m of src.matchAll(/\*\*(\d+) rules across (?:all )?(\d+) languages?\*\*/g)) {
-    eq(Number(m[1]), all, `SKILL.md claims ${m[1]} rules, catalogue has ${all}`);
-    eq(Number(m[2]), langs, `SKILL.md claims ${m[2]} languages, catalogue has ${langs}`);
+  for (const f of docFiles()) {
+    const src = readFileSync(f, 'utf8');
+    for (const m of src.matchAll(/(\d+) rules across (?:all )?(\d+) languages?/g)) {
+      eq(Number(m[1]), all, `${f.split('/').pop()} claims ${m[1]} rules, catalogue has ${all}`);
+      eq(Number(m[2]), langs, `${f.split('/').pop()} claims ${m[2]} languages, catalogue has ${langs}`);
+    }
   }
 });
 t('docs: the adapter count stated anywhere matches the registry', () => {
-  const src = readFileSync(join(HERE, '..', 'SKILL.md'), 'utf8');
-  for (const m of src.matchAll(/(\d+) languages? with full adapters/g))
-    eq(Number(m[1]), adapters.length, `claims ${m[1]} adapters, registry has ${adapters.length}`);
+  for (const f of docFiles())
+    for (const m of readFileSync(f, 'utf8').matchAll(/(\d+)\*?\*? languages?\*?\*? with full adapters/g))
+      eq(Number(m[1]), adapters.length, `claims ${m[1]} adapters, registry has ${adapters.length}`);
 });
 t('docs: every engine named in SKILL.md is in the registry', () => {
   const src = readFileSync(join(HERE, '..', 'SKILL.md'), 'utf8');
@@ -3121,6 +3133,29 @@ t('reports tools and what degrades', () => {
   ok(d.data.tools.every(t => t.present || t.degradesWithout), 'every absent tool explains the cost');
   eq(d.data.missingRequired, [], 'node itself must be present');
 });
+
+// ───────────── the documented test count must be real ─────────────
+// Checked HERE rather than as a test: the live counters are still climbing
+// while tests run, and counting `t(` registrations statically undercounts the
+// ones created inside loops. Only after the run is the number true.
+// "180 tests" sat in the README through 157 additions before this existed.
+{
+  const total = pass + fail + skip;
+  const docs = [join(HERE, '..', 'SKILL.md')];
+  for (const up of ['..', '../..', '../../..']) {
+    const r = join(HERE, up, 'README.md');
+    if (existsSync(r)) { docs.push(r); break; }
+  }
+  for (const f of docs.filter(existsSync)) {
+    const m = readFileSync(f, 'utf8').match(/(\d{2,4}) tests\./);
+    if (!m) continue;
+    if (Math.abs(Number(m[1]) - total) > 5) {
+      fail++;
+      failures.push([`docs: ${f.split('/').pop()} states a stale test count`,
+                     `it claims ${m[1]} tests; the suite ran ${total}`]);
+    }
+  }
+}
 
 // ───────────────────────── summary ─────────────────────────
 console.log(`\n\x1b[32m${pass} passed\x1b[0m  \x1b[31m${fail} failed\x1b[0m  \x1b[33m${skip} skipped\x1b[0m`);
