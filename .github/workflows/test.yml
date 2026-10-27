@@ -1,4 +1,10 @@
 name: tests
+
+# A workflow with no permissions block inherits a write-scoped GITHUB_TOKEN.
+# Nothing here needs to write anything.
+permissions:
+  contents: read
+
 on:
   push: { branches: [main] }
   pull_request:
