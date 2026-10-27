@@ -70,8 +70,15 @@ if (!det.data) die('detect.mjs produced no output: ' + (det.stderr || '').slice(
 let targets = det.data.targets.filter(t => !t.error);
 if (WANT_LANG) targets = targets.filter(t => t.lang === WANT_LANG);
 if (ONLY) targets = targets.filter(t => ONLY.some(o => t.dir.includes(o) || (t.name || '').includes(o)));
-const undeclared = targets.filter(t => !t.declaredMajors);
-targets = targets.filter(t => t.declaredMajors);
+// A target with no pin and no floor is not necessarily unplannable. A library
+// commonly declares nothing and simply tests a CI matrix — fastify, axios and
+// socket.io all do. Dropping those produced NO plan, NO finding and NO
+// explanation for a perfectly real repo, which is the worst output available.
+// Keep them when the matrix gives us something to plan from; pickCurrent()
+// treats the lowest entry as the effective floor.
+const planFrom = t => !!t.declaredMajors || (t.ciMatrix || []).some(v => /^\d/.test(String(v)));
+const undeclared = targets.filter(t => !planFrom(t));
+targets = targets.filter(planFrom);
 
 const langsInScope = [...new Set(targets.map(t => t.lang))];
 if (SINGLE_TARGET && langsInScope.length > 1 && !WANT_LANG) {
@@ -233,6 +240,12 @@ for (const t of targets) {
              ci: ci.map(e => `${e.file} (${e.rule})`),
              config: cfg.map(e => `${e.file} (${e.rule})`),
              ciMatrix: matrix },
+    currentInferredFrom: currentIsInferred(t)
+      ? { source: 'CI test matrix', values: t.ciMatrix,
+          meaning: 'this project declares no runtime pin or floor. The lowest matrix entry is '
+                 + 'treated as the effective floor — it is the oldest runtime CI still green-lights. '
+                 + 'Nothing here is drift, and raising it means dropping a tested version.' }
+      : undefined,
     blockers,
     // assess's own caveats — dropped entirely before, so on the one repo where
     // N-API classification is the headline risk the plan showed nativeNoise: []
@@ -292,7 +305,27 @@ function pickCurrent(t, adapter) {
   // last resort: the LOWEST declared major, never the highest
   const all = String(t.declaredMajors || '').split(',').filter(Boolean)
     .sort((a, b) => parseFloat(a) - parseFloat(b));
-  return all[0] || '';
+  if (all[0]) return all[0];
+
+  // A library often pins NOTHING and simply tests a matrix — fastify, axios and
+  // socket.io all do exactly that. With no pin and no floor those targets fell
+  // through to "undeclared" and plan.mjs emitted nothing at all for them: no
+  // plan, no finding, no explanation. Silence on a real repo is the worst
+  // output this tool can produce.
+  //
+  // A matrix is NOT a pin and must never count as drift, but it is still
+  // evidence of what the project supports. The LOWEST entry is the effective
+  // floor — the oldest runtime they still green-light — so that is the honest
+  // "current" to plan from.
+  const matrix = (t.ciMatrix || []).map(v => String(v).replace(/\.x$/, ''))
+    .filter(v => /^\d/.test(v))
+    .sort((a, b) => parseFloat(a) - parseFloat(b));
+  return matrix[0] || '';
+}
+
+/** Did `current` come from a CI matrix rather than a declaration? */
+function currentIsInferred(t) {
+  return !String(t.declaredMajors || '') && (t.ciMatrix || []).length > 0;
 }
 
 function estimate({ pins, ci, cfg, blockers, scan, deps, fwEol, crossed, edition }) {

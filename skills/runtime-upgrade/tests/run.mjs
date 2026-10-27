@@ -1529,6 +1529,50 @@ t('addons: an ABI number beats an N-API marker', () => {
   } finally { rmSync(r, { recursive: true, force: true }); }
 });
 
+// ───────────── a CI matrix is evidence, not a pin ─────────────
+console.log('\nlibraries that pin nothing');
+t('plan: a repo whose only signal is a CI matrix still gets a plan', () => {
+  // fastify, axios and socket.io declare no engines, no .nvmrc, no Dockerfile.
+  // They were filtered out before pickCurrent ran, so plan.mjs emitted nothing
+  // at all — no plan, no finding, no explanation. Silence on a real repo.
+  const r = mkdtempSync(join(tmpdir(), 'ru-cim-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"lib","dependencies":{"x":"1"}}');
+    mkdirSync(join(r, '.github/workflows'), { recursive: true });
+    writeFileSync(join(r, '.github/workflows/ci.yml'),
+      'jobs:\n  t:\n    strategy:\n      matrix:\n        node-version: [20, 24, 26]\n');
+    const p = runJson(process.execPath, [S('plan.mjs'), r, '--json', '--target', '26.12.1']).data;
+    ok(p.plans.length >= 1, 'a matrix-only repo must still produce a plan');
+    const x = p.plans[0];
+    eq(x.current, '20', 'the LOWEST matrix entry is the effective floor');
+    ok(x.currentInferredFrom, 'and it must be marked as inferred, not declared');
+    eq(x.currentInferredFrom.source, 'CI test matrix');
+    ok(/is drift/.test(x.currentInferredFrom.meaning), 'it must say a matrix is not drift');
+    ok(/dropping a tested version/.test(x.currentInferredFrom.meaning), 'and what raising it costs');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('plan: a declared version still wins over the matrix', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-cim2-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"lib","engines":{"node":">=22"},"dependencies":{"x":"1"}}');
+    mkdirSync(join(r, '.github/workflows'), { recursive: true });
+    writeFileSync(join(r, '.github/workflows/ci.yml'),
+      'jobs:\n  t:\n    strategy:\n      matrix:\n        node-version: [18, 20, 22]\n');
+    const x = runJson(process.execPath, [S('plan.mjs'), r, '--json', '--target', '26.12.1']).data.plans[0];
+    eq(x.current, '22', 'the declared floor, not the matrix low');
+    eq(x.currentInferredFrom, undefined, 'and not marked inferred');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+t('plan: a repo with neither a declaration nor a matrix is still reported, not dropped', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-cim3-'));
+  try {
+    writeFileSync(join(r, 'package.json'), '{"name":"lib","dependencies":{"x":"1"}}');
+    const p = runJson(process.execPath, [S('plan.mjs'), r, '--json', '--target', '26.12.1']).data;
+    eq(p.plans.length, 0, 'nothing to plan from');
+    ok(p.undeclaredTargets.length >= 1, 'but it must appear in undeclaredTargets');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
+
 // ───────────── one repo is one decision ─────────────
 console.log('\nmonorepo plans do not multiply');
 t('plan: identical upgrades in one repo collapse into one', () => {
@@ -2946,7 +2990,14 @@ t('multilang: an ambiguous target is applied to NO language', () => withFixture(
     ok(p.target !== '24.22.1' || p.lang === 'node',
        `${p.lang} must not inherit another language's target (got ${p.target})`);
   const go = v.data.plans.find(p => p.lang === 'go');
-  ok(go && /^1\./.test(go.target), `go resolved its own target: ${go?.target}`);
+  ok(go, 'go must still be planned');
+  // Resolving go's OWN target needs endoflife.date. The thing this test exists
+  // to protect — that go does not inherit node's 24.22.1 — holds either way, and
+  // is asserted above. Only the positive half is network-bound, so gate it
+  // rather than failing the whole suite on a cold offline cache. This failed in
+  // CI on main for exactly that reason, before the workflows ever ran.
+  if (!process.env.RU_OFFLINE) ok(/^1\./.test(go.target), `go resolved its own target: ${go.target}`);
+  else ok(go.target !== '24.22.1', 'offline: go still must not inherit node\'s target');
 }));
 t('multilang: --target applies when the language is unambiguous', () => withFixture('polyglot', r => {
   const v = plan(r, '--lang', 'node', '--target', '24.22.1');
