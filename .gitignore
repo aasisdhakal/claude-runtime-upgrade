@@ -22,3 +22,8 @@ credentials
 .terraform/
 *.tfstate
 *.tfstate.backup
+
+# JetBrains / editor state — never publish IDE config
+.idea/
+*.iml
+.vscode/
