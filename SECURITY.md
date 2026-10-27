@@ -2,7 +2,13 @@
 
 ## Reporting
 
-Open a private security advisory on this repository. Please don't file a public issue for a vulnerability.
+**Preferred:** open a [private security advisory](https://github.com/aasisdhakal/claude-runtime-upgrade/security/advisories/new)
+on this repository. It is private until a fix ships, and it keeps the disclosure in one place.
+
+**If that is unavailable to you:** aashish.developer12@gmail.com.
+
+Please don't file a public issue for a vulnerability. I will acknowledge within a week —
+this is a one-person project, so please allow for that before escalating.
 
 ## What this tool does and does not do
 

@@ -12,6 +12,10 @@ permissions:
 jobs:
   analyze:
     name: Analyze
+    # Scorecard publishes to a public registry and CodeQL needs Advanced
+    # Security on a private repo — both fail until this repo is public, so
+    # skip rather than show a permanent red X. They activate on the flip.
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     permissions:
       security-events: write   # required to upload the SARIF result
