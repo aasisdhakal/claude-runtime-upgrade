@@ -2182,6 +2182,33 @@ t('probe: every supported ecosystem can install, run and read back a version', (
       ok(body.slice(0, 1400).includes(k), `${l} is missing ${k}`);
   }
 });
+t('probe: a changed outcome EXITS NON-ZERO', () => {
+  // emit(obj, code) discarded the second argument, so probe.mjs always exited 0
+  // and a CI gate on exit status passed a probe that had found a change.
+  // Found by an agent using the runner, not by this suite.
+  const r = run(process.execPath, [S('probe.mjs'), 'rust', 'serde', '1', '2', '--probe', '/no/such']);
+  ok(r.status !== 0, 'a refusal must be non-zero');
+  const src = readFileSync(S('probe.mjs'), 'utf8');
+  ok(/outcome === 'changed' \? 1 : 0/.test(src), 'probe.mjs must ask for a non-zero exit on change');
+});
+t('emit: honours an exit code without truncating stdout', () => {
+  // process.exit() can cut stdout mid-write on a pipe, corrupting the JSON the
+  // caller is about to parse — so this sets process.exitCode instead
+  const src = readFileSync(join(HERE, '..', 'scripts', 'lib', 'io.mjs'), 'utf8');
+  ok(/export function emit\(obj, code\)/.test(src), 'emit must accept an exit code');
+  ok(/process\.exitCode = code/.test(src), 'and set it, not call process.exit');
+  ok(!/emit[\s\S]{0,200}process\.exit\(/.test(src), 'process.exit() would truncate the JSON');
+});
+t('emit: a zero code leaves the process status alone', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-emit-'));
+  try {
+    const f = join(r, 'e.mjs');
+    writeFileSync(f, `import { emit } from '${join(HERE, '..', 'scripts', 'lib', 'io.mjs')}';\nemit({ ok: true }, 0);\n`);
+    const v = run(process.execPath, [f]);
+    eq(v.status, 0);
+    eq(JSON.parse(v.stdout).ok, true, 'and the JSON still round-trips');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
 t('probe: a silent probe is inconclusive, never "identical"', () => {
   // the dangerous failure: a probe that prints nothing matches itself exactly
   const src = readFileSync(S('probe.mjs'), 'utf8');

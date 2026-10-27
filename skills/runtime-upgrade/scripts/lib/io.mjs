@@ -163,7 +163,23 @@ export function rel(root, p) {
   return r === '' ? '.' : r;
 }
 
-export function emit(obj) { process.stdout.write(JSON.stringify(obj, null, 2) + '\n'); }
+/**
+ * Write the JSON result, and optionally set the process exit code.
+ *
+ * `emit(obj, 1)` previously discarded the second argument entirely, so
+ * probe.mjs — which ends `}, outcome === 'changed' ? 1 : 0)` — always exited 0.
+ * A CI job gating on exit status passed a probe that had just found a
+ * behaviour change. Found by an agent actually using the runner.
+ *
+ * Sets `process.exitCode` rather than calling `process.exit()`: exit() can
+ * truncate stdout mid-write on a pipe, which would corrupt the very JSON the
+ * caller is about to parse. Setting the code lets the process drain and exit
+ * naturally with the right status.
+ */
+export function emit(obj, code) {
+  process.stdout.write(JSON.stringify(obj, null, 2) + '\n');
+  if (typeof code === 'number' && code !== 0) process.exitCode = code;
+}
 export function die(msg, code = 1) { process.stderr.write('ERROR: ' + msg + '\n'); process.exit(code); }
 
 /**
