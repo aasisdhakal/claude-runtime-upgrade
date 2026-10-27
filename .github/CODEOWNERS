@@ -1,5 +1,4 @@
 # Review routing. See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
-# 
 
 *                 @aasisdhakal
 
@@ -7,3 +6,8 @@
 /.github/         @aasisdhakal
 /LICENSE          @aasisdhakal
 /SECURITY.md      @aasisdhakal
+
+# The write path. A wrong edit here silently breaks someone else's repo:
+/skills/runtime-upgrade/scripts/lib/edits.mjs      @aasisdhakal
+/skills/runtime-upgrade/scripts/remediate.mjs      @aasisdhakal
+/skills/runtime-upgrade/scripts/guard.mjs          @aasisdhakal
