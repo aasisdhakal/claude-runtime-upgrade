@@ -11,7 +11,7 @@
       "name": "runtime-upgrade",
       "source": "./",
       "description": "Upgrade any of 15 language runtimes across any repo shape — EOL and CVE research, blocker assessment, source fixes, dependency behaviour probes, and verification gates.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "category": "security",
       "keywords": [
         "runtime",
