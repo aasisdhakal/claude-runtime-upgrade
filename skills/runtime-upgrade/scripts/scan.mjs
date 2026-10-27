@@ -5,7 +5,7 @@
 import { walk, walkGaps, readText, resolve, existsSync, rel, emit, die, parseArgv } from './lib/io.mjs';
 import { byId } from './adapters/index.mjs';
 import { rulesFor, preExistingRules, inheritedCatalogue, SOURCE_EXT } from './lib/breaking.mjs';
-import { stripNonCode, stripComments, keepInterpolatable } from './lib/strip.mjs';
+import { stripNonCode, stripComments } from './lib/strip.mjs';
 
 const argv = process.argv.slice(2);
 // `--max 50` used to leak its value into the positionals, so `scan java <dir> 17
@@ -52,8 +52,7 @@ for (const f of files) {
   for (const r of rules) {
     // fresh regex per file: a /g rule would carry lastIndex between files
     // a rule may need to see inside strings (Go import paths, PHP interpolation)
-    const haystack = r.scope === 'dquote' ? keepInterpolatable(raw, A.id)
-      : r.scope === 'code-strings' ? stripComments(raw, A.id)
+    const haystack = r.scope === 'code-strings' ? stripComments(raw, A.id)
       : (r.scope === 'any' || r.scope === 'strings') ? raw : text;
     const re = new RegExp(r.re.source, r.re.flags.includes('g') ? r.re.flags : r.re.flags + 'g');
     let m;

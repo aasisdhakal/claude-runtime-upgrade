@@ -114,8 +114,10 @@ export const FIXTURES = {
   'breaking-src': r => {
     w(r, 'package.json', { name: 'brk', engines: { node: '>=20' }, dependencies: {} });
     w(r, '.nvmrc', 'v20.11.1\n');
-    w(r, 'src/removed.js', 'const c = crypto.createCipher("aes192", key);\nmodule.exports = c;\n');
-    w(r, 'src/runtime.js', "const url = require('url');\nconst u = url.parse('http://x');\n");
+    // process.binding was removed in 22 — INSIDE a 20 -> 26 window
+    w(r, 'src/removed.js', "const fs = process.binding('fs');\nmodule.exports = fs;\n");
+    // new Buffer() was removed in 12 — BEFORE 20, so it is pre-existing debt
+    w(r, 'src/runtime.js', "const b = new Buffer('x');\nmodule.exports = b;\n");
     w(r, 'src/behaviour.ts', "import { AsyncLocalStorage } from 'async_hooks';\nexport const als = new AsyncLocalStorage();\n");
     w(r, 'src/clean.js', 'export const ok = 1;\n');
   },

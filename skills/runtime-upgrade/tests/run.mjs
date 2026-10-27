@@ -724,15 +724,15 @@ t('scan: finds the severity classes inside the window', () => withFixture('break
   const kinds = new Set(v.data.details.map(d => d.severity));
   ok(kinds.has('removed'), 'removed');
   ok(kinds.has('behaviour'), 'behaviour');
-  // url.parse was deprecated in Node 16 — BEFORE the current version — so it is
+  // new Buffer() was removed in Node 12 — BEFORE the current version — so it is
   // not caused by this upgrade and must stay out of the window by default
-  ok(!v.data.details.some(d => /url\.parse/.test(d.what)), 'pre-existing deprecations are excluded by default');
+  ok(!v.data.details.some(d => /new Buffer/.test(d.what)), 'pre-existing removals are excluded by default');
 }));
 t('scan: --include-existing surfaces pre-existing debt separately', () => withFixture('breaking-src', r => {
   const v = scan('node', r, '20.11.1', '26.12.1', '--include-existing');
   ok(v.data.preExistingRules > 0, 'pre-existing rules were applied');
   const pre = v.data.details.filter(d => d.preExisting);
-  ok(pre.some(d => /url\.parse/.test(d.what)), 'url.parse surfaces as pre-existing');
+  ok(pre.some(d => /new Buffer/.test(d.what)), 'new Buffer() surfaces as pre-existing');
   ok(v.data.causedByThisUpgrade < v.data.findings, 'and is counted apart from this upgrade');
   ok(/NOT caused by this upgrade/.test(v.data.preExistingNote), 'and is labelled as such');
 }));
@@ -813,8 +813,8 @@ t('strip: scanner finds code hits but not comment hits', () => {
   const r = mkdtempSync(join(tmpdir(), 'ru-strip-'));
   try {
     writeFileSync(join(r, 'package.json'), '{"name":"s","engines":{"node":">=20"}}');
-    writeFileSync(join(r, 'a.js'), '// crypto.createCipher is mentioned here\nconst ok = 1;\n');
-    writeFileSync(join(r, 'b.js'), 'const c = crypto.createCipher("aes", k);\n');
+    writeFileSync(join(r, 'a.js'), "// process.binding is mentioned here\nconst ok = 1;\n");
+    writeFileSync(join(r, 'b.js'), "const fs = process.binding('fs');\n");
     const v = runJson(process.execPath, [S('scan.mjs'), 'node', r, '20.11.1', '26.12.1']);
     const files = v.data.details.map(d => d.file);
     ok(files.includes('b.js'), 'real usage found');
@@ -846,7 +846,9 @@ t('rules: every rule has a severity, a description and a fix', () => {
 });
 t('rules: each new language catalogue actually matches its own syntax', () => {
   const samples = {
-    deno:   ['const p = Deno.run({cmd: ["ls"]});', 6],
+    // deno dropped to 5: `window` removal is fixed by `deno lint --fix`
+    // (no-window / no-window-prefix), so maintaining our own was duplication
+    deno:   ['const p = Deno.run({cmd: ["ls"]});', 5],
     elixir: ['Logger.warn("x")', 2],
     erlang: ['random:uniform(10).', 2],
     rust:   ['let x = std::mem::uninitialized::<u8>();', 5],
@@ -2457,35 +2459,11 @@ t('fix: NEVER edits inside a comment', () => srcRepo(
     eq(v.data.editCount, 1, 'exactly one edit — the real call, not the comment');
     eq(v.data.changes[0].edits[0].line, 2, 'on line 2');
   }));
-t('scan: a dquote-scoped rule sees interpolation, and NOTHING else', () => srcRepo(
-  { 'composer.json': '{"name":"a/b","require":{"php":"^8.0"}}',
-    'real.php': '<?php\n$s = "hello ${name}";\n',
-    'literal.php': "<?php\n$s = '${PUSHER_APP_KEY}';\n",
-    'escaped.php': '<?php\n$s = "<?php \\${$v} = 1;";\n',
-    'backref.php': "<?php\n$s = preg_replace('/x/', '${1}', 'y');\n",
-    'comment.php': '<?php\n// use ${name} here\n',
-    'tpl.blade.php': '<div x-text="`${total}`"></div>\n' }, r => {
-    // The autofix for this rule rewrote all five of the non-findings into
-    // valid-but-wrong PHP that `php -l` accepted. Detection must be narrow.
-    const v = scan('php', r, '8.0', '8.4');
-    const files = (v.data.details || []).map(d => d.file);
-    eq(files.length, 1, `expected only real.php, got ${JSON.stringify(files)}`);
-    eq(files[0], 'real.php');
-  }));
-t('fix: the php interpolation rule offers no autofix', () => srcRepo(
-  { 'composer.json': '{"name":"a/b","require":{"php":"^8.0"}}',
-    'a.php': '<?php\n$s = "hello ${name}";\n' }, r => {
-    // it is reported, and left to a human — rewriting it is a judgement call
-    const v = fix('php', r, '8.0', '8.4');
-    eq(v.data.editCount, 0, 'must not rewrite');
-    const rule = RULES.php.find(x => /\$\{\} string interpolation/.test(x.what));
-    eq(rule.autofix, null);
-    eq(rule.scope, 'dquote');
-  }));
 t('scan: a code-strings rule sees import paths but not prose', () => srcRepo(
   { 'go.mod': 'module x\n\ngo 1.20\n',
-    'real.go': 'package main\nimport "golang.org/x/exp/slices"\n',
-    'prose.go': 'package main\n// we should drop golang.org/x/exp/slices someday\n' }, r => {
+    // x/exp/slices is now fully handled by `go fix`, so only /maps is flagged
+    'real.go': 'package main\nimport "golang.org/x/exp/maps"\n',
+    'prose.go': 'package main\n// we should drop golang.org/x/exp/maps someday\n' }, r => {
     const v = scan('go', r, '1.20', '1.27');
     const files = (v.data.details || []).map(d => d.file);
     eq(files.length, 1, `expected only real.go, got ${JSON.stringify(files)}`);
@@ -2493,14 +2471,15 @@ t('scan: a code-strings rule sees import paths but not prose', () => srcRepo(
   }));
 t('fix: the go x/exp rule offers no autofix', () => srcRepo(
   { 'go.mod': 'module x\n\ngo 1.20\n',
-    'a.go': 'package main\nimport "golang.org/x/exp/slices"\n' }, r => {
+    'a.go': 'package main\nimport "golang.org/x/exp/maps"\n' }, r => {
     // stripping the prefix compiles to a DIFFERENT program: stdlib maps.Keys
     // returns iter.Seq, and slices.SortFunc takes cmp() int, not less() bool
     const v = fix('go', r, '1.20', '1.27');
     eq(v.data.editCount, 0, 'must not rewrite');
     const rule = RULES.go.find(x => /graduated to the stdlib/.test(x.what));
     eq(rule.autofix, null);
-    ok(/signatures CHANGED/.test(rule.fix), 'and must say why it is a port');
+    ok(/iter\.Seq/.test(rule.what), 'and must say why it is a port, not a rename');
+    ok(/go fix/.test(rule.fix), 'and must name what DOES handle the rest');
   }));
 t('fix: --only applies a subset', () => srcRepo(
   { 'mix.exs': 'def project, do: [elixir: "~> 1.12"]\n',

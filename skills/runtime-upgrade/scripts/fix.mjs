@@ -13,7 +13,7 @@ import { walk, readText, resolve, existsSync, rel, join, emit, die } from './lib
 import { runJson } from './lib/sh.mjs';
 import { byId } from './adapters/index.mjs';
 import { rulesFor, SOURCE_EXT } from './lib/breaking.mjs';
-import { stripNonCode, stripComments, keepInterpolatable } from './lib/strip.mjs';
+import { stripNonCode, stripComments } from './lib/strip.mjs';
 import { unified } from './lib/edits.mjs';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -63,8 +63,7 @@ for (const f of files) {
   const hits = [];
   for (const r of selected) {
     // a rule may need to see inside strings (Go import paths, PHP interpolation)
-    const haystack = r.scope === 'dquote' ? keepInterpolatable(original, A.id)
-      : r.scope === 'code-strings' ? stripComments(original, A.id)
+    const haystack = r.scope === 'code-strings' ? stripComments(original, A.id)
       : (r.scope === 'any' || r.scope === 'strings') ? original : code;
     const re = new RegExp(r.re.source, r.re.flags.includes('g') ? r.re.flags : r.re.flags + 'g');
     let m;

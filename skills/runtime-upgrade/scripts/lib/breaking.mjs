@@ -40,14 +40,11 @@ const R = (introducedIn, re, severity, what, fix, autofix = null, scope = 'code'
 export const RULES = {
   node: [
     R('12.0.0', /\bnew Buffer\s*\(/,                      'removed',  'new Buffer() was removed', 'use Buffer.from() / Buffer.alloc()'),
-    R('16.0.0', /\brequire\(['"]url['"]\)\.parse|\burl\.parse\s*\(/, 'runtime', 'url.parse() is runtime-deprecated (DEP0169)', 'use new URL()'),
     R('22.0.0', /\bprocess\.binding\s*\(/,                'removed',  'process.binding() was removed', 'use the public API or a native addon'),
     R('23.0.0', /\brequire\(['"]punycode['"]\)/,          'runtime',  'the bundled punycode module is deprecated', 'use the punycode npm package or the WHATWG URL parser'),
     R('24.0.0', /\bnew AsyncLocalStorage\b|\brequire\(['"]async_hooks['"]\)|from ['"]async_hooks['"]/, 'behaviour',
       'AsyncLocalStorage now uses AsyncContextFrame by default — context can go MISSING rather than throwing',
       'assert context identity across an await boundary and across any message/command bus; confirm a regression with --no-async-context-frame'),
-    R('24.0.0', /\bcrypto\.createCipher\s*\(|\bcrypto\.createDecipher\s*\(/, 'removed',
-      'createCipher/createDecipher were removed', 'use createCipheriv/createDecipheriv'),
     R('26.0.0', /\brequire\(['"]_stream_(wrap|readable|writable|duplex|transform|passthrough)['"]\)/, 'removed',
       'the legacy _stream_* internals were removed in Node 26', "import from 'stream' instead"),
     R('26.0.0', /\.writeHeader\s*\(/,                     'removed',  'http.Server.prototype.writeHeader() was removed', 'use writeHead()',
@@ -55,45 +52,19 @@ export const RULES = {
     R('26.0.0', /--experimental-transform-types/,         'removed',  '--experimental-transform-types was removed', 'use --experimental-strip-types or precompile'),
   ],
   php: [
-    R('8.0.0', /\bcreate_function\s*\(/,                  'removed',  'create_function() was removed', 'use a closure'),
-    // `->each(` and `::each(` are ordinary method calls; only the bare global
-    // function was removed. Without the lookbehind this fired on every
-    // Collection::each in Laravel (141 false positives).
-    R('8.0.0', /(?<![\w$>:\\])each\s*\(/,                 'removed',  'each() was removed', 'use foreach'),
-    // The removed syntax is VARIABLE-then-brace (`$str{4}`). The old pattern
-    // matched brace-then-variable (`{$method}`) — which is modern dynamic
-    // access, legal in every version: 322 false positives in Laravel alone,
-    // including PHP 8 match arms. `$this->{$m}` is not matched, because the
-    // brace there follows `->`, not a bare variable name.
     R('8.0.0', /\$\w+\s*\{\s*(?:-?\d+|\$\w+|'[^']*'|"[^"]*")\s*\}/, 'removed',
       'curly-brace string offset access was removed', 'use square brackets'),
-    // Deprecated in 8.4, not 8.1. The construct is a NON-nullable type with a
-    // null default (`Foo $x = null`); the old pattern matched `?Foo $x = null`,
-    // which is the explicitly-nullable form the fix asks for.
-    // Anchored to parameter position so it cannot fire on a property.
-    R('8.4.0', /[(,]\s*(?:(?:final|public|private|protected|readonly)\s+)*(?!\?)(?!(?:null|mixed|public|private|protected|final|readonly|static|var)\b)[A-Za-z_][\w\\]*\s+\$\w+\s*=\s*null\b/,
-      'runtime', 'implicitly nullable parameter types are deprecated (PHP 8.4)', 'declare ?Type explicitly'),
     R('8.1.0', /\bstrftime\s*\(|\bgmstrftime\s*\(/,       'runtime',  'strftime()/gmstrftime() are deprecated', 'use IntlDateFormatter or date()'),
     R('8.1.0', /\bFILTER_SANITIZE_STRING\b/,              'runtime',  'FILTER_SANITIZE_STRING is deprecated', 'use htmlspecialchars()'),
-    R('8.2.0', /\butf8_encode\s*\(|\butf8_decode\s*\(/,   'runtime',  'utf8_encode()/utf8_decode() are deprecated', 'use mb_convert_encoding()'),
-    // Interpolation exists ONLY inside a double-quoted string or a heredoc —
-    // scope 'dquote' blanks everything else, including single-quoted literals,
-    // nowdocs, comments and the JS template literals that live in .blade.php.
-    // NO AUTOFIX: this one rewrote escaped dollars (`"\\${$var}"`), .env
-    // placeholders and preg_replace backreferences into valid-but-wrong PHP
-    // that `php -l` accepts. Rewriting it is a judgement call, not a mechanical
-    // one, so it is reported and left to a human.
-    R('8.2.0', /(?<!\\)\$\{\s*\$?\w+\s*\}/,                'runtime',
-      '${} string interpolation is deprecated', 'use {$var} — check it is really interpolation and not an escaped or literal ${}',
-      null, 'dquote'),
     R('8.3.0', /\bReflectionClass::getStaticProperties\b/, 'runtime', 'nullable return deprecated', 'check the PHP 8.3 UPGRADING notes'),
-    R('8.4.0', /\bmysqli_execute\s*\(|\bsession_set_save_handler\s*\(\s*\w+\s*,/, 'runtime',
-      'several signatures were deprecated in 8.4', 'see UPGRADING for the exact call'),
+    // Two different releases, and only one of them has a Rector rule.
+    R('8.4.0', /\bsession_set_save_handler\s*\(\s*[^)]*,[^)]*,/, 'runtime',
+      'session_set_save_handler() with more than 2 arguments is deprecated in PHP 8.4',
+      'pass a SessionHandlerInterface instance instead — Rector has NO rule for this'),
+    R('8.5.0', /\bmysqli_execute\s*\(/,                  'runtime',
+      'mysqli_execute() is deprecated in PHP 8.5', 'use mysqli_stmt_execute() — Rector renames this, but only at an 8.5+ target'),
   ],
   python: [
-    R('3.9.0',  /\bfrom\s+collections\s+import\s+(?:Mapping|Sequence|Iterable|MutableMapping)/, 'removed',
-      'collections ABCs moved to collections.abc', 'import from collections.abc',
-      m => m.replace('from collections import', 'from collections.abc import')),
     R('3.10.0', /\basyncio\.get_event_loop\s*\(\s*\)/,    'runtime',  'get_event_loop() outside a running loop is deprecated', 'use asyncio.run() or get_running_loop()'),
     R('3.12.0', /\bimp\.|\bimport\s+imp\b/,               'removed',  'the imp module was removed', 'use importlib'),
     R('3.12.0', /\bdistutils\b/,                          'removed',  'distutils was removed', 'use setuptools or packaging'),
@@ -104,13 +75,33 @@ export const RULES = {
     R('3.14.0', /\bast\.(Num|Str|Bytes|NameConstant|Ellipsis)\b/, 'removed', 'legacy ast node aliases were removed', 'use ast.Constant'),
   ],
   ruby: [
-    R('3.0.0', /\bTaint\b|\.taint\b|\.untaint\b/,         'removed',  'the taint mechanism was removed', 'delete the calls'),
-    R('3.1.0', /\bFile\.exists\?\s*\(/,                   'runtime',  'File.exists? is deprecated', 'use File.exist?',
-      m => m.replace('File.exists?', 'File.exist?')),
-    R('3.4.0', /\bObject#=~|\bNilClass#=~/,               'removed',  'Object#=~ was removed', 'use explicit matching'),
+    // Ruby 3.0 only made these silent no-ops; the methods were REMOVED in 3.2.
+    R('3.2.0', /\bTaint\b|\.taint\b|\.untaint\b|\$SAFE\b/, 'removed',
+      'the taint mechanism was removed in Ruby 3.2', 'delete the calls; $SAFE no longer exists'),
+    // removed outright in 3.2, not merely deprecated — this is a hard failure
+    R('3.2.0', /\bFile\.exists\?\s*\(|\bDir\.exists\?\s*\(/, 'removed',
+      'File.exists?/Dir.exists? were removed in Ruby 3.2', 'use File.exist? / Dir.exist?',
+      m => m.replace('exists?', 'exist?')),
+    // It is Kernel#=~, and it went in 3.2 — `Object#=~` is how the docs spell
+    // it, but that notation can never match real code.
+    //
+    // The receiver's TYPE is what decides whether this breaks, and that cannot
+    // be known statically: `x =~ /re/` is correct for a String and a hard error
+    // for an Integer. A regex over `\w+ =~` flagged 2 of 3 lines in a 3-line
+    // fixture, both of them legitimate String matching. So match only receivers
+    // that are provably not a String or Regexp — a literal number, nil, true,
+    // false, an array or a hash. Low recall, zero false alarms.
+    R('3.2.0', /(?<![\w.$@])(?:\d[\d_.]*|nil|true|false|\[[^\]]*\]|\{[^}]*\})\s*=~/, 'removed',
+      'Kernel#=~ was removed in Ruby 3.2 — this receiver is not a String or Regexp, so it now raises NoMethodError instead of returning nil',
+      'guard the receiver type, or match explicitly. NOTE: a variable receiver cannot be checked statically — audit `=~` call sites by hand'),
   ],
   go: [
-    R('1.16.0', /\bio\/ioutil\b/,                         'runtime',  'io/ioutil is deprecated', 'use io and os'),
+    // `go fix` (Go >= 1.26) rewrites io/ioutil via //go:fix inline markers the
+    // stdlib itself carries — on 6 of the 8 symbols. ReadDir and Discard have
+    // none: ReadDir's return type changed and Discard is a var, not a func.
+    R('1.16.0', /\bioutil\.(ReadDir|Discard)\b/,          'runtime',
+      'ioutil.ReadDir / ioutil.Discard are deprecated and `go fix` does NOT rewrite them',
+      'os.ReadDir returns []DirEntry, not []FileInfo, so the call site must change; Discard moved to io.Discard'),
     R('1.20.0', /\bmath\/rand"\s*\)?[\s\S]{0,40}rand\.Seed\s*\(/, 'runtime', 'rand.Seed is deprecated', 'the global source is auto-seeded; use rand.New for determinism'),
     // A Go import path IS a string literal, so this rule must see strings —
     // but scope 'any' also sees COMMENTS, and a file whose only mention of
@@ -122,16 +113,17 @@ export const RULES = {
     // returns an `iter.Seq`, and `slices.SortFunc` changed from `less() bool`
     // to `cmp() int`. The rewritten file does not build. Graduating off x/exp
     // is a real porting job, so it is reported and left to a human.
-    R('1.21.0', /\bgolang\.org\/x\/exp\/(slices|maps)\b/, 'runtime',
-      'x/exp/slices and x/exp/maps graduated to the stdlib',
-      'import "slices" / "maps" — the signatures CHANGED (maps.Keys returns iter.Seq, slices.SortFunc takes cmp() int), so this is a port, not a rename',
+    // `go fix` covers x/exp/slices completely (29 funcs) and x/exp/maps for 6
+    // of 8. Keys and Values are the exceptions: the stdlib versions return an
+    // iterator, not a slice, so no inline marker is possible.
+    R('1.21.0', /\bgolang\.org\/x\/exp\/maps\b/,          'runtime',
+      'x/exp/maps graduated to the stdlib, but maps.Keys/Values did NOT survive the move — the stdlib versions return an iter.Seq, not a slice',
+      '`go fix` (Go >= 1.26) rewrites x/exp/slices entirely and 6 of 8 x/exp/maps symbols. Keys and Values it cannot: wrap with slices.Collect(maps.Keys(m)) to keep a slice, or consume the iterator',
       null, 'code-strings'),
   ],
   java: [
     R('17', /\bsun\.misc\.Unsafe\b/,                      'runtime',  'sun.misc.Unsafe is being removed incrementally', 'use VarHandle / MemorySegment'),
     R('17', /\bSecurityManager\b/,                        'runtime',  'SecurityManager is deprecated for removal', 'remove the dependency on it'),
-    R('21', /\bThread\.stop\s*\(|\bThread\.suspend\s*\(|\bThread\.resume\s*\(/, 'removed',
-      'Thread.stop/suspend/resume now throw', 'use interruption'),
     R('24', /\bfinalize\s*\(\s*\)/,                       'removed',  'finalization is disabled by default', 'use Cleaner or try-with-resources'),
   ],
   dotnet: [
@@ -140,8 +132,8 @@ export const RULES = {
   ],
   rust: [
     R('1.39.0', /\bstd::mem::uninitialized\s*(::<|\()/,   'runtime',  'mem::uninitialized is deprecated and is UB for most types', 'use MaybeUninit'),
-    R('1.39.0', /\bstd::mem::zeroed\s*(::<|\()/,          'runtime',  'mem::zeroed is unsound for types without a valid zero', 'use MaybeUninit'),
-    R('1.39.0', /\btry!\s*\(/,                            'removed',  'the try! macro was removed in the 2018 edition', 'use the ? operator'),
+    R('1.39.0', /\bstd::mem::zeroed\s*(::<|\()/,          'runtime',  'mem::zeroed is NOT deprecated, but is UB for types with no valid zero bit-pattern', 'audit the type; use MaybeUninit where there is no valid zero'),
+    R('1.39.0', /\btry!\s*\(/,                            'removed',  'the try! macro is deprecated and is not a keyword from the 2018 edition on', 'use the ? operator — note `cargo fix --edition` only rewrites it to r#try!(..), which KEEPS the deprecation'),
     R('1.52.0', /#\[derive\([^)]*\bPartialEq\b[^)]*\)\][\s\S]{0,80}?impl\s+Eq\b/, 'runtime',
       'deriving PartialEq alongside a manual Eq is now linted', 'derive both or implement both'),
     R('1.82.0', /\bextern\s+crate\s+/,                    'runtime',  'extern crate is unnecessary since the 2018 edition', 'delete it; use path-based imports'),
@@ -181,15 +173,16 @@ export const RULES = {
   ],
   perl: [
     R('5.30', /\$\[/,                                     'removed',  '$[ (array base) was removed in 5.30', 'arrays always start at 0'),
-    R('5.42', /(?<![=!~])~~(?!~)/,                        'behaviour','smartmatch (~~) is disabled in the 5.42 feature bundle onward',
-      "enable it with `use feature 'smartmatch'` or rewrite the comparison explicitly"),
-    R('5.42', /(?<!\w)(?:given|when)\s*\(/,               'behaviour','given/when are disabled in the 5.42 feature bundle onward',
-      'rewrite as if/elsif, or opt in explicitly'),
+    // Removal was announced and then INDEFINITELY POSTPONED. These still work;
+    // they are outside the default feature bundle and warn. Reporting them as
+    // removed would be a false alarm.
+    R('5.42', /(?<![=!~])~~(?!~)/,                        'runtime',  'smartmatch (~~) is outside the default feature bundle and warns — its removal has been indefinitely postponed, not carried out',
+      "it still runs; enable `use feature 'smartmatch'` to silence, or rewrite the comparison explicitly"),
+    R('5.42', /(?<!\w)(?:given|when)\s*\(/,               'runtime',  'given/when are outside the default feature bundle and warn',
+      'they still run; rewrite as if/elsif, or opt in explicitly'),
   ],
   deno: [
     R('2.0', /\bDeno\.run\s*\(/,                          'removed',  'Deno.run was removed in Deno 2', 'use new Deno.Command()'),
-    R('2.0', /(?<![\w.])window\./,                        'removed',  'the window global was removed in Deno 2', 'use globalThis',
-      () => 'globalThis.'),
     R('2.0', /\bDeno\.(?:readAll|writeAll|iter|copy)\s*\(/, 'removed','these Deno I/O helpers moved to the Standard Library in Deno 2', 'import them from jsr:@std/io'),
     R('2.0', /\bDeno\.(?:Buffer|Reader|Writer|Seeker)\b/, 'removed',  'the Deno.Buffer/Reader/Writer/Seeker interfaces were removed in Deno 2', 'use Web Streams or @std/io'),
     R('2.0', /\bDeno\.(?:resources|metrics|close)\s*\(/,  'removed',  'resource-id APIs were removed in Deno 2', 'use the resource\'s own .close(); metrics has no replacement'),
