@@ -2990,7 +2990,14 @@ t('multilang: an ambiguous target is applied to NO language', () => withFixture(
     ok(p.target !== '24.22.1' || p.lang === 'node',
        `${p.lang} must not inherit another language's target (got ${p.target})`);
   const go = v.data.plans.find(p => p.lang === 'go');
-  ok(go && /^1\./.test(go.target), `go resolved its own target: ${go?.target}`);
+  ok(go, 'go must still be planned');
+  // Resolving go's OWN target needs endoflife.date. The thing this test exists
+  // to protect — that go does not inherit node's 24.22.1 — holds either way, and
+  // is asserted above. Only the positive half is network-bound, so gate it
+  // rather than failing the whole suite on a cold offline cache. This failed in
+  // CI on main for exactly that reason, before the workflows ever ran.
+  if (!process.env.RU_OFFLINE) ok(/^1\./.test(go.target), `go resolved its own target: ${go.target}`);
+  else ok(go.target !== '24.22.1', 'offline: go still must not inherit node\'s target');
 }));
 t('multilang: --target applies when the language is unambiguous', () => withFixture('polyglot', r => {
   const v = plan(r, '--lang', 'node', '--target', '24.22.1');
