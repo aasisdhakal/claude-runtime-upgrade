@@ -1,22 +1,32 @@
 {
   "name": "runtime-upgrade",
   "version": "0.1.0",
-  "description": "Upgrade a language runtime (Node.js or PHP) across any repo shape. Discovery, EOL/CVE research, blocker assessment, code upgrade, and verification gates.",
+  "description": "Upgrade a language runtime — Node.js, PHP, Go, Python, Ruby, Rust, Java, .NET, Deno, Bun, Elixir, Erlang, Kotlin, Scala or Perl — across any repo shape. Discovery, EOL/CVE research, blocker assessment, source fixes, dependency upgrades with behaviour probes, and verification gates.",
   "author": {
-    "name": "Aashish Dhakal"
+    "name": "aasisdhakal",
+    "email": "aashish.developer12@gmail.com",
+    "url": "https://github.com/aasisdhakal"
   },
-  "homepage": "https://github.com/OWNER/claude-runtime-upgrade",
-  "repository": "https://github.com/OWNER/claude-runtime-upgrade",
+  "homepage": "https://github.com/aasisdhakal/claude-runtime-upgrade",
+  "repository": "https://github.com/aasisdhakal/claude-runtime-upgrade",
   "license": "MIT",
   "keywords": [
-    "nodejs",
-    "php",
+    "runtime",
     "upgrade",
     "eol",
     "cve",
     "security",
     "migration",
-    "dependencies"
+    "dependencies",
+    "monorepo",
+    "nodejs",
+    "php",
+    "golang",
+    "python",
+    "ruby",
+    "rust",
+    "java",
+    "dotnet"
   ],
   "skills": [
     "./skills/runtime-upgrade"

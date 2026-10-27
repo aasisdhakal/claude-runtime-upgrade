@@ -5,7 +5,7 @@ A Claude Code skill that takes a repo of unknown shape from *"what runtime are w
 Supports **15 languages** with full adapters, and researches **any of the 485 products endoflife.date tracks**.
 
 ```bash
-/plugin marketplace add OWNER/claude-runtime-upgrade
+/plugin marketplace add aasisdhakal/claude-runtime-upgrade
 /plugin install runtime-upgrade@runtime-upgrade
 ```
 
@@ -165,7 +165,7 @@ Refuses to commit on a protected branch, refuses any branch outside `runtime/*`,
 Requires **Node 18+** (older falls back to the `https` module). No npm install, no dependencies.
 
 ```bash
-/plugin marketplace add OWNER/claude-runtime-upgrade
+/plugin marketplace add aasisdhakal/claude-runtime-upgrade
 /plugin install runtime-upgrade@runtime-upgrade
 ```
 
