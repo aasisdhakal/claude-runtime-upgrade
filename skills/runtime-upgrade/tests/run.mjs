@@ -1102,6 +1102,33 @@ t('verify: a caret constraint the target breaches is a failure', () => {
   }
 });
 
+// ───────────── the docs must not drift from the code ─────────────
+console.log('\ndocumented counts are real');
+t('docs: every rule count stated in SKILL.md matches the catalogue', () => {
+  // README and SKILL.md both claimed "68 rules across 15 languages" after the
+  // catalogue dropped to 60 across 14. A number in prose rots silently.
+  const all = Object.values(RULES).flat().length;
+  const langs = Object.values(RULES).filter(v => v.length).length;
+  const src = readFileSync(join(HERE, '..', 'SKILL.md'), 'utf8');
+  for (const m of src.matchAll(/\*\*(\d+) rules across (?:all )?(\d+) languages?\*\*/g)) {
+    eq(Number(m[1]), all, `SKILL.md claims ${m[1]} rules, catalogue has ${all}`);
+    eq(Number(m[2]), langs, `SKILL.md claims ${m[2]} languages, catalogue has ${langs}`);
+  }
+});
+t('docs: the adapter count stated anywhere matches the registry', () => {
+  const src = readFileSync(join(HERE, '..', 'SKILL.md'), 'utf8');
+  for (const m of src.matchAll(/(\d+) languages? with full adapters/g))
+    eq(Number(m[1]), adapters.length, `claims ${m[1]} adapters, registry has ${adapters.length}`);
+});
+t('docs: every engine named in SKILL.md is in the registry', () => {
+  const src = readFileSync(join(HERE, '..', 'SKILL.md'), 'utf8');
+  const names = Object.values(ENGINES).map(e => e.name);
+  // the Phase 4a table names each engine; a renamed engine must not linger here
+  for (const n of ['Rector', 'Ruff', 'OpenRewrite', 'go fix'])
+    ok(names.includes(n) || names.some(x => x.includes(n)), `${n} is documented but not registered`);
+  ok(/Phase 4a/.test(src), 'the delegation phase must be documented');
+});
+
 // ───────────── delegate to the engine that already does it ─────────────
 console.log('\nrewrite-engine delegation');
 t('engines: every registered engine declares what it will NOT touch', () => {

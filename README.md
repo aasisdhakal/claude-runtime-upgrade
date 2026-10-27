@@ -9,6 +9,8 @@ Supports **15 languages** with full adapters, and researches **any of the 485 pr
 /plugin install runtime-upgrade@runtime-upgrade
 ```
 
+**New here? Read [docs/USAGE.md](docs/USAGE.md)** — how it works and how to use it, with a worked example.
+
 ## This is not another Dependabot
 
 Renovate and Dependabot own **dependency bumps** and do it well. This owns the **decision above them** — the one they explicitly don't make:
@@ -39,7 +41,7 @@ Every command it prints is runnable verbatim.
 
 ## What it does
 
-Six phases, each with a machine-checkable exit condition.
+Seven phases, each with a machine-checkable exit condition.
 
 | Phase | Script | Output |
 |---|---|---|
@@ -47,8 +49,9 @@ Six phases, each with a machine-checkable exit condition.
 | **Research** | `research.mjs` | EOL/support windows, unpatched runtime CVEs at current *and* target |
 | **Assess** | `assess.mjs` | dependency advisories, native/ABI blockers, dependency floors |
 | **Remediate** | `remediate.mjs` | **rewrites every runtime pin AND upgrades all dependency packages** |
-| **Scan** | `scan.mjs` | **68 rules, all 15 languages** — removed APIs, deprecations and **behaviour changes**, with file:line |
+| **Scan** | `scan.mjs` | **60 rules across 14 languages** — removed APIs, deprecations and **behaviour changes**, with file:line |
 | **Verify** | `verify.mjs` | gates that exit non-zero on failure |
+| **Prove** | `depverify.mjs` + `probe.mjs` | runs each changed dependency at the **old and new version** and diffs the behaviour |
 
 All synthesised by **`plan.mjs`**.
 
@@ -113,18 +116,49 @@ node skills/runtime-upgrade/scripts/frameworks.mjs <dir>
 ```
 The runtime is often the smaller half. endoflife.date tracks 41 frameworks; anything it doesn't (NestJS, FastAPI, Flask, Quarkus, Ember, Tailwind) is reported as `untracked` rather than guessed at.
 
-## It writes the code fixes too
+## Source fixes — delegate first, then fill the gaps
 
 ```bash
-node skills/runtime-upgrade/scripts/fix.mjs elixir ./repo 1.12 1.20 --list
-node skills/runtime-upgrade/scripts/fix.mjs elixir ./repo 1.12 1.20 --apply
+node skills/runtime-upgrade/scripts/fix.mjs php ./repo 8.1 8.4 --list
 ```
 
-`remediate.mjs` moves version pins; **`fix.mjs` rewrites the source** — only where the rewrite is correct for every match. 11 hand-written autofixes across 9 languages: `Logger.warn`->`Logger.warning`, `File.exists?`->`File.exist?`, `window.`->`globalThis.`, `'sym`->`Symbol("sym")`, `golang.org/x/exp/slices`->`slices`, and more.
+**It does not reimplement Rector.** For six languages a maintained engine rewrites source
+far better than any regex catalogue, so the built-in rules deliberately exclude everything
+they already cover. Every `fix.mjs` run reports the boundary:
 
-**Autofix is opt-in per rule, never inferred.** `new Buffer(x)` could be `Buffer.from` or `Buffer.alloc` depending on the argument's *type*; `createCipher`->`createCipheriv` needs an IV that isn't in the source. Those are listed as **needs-a-human, with the reason**. A `behaviour`-class rule never gets an autofix — it needs a test, not an edit.
+| Language | Engine | What it leaves you |
+|---|---|---|
+| PHP | **Rector** | pins, CI, composer resolution, 5 deprecations it has no rule for |
+| Python | **Ruff `UP`** | every stdlib **removal** — Ruff's import whitelist is 8 modules |
+| Java | **OpenRewrite** | `sun.misc.Unsafe`, Java 24 — and it also rewrites pins, so pick one |
+| Go | **`go fix`** (≥1.26) | `ioutil.ReadDir`/`Discard`, `maps.Keys`/`Values`, `rand.Seed` |
+| Node | **nodejs/userland-migrations** | everything past Node 24 |
 
-`--list` is your decision point. `--only a,b` applies a subset. Dry run by default; `--apply` goes through the same guard as everything else.
+Ruby, Rust, .NET, Erlang, Kotlin and Perl have **no credible rewriter** — `doctor.mjs`
+carries the evidence for each. There the built-in rules are the only coverage.
+
+**Nothing is ever installed for you.** An absent engine still yields the exact config and
+command to run elsewhere. Run the engine first, then re-run `fix.mjs` for the remainder.
+
+**Autofix is opt-in per rule, never inferred.** `new Buffer(x)` could be `Buffer.from` or
+`Buffer.alloc` depending on the argument's *type*. Those are listed as **needs-a-human,
+with the reason**. A `behaviour`-class rule never gets an autofix — it needs a test, not an edit.
+
+## Proving the dependencies still behave
+
+A type checker only ever rejects a **shape** change. It cannot reject the same call
+returning a **different answer**, and in Python, Ruby, PHP or plain JS nothing checks even
+the shape. So `probe.mjs` runs the dependency at both versions and diffs the output.
+
+Real finding, NestJS, `path-to-regexp` 3.3.0 → 8.4.2:
+
+```
+route /users/{*path}   3.3.0: matches []
+                       8.4.2: matches [/users/7, /users/a/b]
+```
+
+No error, no type change — just different URLs matching, in a file that implements a
+security check. See [docs/USAGE.md](docs/USAGE.md#9-prove-the-dependencies-still-behave--depverifymjs--probemjs).
 
 ## Pull requests — your forge, your call
 

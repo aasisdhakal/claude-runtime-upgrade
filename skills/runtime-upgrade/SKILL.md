@@ -168,7 +168,10 @@ Finds code the upgrade will break, with `file:line`. Three severity classes, and
 
 Rules fire only inside the upgrade window — scanning for Node 26 removals while going 20 → 22 is noise. `--include-existing` additionally reports deprecations that predate the current version: not caused by this upgrade, but exactly what the next one turns into failures.
 
-**68 rules across all 15 languages.** Bun has no separate catalogue — it executes Node APIs, so it inherits Node's, and `inheritedFrom` says so in the output.
+**60 rules across 14 languages.** Bun has no separate catalogue — it executes Node APIs, so
+it inherits Node's, and `inheritedFrom` says so in the output. The count is deliberately
+small: everything Rector, Ruff, OpenRewrite and `go fix` already rewrite properly has been
+removed rather than reimplemented. See Phase 4a.
 
 **Matching is code-only.** Comments, docstrings and string literals are blanked before matching (byte-for-byte, so line numbers stay exact). Without that, Scala's symbol-literal rule matched the apostrophe in `` `Const`'s `` and Java's `sun.misc.Unsafe` rule matched a Javadoc paragraph — 35 of 35 findings across four real repos were prose.
 
