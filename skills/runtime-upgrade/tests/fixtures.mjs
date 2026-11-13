@@ -87,6 +87,38 @@ export const FIXTURES = {
     w(r, 'global.json', { sdk: { version: '6.0.418', rollForward: 'latestFeature' } });
     w(r, 'Dockerfile', 'FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build\n');
   },
+  // The seven spec-driven languages had no fixture at all, so nothing ever ran
+  // a script against them end to end.
+  'single-deno': r => {
+    w(r, 'deno.json', { imports: { '@std/assert': 'jsr:@std/assert@1', 'hono': 'npm:hono@4' } });
+    w(r, '.deno-version', '2.1.4\n');
+    w(r, 'deno.lock', '{"version":"4"}\n');
+  },
+  'single-bun': r => {
+    w(r, 'package.json', { name: 'acme-bun', packageManager: 'bun@1.1.38', dependencies: { hono: '^4.0.0' } });
+    w(r, '.bun-version', '1.1.38\n');
+    w(r, 'bun.lock', '{"lockfileVersion":1}\n');
+  },
+  'single-elixir': r => {
+    w(r, 'mix.exs', 'defmodule Acme.MixProject do\n  use Mix.Project\n  def project do\n    [app: :acme, version: "0.1.0", elixir: "~> 1.15", deps: deps()]\n  end\n  defp deps do\n    [{:phoenix, "~> 1.7"}, {:jason, "~> 1.4"}]\n  end\nend\n');
+    w(r, '.tool-versions', 'elixir 1.15.7-otp-26\n');
+    w(r, 'mix.lock', '%{}\n');
+  },
+  'single-erlang': r => {
+    w(r, 'rebar.config', '{minimum_otp_vsn, "25"}.\n{deps, [cowboy]}.\n');
+    w(r, '.tool-versions', 'erlang 25.3.2\n');
+    w(r, 'rebar.lock', '[].\n');
+  },
+  'single-kotlin': r => {
+    w(r, 'build.gradle.kts', 'plugins {\n    kotlin("jvm") version "1.9.22"\n}\nkotlin {\n    jvmToolchain(17)\n}\ndependencies {\n    implementation("io.ktor:ktor-server-core:2.3.7")\n}\n');
+  },
+  'single-scala': r => {
+    w(r, 'build.sbt', 'name := "acme"\nscalaVersion := "2.13.12"\nlibraryDependencies += "org.typelevel" %% "cats-core" % "2.10.0"\n');
+  },
+  'single-perl': r => {
+    w(r, 'cpanfile', "requires 'perl', '5.030';\nrequires 'Mojolicious', '9.0';\n");
+    w(r, '.perl-version', '5.30.3\n');
+  },
   // CI accuracy: a Node project whose workflow ALSO pins a python version
   'ci-cross-language': r => {
     w(r, 'package.json', { name: 'cross', engines: { node: '>=20' } });

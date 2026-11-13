@@ -6,6 +6,8 @@ import { have, run, runJson } from './lib/sh.mjs';
 import { byId } from './adapters/index.mjs';
 import { readFileSync } from 'node:fs';
 import { usesCgo } from './lib/strip.mjs';
+import { LANG_FACTS, OSV_SCANNER } from './lib/langfacts.mjs';
+import { OFFLINE } from './lib/io.mjs';
 const require2fs = p => { try { return readFileSync(p, 'utf8'); } catch { return null; } };
 
 const [, , langArg, dirArg, target] = process.argv;
@@ -172,15 +174,12 @@ if (A.id === 'node') {
   // ---------- generic adapter path ----------
   // Dependency advisories come from each ecosystem's own auditor when present.
   // Nothing here is faked: if the tool is absent we say so rather than report zero.
-  const AUDITORS = {
-    go:     { cmd: 'govulncheck', args: ['-format', 'json', './...'], install: 'go install golang.org/x/vuln/cmd/govulncheck@latest' },
-    python: { cmd: 'pip-audit',   args: ['-f', 'json'],               install: 'pipx install pip-audit' },
-    ruby:   { cmd: 'bundle',      args: ['audit', 'check', '--quiet'], install: 'gem install bundler-audit && bundle audit update' },
-    rust:   { cmd: 'cargo',       args: ['audit', '--json'],          install: 'cargo install cargo-audit' },
-    dotnet: { cmd: 'dotnet',      args: ['list', 'package', '--vulnerable', '--include-transitive'], install: 'ships with the .NET SDK' },
-    java:   { cmd: null,          args: [],                            install: 'OWASP dependency-check, or `mvn versions:display-dependency-updates`' },
-  };
-  const au = AUDITORS[A.id];
+  // The auditor comes from lib/langfacts.mjs, which has an entry for EVERY
+  // language. This table used to live here and stopped at six, so Deno, Bun,
+  // Elixir, Erlang, Kotlin, Scala and Perl all answered "no standard auditor
+  // exists" — true for some of them, wrong for the rest.
+  const F = LANG_FACTS[A.id] || {};
+  const au = F.auditor;
   result.dependencyAdvisories = { tool: au?.cmd || null };
   if (au?.cmd && have(au.cmd)) {
     const r = runJson(au.cmd, au.args, { cwd: DIR, timeout: 180000 });
@@ -188,17 +187,37 @@ if (A.id === 'node') {
       ? { tool: au.cmd, raw: r.data }
       : { tool: au.cmd, output: (r.stdout || r.stderr).slice(0, 4000), exitStatus: r.status };
   } else {
-    result.dependencyAdvisories.error =
-      (au?.cmd ? `${au.cmd} is not installed` : 'no standard auditor exists for this ecosystem')
-        + ` — dependency advisories were NOT checked${au?.install ? `. Install: ${au.install}` : ''}`;
-    notes.push(result.dependencyAdvisories.error);
+    const why = au?.cmd ? `${au.cmd} is not installed`
+      : `no standard auditor exists for ${A.label}${F.auditorNote ? ` (${F.auditorNote})` : ''}`;
+    // osv-scanner reads lockfiles and build files for every ecosystem, so it
+    // can stand in — but it is a different tool with a different database, and
+    // the result says so rather than passing as the ecosystem's own auditor.
+    if (!OFFLINE && have(OSV_SCANNER.cmd)) {
+      const r = runJson(OSV_SCANNER.cmd, OSV_SCANNER.args(DIR), { cwd: DIR, timeout: 120000 });
+      const pkgs = (r.data?.results || []).flatMap(x => x.packages || []);
+      const hit = pkgs.filter(p => (p.vulnerabilities || []).length);
+      const ids = [...new Set(hit.flatMap(p => p.vulnerabilities.map(v => v.id)))];
+      result.dependencyAdvisories = r.data
+        ? { tool: OSV_SCANNER.cmd, fallbackFor: why,
+            packagesScanned: pkgs.length, packagesWithAdvisories: hit.length, advisories: ids.length,
+            ids: ids.slice(0, 50),
+            ...(pkgs.length ? {} : { nothingScanned: 'osv-scanner found no lockfile or build file it can read here — this is NOT a clean result' }) }
+        : { tool: OSV_SCANNER.cmd, fallbackFor: why,
+            error: `osv-scanner produced no JSON — dependency advisories were NOT checked: ${(r.stderr || r.error || '').trim().slice(0, 300)}` };
+      if (result.dependencyAdvisories.error) notes.push(result.dependencyAdvisories.error);
+      else notes.push(`${why} — dependency advisories come from osv-scanner instead`);
+    } else {
+      result.dependencyAdvisories.error = `${why} — dependency advisories were NOT checked`
+        + (au?.install ? `. Install: ${au.install}` : '')
+        + `. osv-scanner covers every ecosystem as a fallback: ${OSV_SCANNER.install}`;
+      notes.push(result.dependencyAdvisories.error);
+    }
   }
 
   // ---------- toolchain presence ----------
-  const RUNTIME_BIN = { go: 'go', python: 'python3', ruby: 'ruby', rust: 'rustc', java: 'java', dotnet: 'dotnet' }[A.id];
+  const RUNTIME_BIN = F.runtimeBin;
   if (RUNTIME_BIN && have(RUNTIME_BIN)) {
-    const vflag = A.id === 'go' ? ['version'] : A.id === 'java' ? ['-version'] : ['--version'];
-    const r = run(RUNTIME_BIN, vflag, { timeout: 15000 });
+    const r = run(RUNTIME_BIN, F.versionArgs || ['--version'], { timeout: 15000 });
     result.installedRuntime = ((r.stdout || r.stderr).split('\n')[0] || '').trim();
   } else {
     notes.push(`${RUNTIME_BIN || A.id} not installed locally — runtime inspection skipped`);
@@ -207,8 +226,6 @@ if (A.id === 'node') {
   // ---------- the native/compiled-artifact axis, per language ----------
   // Shapes differ enough that a shared classifier would lie. Each adapter
   // states its own, and assess surfaces what can be checked cheaply.
-  const target = byId[A.id];
-  result.nativeModel = target.scan ? null : null;
   // `[]` reads as "no blockers". For a language this script cannot enumerate
   // native artefacts for, the honest answer is "not checked" — rails' Gemfile.lock
   // is full of precompiled platform gems (ffi, nokogiri) and SKILL.md calls this
@@ -216,11 +233,13 @@ if (A.id === 'node') {
   result.nativeAddons = [];
   result.nativeBlockers = [];
   result.nativeEnumerated = false;
+  const N = F.native || {};
   notes.push(`native artefact enumeration is not implemented for ${A.label} — `
     + 'nativeAddons/nativeBlockers are EMPTY because nothing was checked, not because nothing was found. '
-    + 'Check prebuilt platform artefacts by hand (precompiled gems, wheels with manylinux tags, cgo binaries).');
+    + (N.blocker ? `What to check by hand: ${N.blocker}.` : 'Check prebuilt platform artefacts by hand.'));
+  // one statement of the native axis per language, from the same table brief.mjs prints
+  result.nativeNote = N.axis || A.abiNote || null;
   if (A.id === 'go') {
-    const gomod = require2fs(join(DIR, 'go.mod'));
     // `/"C"/.test(gomod)` could never match: cgo lives in .go files
     const cgoProbe = usesCgo(DIR, { walk, readText, join });
     const cgo = cgoProbe.cgo;
@@ -229,16 +248,6 @@ if (A.id === 'node') {
       : 'pure Go: statically linked, no ABI axis. CGO_ENABLED=0 builds move between images freely';
     result.cgo = cgo;
     result.cgoEvidence = cgoProbe.evidence || undefined;
-  } else if (A.id === 'python') {
-    result.nativeNote = 'binary wheels are tagged cp3XX-<abi>-<platform>. A new MINOR needs wheels published for that tag, or a source build with a compiler. Check `pip debug --verbose` for supported tags.';
-  } else if (A.id === 'ruby') {
-    result.nativeNote = 'native gems (C extensions) relink against the interpreter and must be rebuilt for a new MINOR. Check Gemfile.lock PLATFORMS for precompiled entries.';
-  } else if (A.id === 'rust') {
-    result.nativeNote = 'no ABI axis: crates always compile from source. `edition` is independent of toolchain version and does not need to move together.';
-  } else if (A.id === 'java') {
-    result.nativeNote = 'bytecode major version is the compatibility axis, not a binary ABI. `--release N` lets a newer JDK emit older bytecode, so the JDK and the target level move independently.';
-  } else if (A.id === 'dotnet') {
-    result.nativeNote = 'TFM (net8.0) is the compatibility axis; global.json `rollForward` decides which installed SDK a build will accept.';
   }
   if (A.gateNote) notes.push(A.gateNote);
 }

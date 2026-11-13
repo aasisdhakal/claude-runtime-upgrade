@@ -21,6 +21,15 @@ Under `CVE_POLICY=gate` for a non-gating language, gate on **EOL/support status 
 
 `SK=${CLAUDE_SKILL_DIR}` in the examples below — the directory this file is in, wherever the skill is installed.
 
+## Start every target with its language brief
+
+```bash
+node $SK/scripts/brief.mjs <lang> <dir> [from] [to]     # --list names every supported language
+```
+One document with everything that differs between languages: whether runtime CVEs can gate (`gate`), which dependency auditor will actually run on this machine (`dependencyAudit.willRun`), what a real native blocker looks like and what only looks like one (`native`), where to prove a package supports the target (`registry.supportsTarget`), which engine migrates the source (`sourceMigration`), the reference file to read, and the exact command for each phase. It is read from the same registries the other scripts run on, so it cannot disagree with them.
+
+**Every `gap` field is something that was not checked.** Report it as not checked — never as clean.
+
 ## Ask the user two things first — always
 
 Before running any phase, use **AskUserQuestion** to settle these. Do not assume defaults.

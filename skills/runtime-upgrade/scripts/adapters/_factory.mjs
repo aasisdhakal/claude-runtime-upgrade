@@ -71,7 +71,7 @@ export function makeAdapter(spec) {
   }
 
   return {
-    id, label, manifests, eolProduct, osvEcosystem,
+    id, label, manifests, eolProduct, osvEcosystem, lockfiles, abiNote,
     gateCapable: false, gateNote, imageRe, ciKey, scan,
     cveSource: { url: null, note: `none curated for ${label} — gate on EOL/support plus the ecosystem auditor` },
   };

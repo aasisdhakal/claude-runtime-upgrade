@@ -69,6 +69,7 @@ detect → research → assess → scan → plan → remediate → fix → verif
 |---|---|---|
 | **Discover** | `detect.mjs` | repo shape, every runtime target, version drift as a defect |
 | **Research** | `research.mjs` | EOL and support windows, CVE counts at current *and* target |
+| **Brief** | `brief.mjs` | what is specific to one language: gate, auditor, native axis, registry, engine, commands |
 | **Assess** | `assess.mjs` | dependency advisories, native/ABI blockers, dependency floors |
 | **Scan** | `scan.mjs` | 60 rules across 14 languages, matched on code only, with file:line |
 | **Plan** | `plan.mjs` | ordered steps, each with a machine-checkable exit condition |
@@ -347,7 +348,7 @@ node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
 
-357 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git`
+384 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git`
 directories, which git itself won't track, and generated fixtures can't drift from their
 assertions.
 

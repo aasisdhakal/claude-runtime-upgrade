@@ -11,6 +11,7 @@ import { LOCKFILES, diffLocks, bump } from '../scripts/lib/lockdiff.mjs';
 import { projectTypeChecking, catchability } from '../scripts/lib/typecover.mjs';
 import { PR_PROVIDERS, ISSUE_PROVIDERS, hostOf, slugOf, compareUrl, pickSuggestion } from '../scripts/lib/providers.mjs';
 import { RULES, rulesFor, inheritedCatalogue } from '../scripts/lib/breaking.mjs';
+import { LANG_FACTS } from '../scripts/lib/langfacts.mjs';
 import { adapters, byId, adaptersForManifest } from '../scripts/adapters/index.mjs';
 import { FRAMEWORK_MAP, UNTRACKED, frameworkEol } from '../scripts/lib/frameworks.mjs';
 import { PIN_RULES, planPinEdits, unified, planCiEdits, planConfigEdits, ciMatrixAdvice,
@@ -276,6 +277,13 @@ const LANGS = [
   ['single-rust',   'rust',   '1.70', 'Cargo.lock'],
   ['single-java',   'java',   '17',   ''],
   ['single-dotnet', 'dotnet', '6',    ''],
+  ['single-deno',   'deno',   '2.1',  'deno.lock'],
+  ['single-bun',    'bun',    '1',    'bun.lock'],
+  ['single-elixir', 'elixir', '1.15', 'mix.lock'],
+  ['single-erlang', 'erlang', '25',   'rebar.lock'],
+  ['single-kotlin', 'kotlin', '1.9',  ''],
+  ['single-scala',  'scala',  '2.13', ''],
+  ['single-perl',   'perl',   '5.30', ''],
 ];
 for (const [fx, lang, major, lock] of LANGS) {
   t(`lang: ${lang} discovered with version ${major}`, () => withFixture(fx, r => {
@@ -3286,6 +3294,87 @@ t('reports tools and what degrades', () => {
   eq(d.data.missingRequired, [], 'node itself must be present');
 });
 
+// ───────────── every language, end to end ─────────────
+// Six of the fifteen had a discovery test and nothing else; seven had no
+// fixture at all. "Supports 15 languages" was asserted by the adapter list and
+// exercised for two.
+console.log('\nevery language, end to end');
+for (const a of adapters) {
+  t(`all-langs: ${a.id} — detect, brief and assess all answer`, () => withFixture(`single-${a.id}`, r => {
+    ok(detect(r).targets.some(x => x.lang === a.id), `detect found no ${a.id} target`);
+
+    const b = runJson(process.execPath, [S('brief.mjs'), a.id, r, '1', '99']);
+    eq(b.status, 0, `brief exit (${b.stderr.slice(0, 200)})`);
+    const j = b.data;
+    eq(j.lang, a.id);
+    eq(typeof j.gate.runtimeCvesCanGate, 'boolean', 'gate capability is stated');
+    ok(j.gate.runtimeCvesCanGate ? j.gate.metric : j.gate.whenNotCapable, 'and what to do about it');
+    ok(j.native.axis, 'the native axis is described');
+    ok(j.native.enumeratedByAssess || j.native.gap, 'an unenumerated axis is called a gap');
+    ok(j.registry?.name && j.registry?.supportsTarget, 'where to prove a package supports the target');
+    ok(j.sourceMigration.engine || j.sourceMigration.why, 'an engine, or why there is none');
+    ok(existsSync(j.reference), `reference file exists: ${j.reference}`);
+    for (const c of ['research', 'assess', 'scan', 'fix', 'remediate', 'verify'])
+      ok(j.commands[c].includes(` ${a.id} `), `commands.${c} is for ${a.id}`);
+    ok(j.dependencyAudit.willRun || j.dependencyAudit.gap, 'an auditor that will run, or a stated gap');
+
+    const v = runJson(process.execPath, [S('assess.mjs'), a.id, r, '99'], { env: { RU_OFFLINE: '1' } });
+    eq(v.status, 0, `assess exit (${v.stderr.slice(0, 200)})`);
+    const adv = v.data.dependencyAdvisories;
+    ok(adv && typeof adv === 'object', 'dependencyAdvisories is always present');
+    ok(Array.isArray(v.data.notes), 'notes');
+    ok(v.data.nativeNote || typeof v.data.nativeEnumerated === 'boolean', 'the native axis is addressed');
+    if (!['node', 'php'].includes(a.id))
+      ok(v.data.nativeEnumerated === false && v.data.notes.some(n => /nothing was checked/.test(n)),
+         'an unenumerated native axis is never reported as an empty, clean list');
+  }));
+}
+t('all-langs: every adapter has language facts, and they point at real things', () => {
+  for (const a of adapters) {
+    const f = LANG_FACTS[a.id];
+    ok(f, `lib/langfacts.mjs has no entry for ${a.id}`);
+    ok(f.runtimeBin && f.installedTree && f.registry?.supportsTarget, `${a.id}: incomplete facts`);
+    ok(f.native?.axis || a.abiNote, `${a.id}: no native axis described anywhere`);
+    ok(f.auditor?.cmd || f.auditorNote, `${a.id}: neither an auditor nor a reason there is none`);
+    ok(existsSync(join(HERE, '..', f.reference)), `${a.id}: ${f.reference} does not exist`);
+  }
+  eq(Object.keys(LANG_FACTS).sort(), adapters.map(a => a.id).sort(), 'no orphan entries');
+});
+t('all-langs: a spec-driven language names its own auditor', () => withFixture('single-deno', r => {
+  // assess kept its own six-row table, so these seven all said "no standard
+  // auditor exists" — which is false for Deno, Bun, Elixir and Perl
+  const v = runJson(process.execPath, [S('assess.mjs'), 'deno', r, '2.9'], { env: { RU_OFFLINE: '1', PATH: '/nonexistent' } });
+  const adv = v.data.dependencyAdvisories;
+  eq(adv.tool, 'deno');
+  ok(/deno is not installed/.test(adv.error) && /NOT checked/.test(adv.error), adv.error);
+}));
+t('all-langs: osv-scanner stands in when a language has no auditor, and says it is a stand-in', () => {
+  const bin = mkdtempSync(join(tmpdir(), 'ru-osv-'));
+  const fake = out => { writeFileSync(join(bin, 'osv-scanner'), `#!/bin/sh\ncat <<'JSON'\n${out}\nJSON\nexit 1\n`, { mode: 0o755 }); };
+  try {
+    return withFixture('single-erlang', r => {
+      const env = { RU_OFFLINE: '0', PATH: `${bin}:${process.env.PATH}` };
+      fake('{"results":[{"packages":[{"package":{"name":"cowboy"},"vulnerabilities":[{"id":"GHSA-aaaa"},{"id":"GHSA-bbbb"}]},{"package":{"name":"ranch"}}]}]}');
+      let adv = runJson(process.execPath, [S('assess.mjs'), 'erlang', r, '29'], { env }).data.dependencyAdvisories;
+      eq(adv.tool, 'osv-scanner');
+      ok(/no standard auditor exists for Erlang/.test(adv.fallbackFor), 'says what it replaced');
+      eq([adv.packagesScanned, adv.packagesWithAdvisories, adv.advisories], [2, 1, 2]);
+      fake('{"results":[]}');
+      adv = runJson(process.execPath, [S('assess.mjs'), 'erlang', r, '29'], { env }).data.dependencyAdvisories;
+      ok(/NOT a clean result/.test(adv.nothingScanned || ''), 'nothing scanned must not read as zero advisories');
+      fake('not json');
+      adv = runJson(process.execPath, [S('assess.mjs'), 'erlang', r, '29'], { env }).data.dependencyAdvisories;
+      ok(/NOT checked/.test(adv.error || ''), 'garbage output is an error, not a pass');
+    });
+  } finally { rmSync(bin, { recursive: true, force: true }); }
+});
+t('brief: an unsupported language is refused, and --list names all fifteen', () => {
+  const bad = run(process.execPath, [S('brief.mjs'), 'cobol']);
+  eq(bad.status, 2); ok(/unsupported language/.test(bad.stderr), bad.stderr);
+  const list = runJson(process.execPath, [S('brief.mjs'), '--list']).data.languages;
+  eq(list.map(l => l.lang).sort(), adapters.map(a => a.id).sort());
+});
+
 // ───────────── the plugin, as someone else installs it ─────────────
 // The suite ran from the author's checkout, where ~/.claude/skills/runtime-upgrade
 // happened to exist. Nothing here ever exercised the path a marketplace install
@@ -3338,13 +3427,56 @@ console.log('\nplugin packaging');
       eq(name, f.replace(/\.js$/, ''), 'file name and meta.name agree');
     }
   });
-  t('packaging: the fleet workflow covers every language the skill has an adapter for', () => {
+  t('packaging: the fleet workflow names no language — it follows brief.mjs', () => {
     if (skip()) return 'skip';
-    // it was ['node', 'php'] — thirteen languages were detected and then dropped
-    const src = readFileSync(join(wfDir, 'fleet.js'), 'utf8');
-    const langs = [...src.match(/const LANGS = \[([^\]]+)\]/)[1].matchAll(/'([a-z]+)'/g)].map(m => m[1]);
-    eq(langs.sort(), adapters.map(a => a.id).sort(), 'LANGS');
-    ok(!/t\.lang === 'node' \|\| t\.lang === 'php'/.test(src), 'no node/php-only filter');
+    // It carried its own list, ['node', 'php'], long after the skill covered
+    // fifteen: thirteen languages were detected and then dropped. A list in a
+    // prompt goes stale; the only durable fix is for there to be no list.
+    const code = readFileSync(join(wfDir, 'fleet.js'), 'utf8')
+      .split('\n').filter(l => !l.trim().startsWith('//')).join('\n')
+      .replace(/node \$\{SK\}/g, '');                        // the interpreter, not the language
+    const words = [...adapters.map(a => a.id), 'npm', 'composer', 'packagist', 'pypi', 'n-api', 'napi',
+                   'rubygems', 'crates', 'maven', 'nuget', 'golang'];
+    const named = words.filter(w => new RegExp(`(^|[^\\w.-])${w}([^\\w.-]|$)`, 'i').test(code));
+    eq(named, [], 'language-specific words in the workflow');
+    ok(!/enum:\s*\[\s*'node'/.test(code) && !/t\.lang === '/.test(code), 'no language filter');
+    for (const phase of ['research:', 'assess:', 'challenge:']) {
+      const prompt = code.slice(0, code.indexOf(`label: \`${phase}`));
+      ok(prompt.lastIndexOf('brief.mjs') > prompt.lastIndexOf('agent('), `the ${phase} agent must be told to run brief.mjs`);
+    }
+  });
+  await ta('packaging: the fleet workflow runs every detected language, with or without skillDir', async () => {
+    if (skip()) return 'skip';
+    // The script body, run for real with the agents stubbed out. Before the fix
+    // a Go and an Elixir target came back from detect and none was assessed.
+    const body = readFileSync(join(wfDir, 'fleet.js'), 'utf8').replace('export const meta =', 'const meta =');
+    const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+    const wf = new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', body);
+    const pipeline = async (items, ...stages) => {
+      const out = [];
+      for (const it of items) { let v; for (const [i, st] of stages.entries()) v = await (i ? st(v, it) : st(it)); out.push(v); }
+      return out;
+    };
+    for (const [args, wantRoot] of [[{ root: '/r' }, '/found'], [{ root: '/r', skillDir: '/plug/skills/runtime-upgrade/' }, '/plug/skills/runtime-upgrade']]) {
+      const calls = [];
+      const agent = async (prompt, o) => {
+        calls.push([o.label, prompt]);
+        if (o.label === 'locate skill') return { path: '/found' };
+        if (o.label === 'detect') return { shape: 'mixed', driftCount: 0, targets: [
+          { lang: 'go', dir: 'svc', currentVersion: '1.21' }, { lang: 'elixir', dir: 'web', currentVersion: '1.15' },
+          { lang: 'unknown', dir: 'misc', currentVersion: '' }] };
+        return /^assess/.test(o.label) ? { dir: 'd', lang: 'l', verdict: 'proceed', blockers: [] } : 'ok';
+      };
+      const r = await wf(args, agent, pipeline, null, () => {}, () => {});
+      eq(r.targetsAssessed, 2, 'the Go and the Elixir target are both assessed');
+      const labels = calls.map(c => c[0]);
+      for (const l of ['research:svc', 'assess:svc', 'challenge:svc', 'research:web', 'assess:web', 'challenge:web'])
+        ok(labels.includes(l), `missing agent ${l}`);
+      eq(labels.includes('locate skill'), !args.skillDir, 'the skill is located only when skillDir is not passed');
+      const detectPrompt = calls.find(c => c[0] === 'detect')[1];
+      ok(detectPrompt.includes(`node ${wantRoot}/scripts/detect.mjs`), 'scripts are addressed under the resolved skill directory');
+      ok(calls.find(c => c[0] === 'assess:web')[1].includes(`${wantRoot}/scripts/brief.mjs elixir /r/web 1.15`), 'the brief is run for the target\'s own language');
+    }
   });
   t('packaging: the version is declared once, and nothing stale ships', () => {
     if (skip()) return 'skip';
