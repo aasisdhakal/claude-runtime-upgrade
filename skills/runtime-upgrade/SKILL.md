@@ -35,7 +35,7 @@ Carry the answer as `CVE_POLICY=gate|report` through every later phase.
 
 **2. Action mode**
 - **Plan only** — read-only. Produce the upgrade plan, the diffs, and the ticket text. Change nothing.
-- **Plan and write** — apply changes. Then: work on a branch (`git switch -c runtime/<lang>-<target>`), commit per phase, never commit a lockfile without its manifest.
+- **Plan and write** — apply changes. Then: work on a branch (`git switch -c runtime/<lang>-<target>`), commit per phase, never commit a dependency change without its lockfile.
 
 Carry as `MODE=plan|write`. Under `plan`, every phase is read-only — emit diffs with `diff -u`, never apply them.
 
@@ -43,13 +43,14 @@ Carry as `MODE=plan|write`. Under `plan`, every phase is read-only — emit diff
 ```bash
 node $SK/scripts/guard.mjs preflight <dir>                   # safe to write? exits 1 if not
 node $SK/scripts/guard.mjs branch    <dir> node 24.22.1      # creates runtime/node-24.22.1
-node $SK/scripts/guard.mjs commit    <dir> -m "msg" --phase runtime
+node $SK/scripts/guard.mjs commit    <dir> -m "msg" --phase runtime [--include <path>]
 ```
 Guard **enforces** what this skill promises, rather than trusting the model to remember it:
 - refuses to commit on `main`/`master`/`develop`/`prod`/`release`, or on any branch not matching `runtime/*`
 - refuses to branch from a dirty tree
-- refuses a manifest change without its lockfile (and vice versa), resetting the index so nothing is left staged
-- scans the staged diff for private keys, AWS/GitHub/Slack tokens and hardcoded credentials, and refuses
+- refuses a manifest **dependency** change without its lockfile, resetting the index so nothing is left staged. A lockfile moving alone is an in-range refresh and is allowed, with a note
+- scans the staged diff for private keys, AWS/GitHub/Slack tokens, hardcoded credentials and credentials in URLs, and refuses — in a sub-package exactly as at the root
+- stages tracked changes plus the files the tool itself creates (pin files, lockfiles, engine config). **Any other untracked file is left alone and listed under `leftUntracked`**; if you created a file that belongs in the commit, name it with `--include <path>`
 - **contains no push, force, or remote code path at all** — publishing a branch is always a human action
 
 Also ask, when it is not obvious: **which target version** (otherwise `research.mjs` picks the newest non-EOL LTS), and **which targets** when discovery finds more than ~6.

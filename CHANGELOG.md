@@ -3,6 +3,27 @@
 Each release gets a new number in `.claude-plugin/plugin.json`; Claude Code only offers an
 update when that number changes.
 
+## Unreleased
+
+- **Security: `guard commit <subdir>` ran no secret scan and no manifest/lockfile
+  check.** Every git lookup used root-relative names from a subdirectory, so
+  each one matched nothing — and a commit from `packages/api` went through with
+  an AWS key in it. That is the normal monorepo path. All git calls now run from
+  the repository root.
+- **Security: the secret scan skipped files with non-ASCII names.** git C-quotes
+  them, and the quoted string matched no file. Names are now read NUL-separated
+  and passed as literal pathspecs.
+- **Security: untracked files are no longer swept into the commit.** `git add -A`
+  staged a developer's stray `.env` right after preflight had called the tree
+  clean. Guard now stages tracked changes plus the files the tool itself creates;
+  anything else is left alone, listed under `leftUntracked`, and committed only
+  with `--include <path>`.
+- **A sub-package manifest is paired with its own lockfile**, not the root one.
+- **A lockfile moving alone is allowed**, with a note. It is what an in-range
+  update produces, and refusing it made `remediate --deps minor` uncommittable.
+  `requirements.txt` is no longer treated as `pyproject.toml`'s lockfile.
+- The secret scan also catches credentials embedded in a URL.
+
 ## 0.2.0
 
 - **A CI test matrix now counts as version evidence.** fastify, axios and

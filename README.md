@@ -235,8 +235,10 @@ node skills/runtime-upgrade/scripts/guard.mjs commit    <dir> -m "msg" --phase r
 ```
 
 Refuses to commit on a protected branch, refuses any branch outside `runtime/*`, refuses a
-dirty tree, refuses a manifest change whose lockfile didn't move with it, and scans the staged
-diff for private keys and AWS/GitHub/Slack tokens. **There is no push, force, or remote code
+dirty tree, refuses a dependency change whose lockfile didn't move with it, and scans the staged
+diff for private keys, AWS/GitHub/Slack tokens and credentials embedded in URLs — from the
+repository root, so a sub-package gets the same scan. Untracked files it did not create are
+left alone; `--include <path>` commits one. **There is no push, force, or remote code
 path in the file** — a test asserts it.
 
 It also refuses rather than wrecking: before any bulk dependency upgrade it checks for
@@ -345,7 +347,7 @@ node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
 
-339 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git`
+351 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git`
 directories, which git itself won't track, and generated fixtures can't drift from their
 assertions.
 

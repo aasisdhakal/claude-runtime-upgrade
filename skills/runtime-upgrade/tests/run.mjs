@@ -581,7 +581,7 @@ t('guard: blocks secrets before they reach a commit', () => gitRepo(r => {
   guard('branch', r, 'node', '24.22.1');
   writeFileSync(join(r, 'cfg.js'), 'const k = "AKIAIOSFODNN7EXAMPLE";\nconst t = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";\n');
   writeFileSync(join(r, 'id_rsa'), '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIB\n-----END RSA PRIVATE KEY-----\n');
-  const v = guard('commit', r, '-m', 'add config');
+  const v = guard('commit', r, '-m', 'add config', '--include', 'cfg.js', '--include', 'id_rsa');
   eq(v.data.verdict, 'refused');
   ok(v.data.blocked.some(b => /AWS access key/.test(b)), 'AWS key');
   ok(v.data.blocked.some(b => /GitHub personal access token/.test(b)), 'GitHub token');
@@ -589,6 +589,107 @@ t('guard: blocks secrets before they reach a commit', () => gitRepo(r => {
   const n = run('git', ['log', '--oneline'], { cwd: r }).stdout.trim().split('\n').length;
   eq(n, 1, 'no commit was created');
 }));
+// A monorepo sub-target is the NORMAL case: plan and remediate both print
+// `guard.mjs commit <absDir of the sub-target>`. From there every git lookup
+// used root-relative names against a subdirectory cwd and matched nothing.
+function monoRepo(fn) {
+  return gitRepo(r => {
+    mkdirSync(join(r, 'packages', 'api'), { recursive: true });
+    writeFileSync(join(r, 'packages', 'api', 'package.json'), '{"name":"api","dependencies":{"ms":"2.1.2"}}');
+    writeFileSync(join(r, 'packages', 'api', 'package-lock.json'), '{"lockfileVersion":3}');
+    writeFileSync(join(r, 'packages', 'api', '.nvmrc'), '20\n');
+    writeFileSync(join(r, 'packages', 'api', 'config.js'), 'module.exports = {};\n');
+    run('git', ['add', '-A'], { cwd: r }); run('git', ['commit', '-qm', 'api'], { cwd: r });
+    guard('branch', r, 'node', '24.22.1');
+    return fn(r, join(r, 'packages', 'api'));
+  });
+}
+t('guard: the secret scan runs when committing from a SUBDIRECTORY', () => monoRepo((r, api) => {
+  writeFileSync(join(api, '.nvmrc'), '24.22.1\n');
+  writeFileSync(join(api, 'config.js'), 'module.exports = { k: "AKIAIOSFODNN7EXAMPLE" };\n');
+  const v = guard('commit', api, '-m', 'runtime: node 24');
+  eq(v.data.verdict, 'refused', 'a key in a sub-package must be refused exactly as at the root');
+  ok(v.data.blocked.some(b => /packages\/api\/config\.js: possible AWS access key/.test(b)), JSON.stringify(v.data.blocked));
+  eq(run('git', ['log', '--oneline'], { cwd: r }).stdout.trim().split('\n').length, 2, 'no commit was created');
+}));
+t('guard: a sub-package manifest is paired with ITS lockfile, not the root one', () => monoRepo((r, api) => {
+  writeFileSync(join(api, 'package.json'), '{"name":"api","dependencies":{"ms":"^9.9.9"}}');
+  const v = guard('commit', api, '-m', 'bump dep');
+  eq(v.data.verdict, 'refused');
+  ok(v.data.blocked.some(b => /packages\/api\/package\.json dependencies changed without its lockfile/.test(b)),
+     JSON.stringify(v.data.blocked));
+}));
+t('guard: a pin-only change commits from a subdirectory', () => monoRepo((r, api) => {
+  writeFileSync(join(api, '.nvmrc'), '24.22.1\n');
+  const v = guard('commit', api, '-m', 'pin', '--phase', 'runtime');
+  eq(v.data.verdict, 'committed');
+  eq(v.data.files, ['packages/api/.nvmrc']);
+}));
+t('guard: the secret scan reads files with non-ASCII and glob-like names', () => gitRepo(r => {
+  // git C-quotes `café.env` as "caf\303\251.env"; that string matched no pathspec
+  writeFileSync(join(r, 'café.js'), 'x\n'); writeFileSync(join(r, 'a[1].js'), 'x\n');
+  run('git', ['add', '-A'], { cwd: r }); run('git', ['commit', '-qm', 'names'], { cwd: r });
+  guard('branch', r, 'node', '24.22.1');
+  writeFileSync(join(r, 'café.js'), 'const t = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";\n');
+  writeFileSync(join(r, 'a[1].js'), 'const k = "AKIAIOSFODNN7EXAMPLE";\n');
+  const v = guard('commit', r, '-m', 'x');
+  eq(v.data.verdict, 'refused');
+  ok(v.data.blocked.some(b => /^café\.js: possible GitHub/.test(b)), JSON.stringify(v.data.blocked));
+  ok(v.data.blocked.some(b => /^a\[1\]\.js: possible AWS/.test(b)), JSON.stringify(v.data.blocked));
+}));
+t('guard: untracked files the tool did not create are never committed', () => gitRepo(r => {
+  guard('branch', r, 'node', '24.22.1');
+  // what a developer has lying around: preflight called this tree clean
+  writeFileSync(join(r, '.env'), 'DATABASE_URL=postgres://admin:hunter2@db.internal/prod\n');
+  writeFileSync(join(r, 'TODO-private.txt'), 'notes\n');
+  eq(guard('preflight', r).data.verdict, 'safe-to-write');
+  writeFileSync(join(r, 'package.json'), '{"name":"x","engines":{"node":">=24.22.1"}}');
+  writeFileSync(join(r, '.nvmrc'), '24.22.1\n');                 // a pin file the tool creates
+  const v = guard('commit', r, '-m', 'runtime: node 24.22.1');
+  eq(v.data.verdict, 'committed');
+  eq(v.data.files.sort(), ['.nvmrc', 'package.json'], 'only the tool\'s own files');
+  eq(v.data.leftUntracked.sort(), ['.env', 'TODO-private.txt'], 'and it says what it left');
+  const inHead = run('git', ['ls-tree', '-r', '--name-only', 'HEAD'], { cwd: r }).stdout;
+  ok(!/\.env|TODO/.test(inHead), 'the stray files must not be in the commit');
+}));
+t('guard: --include commits a named untracked file, and still scans it', () => gitRepo(r => {
+  guard('branch', r, 'node', '24.22.1');
+  mkdirSync(join(r, 'src'));
+  writeFileSync(join(r, 'src', 'new.js'), 'export const a = 1;\n');
+  const v = guard('commit', r, '-m', 'add', '--include', 'src');
+  eq(v.data.verdict, 'committed'); eq(v.data.files, ['src/new.js']);
+  writeFileSync(join(r, 'db.js'), 'const u = "postgres://admin:hunter2@db.internal/prod";\n');
+  const w = guard('commit', r, '-m', 'add', '--include', 'db.js');
+  eq(w.data.verdict, 'refused');
+  ok(w.data.blocked.some(b => /credentials embedded in a URL/.test(b)), JSON.stringify(w.data.blocked));
+}));
+t('guard: only untracked strays means nothing to commit, and says so', () => gitRepo(r => {
+  guard('branch', r, 'node', '24.22.1');
+  writeFileSync(join(r, 'notes.txt'), 'x\n');
+  const v = guardRaw('commit', r, '-m', 'x');
+  ok(v.status !== 0, 'must not succeed');
+  ok(/left alone/.test(v.stderr) && /--include/.test(v.stderr), v.stderr);
+}));
+t('guard: a lockfile moving alone is an in-range refresh, not a violation', () => gitRepo(r => {
+  // exactly what `remediate --deps minor --apply` leaves behind
+  guard('branch', r, 'node', '24.22.1');
+  writeFileSync(join(r, 'package-lock.json'), '{"lockfileVersion":3,"u":2}');
+  const v = guard('commit', r, '-m', 'deps', '--phase', 'dependencies');
+  eq(v.data.verdict, 'committed');
+  ok((v.data.notes || []).some(n => /in-range refresh/.test(n)), 'and it is noted, not silent');
+}));
+t('guard: a project with only requirements.txt can commit it', () => {
+  const r = mkdtempSync(join(tmpdir(), 'ru-req-'));
+  try {
+    run('git', ['init', '-q'], { cwd: r });
+    run('git', ['config', 'user.email', 't@t'], { cwd: r }); run('git', ['config', 'user.name', 'T'], { cwd: r });
+    writeFileSync(join(r, 'requirements.txt'), 'flask==3.0.0\n');
+    run('git', ['add', '-A'], { cwd: r }); run('git', ['commit', '-qm', 'init'], { cwd: r });
+    guard('branch', r, 'python', '3.14');
+    writeFileSync(join(r, 'requirements.txt'), 'flask==3.1.0\n');
+    eq(guard('commit', r, '-m', 'deps').data.verdict, 'committed');
+  } finally { rmSync(r, { recursive: true, force: true }); }
+});
 t('guard: refuses to branch from a dirty tree', () => gitRepo(r => {
   writeFileSync(join(r, 'package.json'), '{"name":"dirty"}');
   const v = guardRaw('branch', r, 'node', '24.22.1');
