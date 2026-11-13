@@ -19,7 +19,7 @@ Only **two** runtimes have a curated, version-ranged CVE database. The rest cann
 
 Under `CVE_POLICY=gate` for a non-gating language, gate on **EOL/support status and dependency advisories**, and present runtime CVEs as advisory. Check `gateCapable` and `gateMetric` in the research output and say which you are enforcing. Never imply a gate you cannot enforce.
 
-`SK=~/.claude/skills/runtime-upgrade` in the examples below.
+`SK=${CLAUDE_SKILL_DIR}` in the examples below — the directory this file is in, wherever the skill is installed.
 
 ## Ask the user two things first — always
 
@@ -466,7 +466,9 @@ plainly that a clean build checks shape only. A behaviour change passes it.
 
 To do this across many packages with agents writing the probes, run the companion workflow
 `dep-behaviour-check`, which probes each package and has a second agent adversarially judge
-whether the probe would actually have caught a regression.
+whether the probe would actually have caught a regression. Pass it
+`skillDir: "${CLAUDE_SKILL_DIR}"` in `args` — a workflow cannot find this directory itself.
+The same goes for `fleet`, the workflow that runs every phase across many targets in parallel.
 
 ## Rollout
 

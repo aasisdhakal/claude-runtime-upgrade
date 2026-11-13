@@ -347,7 +347,7 @@ node skills/runtime-upgrade/tests/run.mjs
 node skills/runtime-upgrade/tests/run.mjs --filter abi
 ```
 
-351 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git`
+357 tests. Fixtures are generated into a temp dir — the polyrepo case needs real `.git`
 directories, which git itself won't track, and generated fixtures can't drift from their
 assertions.
 

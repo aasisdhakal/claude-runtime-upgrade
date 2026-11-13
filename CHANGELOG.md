@@ -23,6 +23,20 @@ update when that number changes.
   update produces, and refusing it made `remediate --deps minor` uncommittable.
   `requirements.txt` is no longer treated as `pyproject.toml`'s lockfile.
 - The secret scan also catches credentials embedded in a URL.
+- **A marketplace install could not find its own scripts.** `SKILL.md` and both
+  workflows hard-coded `~/.claude/skills/runtime-upgrade`, a path that exists
+  where the skill was developed and nowhere it was installed from a marketplace.
+  `SKILL.md` now uses `${CLAUDE_SKILL_DIR}`; the workflows take `skillDir` in
+  `args` and locate the skill themselves when it is not passed.
+- **The multi-target workflow only handled Node and PHP.** Its language list
+  was never widened when the skill grew to fifteen, so a Go or Python target was
+  detected, filtered out, and the run reported nothing to upgrade. It now covers
+  every language with an adapter.
+- **That workflow is now `fleet`** (`/runtime-upgrade:fleet`). It was named
+  `runtime-upgrade`, the same as the skill, and shadowed it in the listing.
+- Removed a stale `workflow.js` nothing loaded, the redundant `skills` key in
+  `plugin.json` (it registered the skill twice), and the second copy of
+  `version` in `marketplace.json`.
 
 ## 0.2.0
 

@@ -28,8 +28,5 @@
     "rust",
     "java",
     "dotnet"
-  ],
-  "skills": [
-    "./skills/runtime-upgrade"
   ]
 }

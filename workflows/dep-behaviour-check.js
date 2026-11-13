@@ -1,7 +1,7 @@
 export const meta = {
   name: 'dep-behaviour-check',
   description: 'After a dependency upgrade, prove each changed package still behaves the same — by running it, not by type-checking it',
-  whenToUse: 'After `remediate --deps latest`. Pass args: {lang, dir, before} where before is a copy of the lockfile taken BEFORE the upgrade. Optional: {top: 6, judge: true}',
+  whenToUse: 'After `remediate --deps latest`. Pass args: {lang, dir, before, skillDir} where before is a copy of the lockfile taken BEFORE the upgrade and skillDir is the directory holding the runtime-upgrade SKILL.md. Optional: {top: 6, judge: true}',
   phases: [
     { title: 'Survey',  detail: 'depverify: what moved, how this repo uses it, what could catch a regression' },
     { title: 'Probe',   detail: 'one agent per package: write a probe from the REAL call sites, run it on old and new' },
@@ -10,7 +10,6 @@ export const meta = {
   ],
 }
 
-const SK = '~/.claude/skills/runtime-upgrade/scripts'
 const A = (typeof args === 'object' && args) ? args : {}
 const LANG = A.lang || 'node'
 const DIR = A.dir
@@ -22,6 +21,32 @@ if (!DIR || !BEFORE) {
   log('need {lang, dir, before}: `before` is a copy of the lockfile taken BEFORE the upgrade')
   return { error: 'missing args', needed: ['dir', 'before'] }
 }
+
+// Where the skill's files are. A workflow script gets no path variable of its
+// own, and this used to be a hard-coded ~/.claude/skills path — which exists on
+// the author's machine and on nobody's who installed the plugin from a
+// marketplace. The caller passes it (SKILL.md says how); when it does not, one
+// cheap agent call finds it.
+let SKILL_DIR = A.skillDir ? String(A.skillDir).replace(/\/+$/, '') : ''
+if (!SKILL_DIR) {
+  const found = await agent(
+    `Find the directory that holds the "runtime-upgrade" skill: the one containing BOTH
+SKILL.md and scripts/detect.mjs. Check, in this order, and stop at the first that exists:
+  1. $CLAUDE_PLUGIN_ROOT/skills/runtime-upgrade (if that variable is set)
+  2. ~/.claude/plugins/cache/*/runtime-upgrade/*/skills/runtime-upgrade (newest version directory)
+  3. ~/.claude/skills/runtime-upgrade
+  4. .claude/skills/runtime-upgrade in the current project
+Verify with: ls <dir>/SKILL.md <dir>/scripts/detect.mjs
+Return the ABSOLUTE path (expand ~). If none exists, return an empty path.`,
+    { label: 'locate skill', schema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } } },
+  )
+  SKILL_DIR = found && found.path ? String(found.path).replace(/\/+$/, '') : ''
+}
+if (!SKILL_DIR) {
+  log('could not find the runtime-upgrade skill directory — pass args.skillDir')
+  return { error: 'skill directory not found', needed: ['skillDir'] }
+}
+const SK = `${SKILL_DIR}/scripts`
 
 const PREMISE = `
 A type checker only ever catches SHAPE changes — a renamed export, a changed signature,

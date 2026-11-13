@@ -3286,6 +3286,77 @@ t('reports tools and what degrades', () => {
   eq(d.data.missingRequired, [], 'node itself must be present');
 });
 
+// ───────────── the plugin, as someone else installs it ─────────────
+// The suite ran from the author's checkout, where ~/.claude/skills/runtime-upgrade
+// happened to exist. Nothing here ever exercised the path a marketplace install
+// takes, so a hard-coded home-directory path shipped in three files.
+console.log('\nplugin packaging');
+{
+  const PLUGIN = join(HERE, '..', '..', '..');
+  const packaged = existsSync(join(PLUGIN, '.claude-plugin', 'plugin.json'));
+  const wfDir = join(PLUGIN, 'workflows');
+  const wfs = packaged && existsSync(wfDir) ? readdirSync(wfDir).filter(f => f.endsWith('.js')) : [];
+  const skip = () => packaged ? null : 'skip';              // a bare skill install has no plugin around it
+
+  t('packaging: SKILL.md resolves its own directory, not a home path', () => {
+    const md = readFileSync(join(HERE, '..', 'SKILL.md'), 'utf8');
+    ok(md.includes('SK=${CLAUDE_SKILL_DIR}'), 'SK must be ${CLAUDE_SKILL_DIR}');
+    ok(!/SK=~\//.test(md), 'a ~/ path exists only where the author installed it');
+  });
+  t('packaging: no workflow hard-codes where the skill lives', () => {
+    if (skip()) return 'skip';
+    for (const f of wfs) {
+      const src = readFileSync(join(wfDir, f), 'utf8');
+      ok(!/const SK\s*=\s*['"`]~/.test(src), `${f} hard-codes a home path`);
+      ok(/A\.skillDir/.test(src), `${f} must accept args.skillDir`);
+      ok(/skillDir/.test(src.split('phases:')[0]), `${f} must name skillDir in whenToUse`);
+    }
+    ok(wfs.length >= 2, 'both workflows ship');
+  });
+  t('packaging: every workflow script parses', () => {
+    if (skip()) return 'skip';
+    const d = mkdtempSync(join(tmpdir(), 'ru-wf-'));
+    try {
+      for (const f of wfs) {
+        const src = readFileSync(join(wfDir, f), 'utf8');
+        ok(src.startsWith('export const meta = {'), `${f}: meta must be the first statement`);
+        const body = src.replace('export const meta =', 'const meta =');
+        const file = join(d, f.replace(/\.js$/, '.mjs'));
+        writeFileSync(file, `async function wf(args, agent, pipeline, parallel, phase, log) {\n${body}\n}\n`);
+        const r = run(process.execPath, ['--check', file]);
+        ok(r.ok, `${f} does not parse: ${r.stderr.split('\n').slice(0, 4).join(' ')}`);
+      }
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+  t('packaging: a workflow never takes a skill\'s name', () => {
+    if (skip()) return 'skip';
+    // both resolve to /<plugin>:<name>; the workflow shadowed the skill in the listing
+    const skills = readdirSync(join(PLUGIN, 'skills'));
+    for (const f of wfs) {
+      const name = readFileSync(join(wfDir, f), 'utf8').match(/name:\s*'([^']+)'/)[1];
+      ok(!skills.includes(name), `workflow "${name}" collides with the skill of the same name`);
+      eq(name, f.replace(/\.js$/, ''), 'file name and meta.name agree');
+    }
+  });
+  t('packaging: the fleet workflow covers every language the skill has an adapter for', () => {
+    if (skip()) return 'skip';
+    // it was ['node', 'php'] — thirteen languages were detected and then dropped
+    const src = readFileSync(join(wfDir, 'fleet.js'), 'utf8');
+    const langs = [...src.match(/const LANGS = \[([^\]]+)\]/)[1].matchAll(/'([a-z]+)'/g)].map(m => m[1]);
+    eq(langs.sort(), adapters.map(a => a.id).sort(), 'LANGS');
+    ok(!/t\.lang === 'node' \|\| t\.lang === 'php'/.test(src), 'no node/php-only filter');
+  });
+  t('packaging: the version is declared once, and nothing stale ships', () => {
+    if (skip()) return 'skip';
+    const plugin = JSON.parse(readFileSync(join(PLUGIN, '.claude-plugin', 'plugin.json'), 'utf8'));
+    const market = JSON.parse(readFileSync(join(PLUGIN, '.claude-plugin', 'marketplace.json'), 'utf8'));
+    ok(/^\d+\.\d+\.\d+$/.test(plugin.version), 'plugin.json carries the version');
+    ok(market.plugins.every(p => !('version' in p)), 'marketplace.json must not repeat it — the two drift');
+    ok(!('skills' in plugin), 'skills/ is scanned by default; listing it registers the skill twice');
+    ok(!existsSync(join(HERE, '..', 'workflow.js')), 'a workflow inside the skill directory is loaded by nothing');
+  });
+}
+
 // ───────────── the documented test count must be real ─────────────
 // Checked HERE rather than as a test: the live counters are still climbing
 // while tests run, and counting `t(` registrations statically undercounts the

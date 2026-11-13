@@ -1,7 +1,7 @@
 export const meta = {
-  name: 'runtime-upgrade',
-  description: 'Upgrade a Node.js or PHP runtime across any repo shape: discover, research EOL/CVEs, assess blockers, plan, adversarially verify',
-  whenToUse: 'When upgrading/bumping a Node or PHP version across one or many repos, or auditing runtime EOL/CVE exposure at scale. Pass args: {root, cvePolicy:"gate"|"report", mode:"plan"|"write", target?, lang?, only?}',
+  name: 'fleet',
+  description: 'Upgrade any of 15 language runtimes across any repo shape: discover, research EOL/CVEs, assess blockers, plan, adversarially verify',
+  whenToUse: 'When upgrading/bumping a language runtime across one or many repos, or auditing runtime EOL/CVE exposure at scale. Pass args: {root, cvePolicy:"gate"|"report", mode:"plan"|"write", skillDir, target?, lang?, only?} where skillDir is the directory holding the runtime-upgrade SKILL.md',
   phases: [
     { title: 'Discover', detail: 'detect.mjs over the root — repo shape, every runtime target, version drift' },
     { title: 'Research', detail: 'per target: EOL windows + runtime CVE delta' },
@@ -12,8 +12,32 @@ export const meta = {
   ],
 }
 
-const SK = '~/.claude/skills/runtime-upgrade'
 const A = (typeof args === 'object' && args) ? args : {}
+// Where the skill's files are. A workflow script gets no path variable of its
+// own, and this used to be a hard-coded ~/.claude/skills path — which exists on
+// the author's machine and on nobody's who installed the plugin from a
+// marketplace. The caller passes it (SKILL.md says how); when it does not, one
+// cheap agent call finds it.
+let SKILL_DIR = A.skillDir ? String(A.skillDir).replace(/\/+$/, '') : ''
+if (!SKILL_DIR) {
+  const found = await agent(
+    `Find the directory that holds the "runtime-upgrade" skill: the one containing BOTH
+SKILL.md and scripts/detect.mjs. Check, in this order, and stop at the first that exists:
+  1. $CLAUDE_PLUGIN_ROOT/skills/runtime-upgrade (if that variable is set)
+  2. ~/.claude/plugins/cache/*/runtime-upgrade/*/skills/runtime-upgrade (newest version directory)
+  3. ~/.claude/skills/runtime-upgrade
+  4. .claude/skills/runtime-upgrade in the current project
+Verify with: ls <dir>/SKILL.md <dir>/scripts/detect.mjs
+Return the ABSOLUTE path (expand ~). If none exists, return an empty path.`,
+    { label: 'locate skill', schema: { type: 'object', required: ['path'], properties: { path: { type: 'string' } } } },
+  )
+  SKILL_DIR = found && found.path ? String(found.path).replace(/\/+$/, '') : ''
+}
+if (!SKILL_DIR) {
+  log('could not find the runtime-upgrade skill directory — pass args.skillDir')
+  return { error: 'skill directory not found', needed: ['skillDir'] }
+}
+const SK = SKILL_DIR
 const ROOT = A.root || '.'
 const POLICY = A.cvePolicy === 'gate' ? 'gate' : 'report'
 const MODE = A.mode === 'write' ? 'write' : 'plan'
@@ -21,19 +45,26 @@ const TARGET = A.target || ''
 const ONLY = Array.isArray(A.only) ? A.only : null
 
 const RULES = `
-Skill scripts live at ${SK}/scripts. Read ${SK}/SKILL.md and the matching
-${SK}/references/{nodejs,php}.md before judging anything.
+Skill scripts live at ${SK}/scripts. Read ${SK}/SKILL.md and the matching reference before
+judging anything: ${SK}/references/nodejs.md, ${SK}/references/php.md, or
+${SK}/references/languages.md for every other language.
 CVE policy for this run: ${POLICY.toUpperCase()}.
   - gate   = high/critical runtime CVEs or any critical/high dependency advisory BLOCKS the upgrade.
   - report = surface everything, block nothing; the human decides.
-  NOTE: a hard gate is only fully enforceable for Node. research.mjs returns gateCapable:false for PHP
-  (NVD CPE data is historical and noisy). For PHP under gate, gate on EOL/support status and
-  composer advisories, and mark runtime CVEs advisory. Never imply a gate you cannot enforce.
+  NOTE: a hard gate on runtime CVEs is only enforceable where research.mjs returns gateCapable:true
+  (Node and Go today). For every other language under gate, gate on EOL/support status and the
+  ecosystem's dependency advisories, and mark runtime CVEs advisory. Never imply a gate you cannot enforce.
 Action mode: ${MODE.toUpperCase()}. ${MODE === 'plan'
   ? 'READ-ONLY. Do not edit, create, or delete any file in the target repo. Emit diffs as text only.'
-  : 'You may edit files, but only on a branch named runtime/<lang>-<target>. Commit per phase. Never commit a lockfile without its manifest.'}
+  : 'You may edit files, but only on a branch named runtime/<lang>-<target>. Commit per phase, only through guard.mjs. Never commit a dependency change without its lockfile.'}
 Be concrete: cite file:line and exact versions. Never report a finding you have not verified by running something.
 `
+
+// Every language the skill has an adapter for. This list was ['node', 'php']
+// long after the skill grew to fifteen, so a Go or Python target was detected,
+// then silently filtered out, and the run reported nothing to upgrade.
+const LANGS = ['node', 'php', 'go', 'python', 'ruby', 'rust', 'java', 'dotnet',
+               'deno', 'bun', 'elixir', 'erlang', 'kotlin', 'scala', 'perl']
 
 const TARGETS_SCHEMA = {
   type: 'object',
@@ -48,7 +79,7 @@ const TARGETS_SCHEMA = {
         type: 'object',
         required: ['lang', 'dir', 'currentVersion'],
         properties: {
-          lang: { type: 'string', enum: ['node', 'php', 'unknown'] },
+          lang: { type: 'string', enum: LANGS.concat('unknown') },
           name: { type: 'string' },
           dir: { type: 'string' },
           currentVersion: { type: 'string' },
@@ -142,7 +173,7 @@ if (!disco || !disco.targets || !disco.targets.length) {
   return { shape: disco && disco.shape, targets: [], findings: [] }
 }
 
-let work = disco.targets.filter(t => t.lang === 'node' || t.lang === 'php')
+let work = disco.targets.filter(t => LANGS.includes(t.lang))
 if (A.lang) work = work.filter(t => t.lang === A.lang)
 if (ONLY) work = work.filter(t => ONLY.some(o => t.dir.includes(o) || (t.name || '').includes(o)))
 const skipped = work.filter(t => !t.currentVersion)
@@ -203,8 +234,9 @@ not to agree. Default to refuting when the evidence is thin.
 
 ${JSON.stringify(finding).slice(0, 6000)}
 
-For each claimed blocker, verify it independently against the real repo and the npm/Packagist
-registry — re-run the scripts, read node_modules/*/package.json or composer.lock, query the registry.
+For each claimed blocker, verify it independently against the real repo and the ecosystem's
+registry (npm, Packagist, PyPI, crates.io, RubyGems, Maven Central, NuGet, the Go proxy, Hex…) —
+re-run the scripts, read the installed tree or the lockfile, query the registry.
 Refute any blocker that:
   - is actually N-API or otherwise ABI-stable
   - already has a compatible release available (check the registry, not the installed tree)
