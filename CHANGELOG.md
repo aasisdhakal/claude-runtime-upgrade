@@ -23,6 +23,35 @@ update when that number changes.
   update produces, and refusing it made `remediate --deps minor` uncommittable.
   `requirements.txt` is no longer treated as `pyproject.toml`'s lockfile.
 - The secret scan also catches credentials embedded in a URL.
+- **A marketplace install could not find its own scripts.** `SKILL.md` and both
+  workflows hard-coded `~/.claude/skills/runtime-upgrade`, a path that exists
+  where the skill was developed and nowhere it was installed from a marketplace.
+  `SKILL.md` now uses `${CLAUDE_SKILL_DIR}`; the workflows take `skillDir` in
+  `args` and locate the skill themselves when it is not passed.
+- **The multi-target workflow only handled Node and PHP.** Its language list
+  was never widened when the skill grew to fifteen, so a Go or Python target was
+  detected, filtered out, and the run reported nothing to upgrade. It now covers
+  every language with an adapter.
+- **New: `brief.mjs <lang> [dir] [from] [to]`** — everything that differs
+  between languages in one document: gate capability, the dependency auditor
+  that will actually run, what a native blocker looks like, where to prove a
+  package supports the target, the migration engine, and the command for each
+  phase. The `fleet` workflow now names no language at all; its agents run the
+  brief and follow it, and a test fails if a language name returns.
+- **Dependency auditing now covers all fifteen languages.** `assess.mjs` kept
+  its own six-row auditor table, so Deno, Bun, Elixir, Erlang, Kotlin, Scala and
+  Perl all answered "no standard auditor exists" — false for four of them. The
+  table moved to `lib/langfacts.mjs`, with an entry required for every adapter.
+- **`osv-scanner` is a fallback auditor** when a language's own is absent or
+  does not exist. The result is labelled as a stand-in, and "found nothing it
+  could read" is reported as not checked rather than as zero advisories.
+- **Every language is now exercised end to end.** Seven had no fixture; six
+  more had only a discovery test.
+- **That workflow is now `fleet`** (`/runtime-upgrade:fleet`). It was named
+  `runtime-upgrade`, the same as the skill, and shadowed it in the listing.
+- Removed a stale `workflow.js` nothing loaded, the redundant `skills` key in
+  `plugin.json` (it registered the skill twice), and the second copy of
+  `version` in `marketplace.json`.
 
 ## 0.2.0
 
