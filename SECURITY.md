@@ -14,7 +14,7 @@ this is a one-person project, so please allow for that before escalating.
 
 **It reads.** Manifests, lockfiles, Dockerfiles, CI config, and `node_modules`/`vendor` metadata.
 
-**It writes only when you say so.** The skill always asks for an action mode. Under `plan` it emits diffs and changes nothing. Under `write` it works on a branch (`runtime/<lang>-<target>`), commits per phase, and never commits a lockfile without its manifest.
+**It writes only when you say so.** The skill always asks for an action mode. Under `plan` it emits diffs and changes nothing. Under `write` it works on a branch (`runtime/<lang>-<target>`), commits per phase, never commits a dependency change without its lockfile, and never sweeps an untracked file it did not create into a commit.
 
 **It executes these, and only these:** `npm`/`pnpm`/`yarn audit`, `npm view`, `composer audit|prohibits|check-platform-reqs`, `php -m|-i|-r`, `docker run --rm <your image>`. All through `spawnSync` with argument arrays — never a shell string, so repo contents cannot be interpolated into a command.
 
